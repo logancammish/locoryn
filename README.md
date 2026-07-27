@@ -26,7 +26,7 @@
 Locoryn is a fork of [ollama-gui-interface](https://github.com/logancammish/ollama-gui-interface).
 
 > [!NOTE]
-> This README describes the current `main` branch (`0.6.0`). Packaged releases
+> This README describes the current `main` branch (`1.0.0`). Packaged releases
 > may trail the source branch; check the release notes for the exact feature set
 > in a download.
 
@@ -47,91 +47,6 @@ It is a particularly good fit if you want to:
 - give tool-capable models optional, source-linked access to the web; or
 - tune generation and rendering without building your own Ollama client.
 
-## Highlights in 0.6
-
-### A smarter chat workspace
-
-- **Capability-aware reasoning** — each model exposes only the modes it
-  reports, from simple Off/On controls through named effort levels such as
-  Minimal, Low, Medium, High, Extra high, or Maximum. Reasoning stays in a
-  collapsible section so the final answer remains readable.
-- **Resizable workspace** — drag the chat-list divider or composer handle to
-  tune the layout; both sizes are restored from the local settings file.
-- **Polished streaming output** — responses render as Markdown, code blocks have
-  one-click copy controls and syntax highlighting for Rust, Lua, C, C++, Python,
-  C#, and many other common languages.
-- **Precise generation controls** — tune temperature, maximum response length
-  from 512 to 1,048,576 tokens, and context windows from 4,096 to 4,194,304
-  tokens. Use either the slider or type an exact value.
-- **Dynamic system context** — optionally add the current local date, time, user
-  name, and custom instructions to the selected prompt immediately before each
-  request.
-- **Opt-in code checks** — check generated Python, Rust, C, C++, and C# snippets
-  for basic syntax or compilation errors with locally installed tools.
-- **A theme that fits your desk** — switch between the redesigned dark and light
-  interfaces and adjust text size for comfortable reading.
-- **Built-in update manager** — check the latest stable GitHub release at
-  startup or on demand from Settings, then open the trusted release page when
-  an update is available.
-
-### Chats that work your way
-
-- **Saved chat sidebar** — reopen, pin, unpin, and delete conversations without
-  digging through files.
-- **Background responses** — switch conversations while prompts keep running;
-  progress remains visible beside each working chat.
-- **Temporary chats** — explore an idea without writing the conversation to
-  saved-chat storage.
-- **Flexible local storage** — see the exact chat folder and move saved chats to
-  a location you choose.
-- **Independent context control** — decide whether earlier messages are sent to
-  the model while still keeping the visible conversation organised.
-
-### Vision and image generation
-
-- Attach one or more images with the multi-select file picker, drag and drop, or
-  your clipboard.
-- Ask a vision-capable model to describe, classify, read, or reason about it.
-- Use the dedicated Images workspace with models that report Ollama's
-  experimental `image` capability.
-- Keep generated images in a local gallery and copy them straight to the
-  clipboard.
-
-The app checks the selected model's Ollama capabilities before exposing vision,
-reasoning, or image-generation controls. Image attachments must be under 20 MB.
-Experimental image generation requests a 1024 × 1024 image and also depends on
-support in your Ollama runtime and operating system.
-
-### Optional, source-backed web search
-
-Give a compatible tool-calling model access to fresh public information through
-Brave Search, or try the experimental Tavily and Exa integrations. The model can
-search, fetch relevant pages, and return clickable sources with its answer. Live
-status keeps accumulated search results visible while the model reads and
-synthesizes, and web-enabled thinking and answer text stream as Ollama produces
-them.
-
-Web access is off by default and can be set globally or toggled for the current
-chat. Opt-in deep follow-up research supports configurable search, page-read,
-cross-source, and tool-round budgets, plus optional per-request research
-instructions. Provider-level freshness filters remain available for
-time-sensitive questions. Reaching a configured web-tool limit now triggers a
-final no-tools synthesis from the evidence already collected instead of failing
-the prompt, and streamed research progress remains visible between tool rounds.
-Private/local network targets and unsupported content types are blocked.
-Provider searches are paced, and transient rate limits from search providers or
-Ollama are retried with bounded, cancellable backoff.
-
-### More control, without more friction
-
-- Switch between reusable system-prompt profiles.
-- Install an Ollama model by name from Advanced Settings.
-- Connect to a trusted Ollama server using a custom host/IP and port.
-- Choose instant streaming or batch visual updates for lower rendering overhead.
-- Optionally mask inappropriate output with the built-in content filter.
-- Use the English interface or the experimental, machine-generated Spanish
-  translation.
-
 ## Quick start
 
 ### 1. Install Ollama
@@ -148,10 +63,10 @@ ollama serve
 Open the [latest release](https://github.com/logancammish/locoryn/releases/latest)
 and choose the asset for your operating system.
 
-- **Windows 11:** use `ollama-gui-0.6.0-windows-11-x64-setup.exe` for the standard per-user
+- **Windows 11:** use `locoryn-1.0.0-windows-11-x64-setup.exe` for the standard per-user
   installation. It does not require administrator privileges.
 - **Linux:** download the Linux archive when one is provided, extract it, and
-  run the `ollama-gui` executable.
+  run the `locoryn` executable.
 
 ### 3. Choose a model and chat
 
@@ -315,8 +230,8 @@ cd locoryn
 cargo build --release
 ```
 
-The finished binary is `target/release/ollama-gui` on Linux and macOS, and
-`target\release\ollama-gui.exe` on Windows. On an Apple Silicon Mac, build it
+The finished binary is `target/release/locoryn` on Linux and macOS, and
+`target\release\locoryn.exe` on Windows. On an Apple Silicon Mac, build it
 natively with:
 
 ```bash
@@ -324,7 +239,7 @@ cargo build --release --target aarch64-apple-darwin
 ```
 
 The macOS ARM64 binary is then
-`target/aarch64-apple-darwin/release/ollama-gui`.
+`target/aarch64-apple-darwin/release/locoryn`.
 
 Run a development build with:
 
