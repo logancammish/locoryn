@@ -1,0 +1,65 @@
+name: macOS ARM64 build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Apple Silicon binary
+    runs-on: macos-14
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Build release binary
+        run: |
+          cargo build \
+            --locked \
+            --release \
+            --target aarch64-apple-darwin
+
+      - name: Prepare downloadable files
+        shell: bash
+        run: |
+          RELEASE_DIR="target/aarch64-apple-darwin/release"
+          DIST_DIR="dist/locoryn-macos-arm64"
+
+          mkdir -p "$DIST_DIR"
+
+          cp "$RELEASE_DIR/locoryn" "$DIST_DIR/locoryn"
+          chmod +x "$DIST_DIR/locoryn"
+
+          # Copy these folders from the release directory if they exist.
+          for folder in config output assets; do
+            if [ -d "$RELEASE_DIR/$folder" ]; then
+              cp -R "$RELEASE_DIR/$folder" "$DIST_DIR/"
+            elif [ -d "$folder" ]; then
+              cp -R "$folder" "$DIST_DIR/"
+            fi
+          done
+
+          echo "Files being uploaded:"
+          find "$DIST_DIR" -maxdepth 3 -print
+
+      - name: Upload downloadable macOS ARM64 build
+        uses: actions/upload-artifact@v4
+        with:
+          name: locoryn-macos-arm64
+          path: dist/locoryn-macos-arm64/
+          if-no-files-found: error
+          retention-days: 90

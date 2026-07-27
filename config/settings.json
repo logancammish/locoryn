@@ -1,0 +1,36 @@
+{
+    "filtering": false,
+    "logging": false,
+    "dark_mode": true,
+    "current_chat_history_enabled": true,
+    "info_popup": true,
+    "fast_streaming": true,
+    "max_response_tokens": 32768,
+    "context_tokens": 131072,
+    "code_checking_enabled": false,
+    "ui_layout": {
+        "sidebar_width": 278,
+        "composer_height": 142
+    },
+    "dynamic_prompt": {
+        "include_date": true,
+        "include_time": true,
+        "include_user_name": false,
+        "user_name": "",
+        "custom_instructions": ""
+    },
+    "language": "english",
+    "web_search": {
+        "enabled": false,
+        "provider": "brave",
+        "result_limit": 5,
+        "allow_multiple_searches": false,
+        "request_timeout_seconds": 15,
+        "maximum_searches": 6,
+        "maximum_page_fetches": 6,
+        "minimum_successful_searches": 3,
+        "minimum_independent_pages": 2,
+        "tool_iteration_limit": 15,
+        "custom_research_instructions": ""
+    }
+}
