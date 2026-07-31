@@ -63,6 +63,8 @@ const MIN_COMPOSER_HEIGHT: f32 = 118.0;
 const MAX_COMPOSER_HEIGHT: f32 = 320.0;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+#[cfg(target_os = "linux")]
+const LINUX_APP_ID: &str = "io.github.logancammish.locoryn";
 const UPDATE_RELEASE_API: &str =
     "https://api.github.com/repos/logancammish/locoryn/releases/latest";
 const UPDATE_RELEASE_PAGE: &str = "https://github.com/logancammish/locoryn/releases/latest";
@@ -4130,35 +4132,41 @@ impl Default for Program {
 }
 
 pub fn main() -> iced::Result {
-    let icon = match image::ImageReader::open(resource_path("assets/icon.ico")) {
-        Ok(image_reader) => match image_reader.decode() {
-            Ok(img) => {
-                let rgba_image = img.into_rgba8();
-                let (width, height) = rgba_image.dimensions();
-
-                match iced::window::icon::from_rgba(rgba_image.into_raw(), width, height) {
-                    Ok(icon) => Some(icon),
-                    Err(e) => {
-                        eprintln!("Failed to create icon: {}", e);
-                        None
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("Failed to decode the image: {}", e);
-                None
-            }
-        },
-        Err(e) => {
-            eprintln!("Failed to open the icon file: {}", e);
-            None
-        }
-    };
+    // Keep the live window icon in the executable. In particular, Linux launchers
+    // do not guarantee a working directory beside the installed asset folder.
+    let icon = image::load_from_memory_with_format(
+        include_bytes!("../assets/icon.png"),
+        image::ImageFormat::Png,
+    )
+    .map_err(|error| error.to_string())
+    .and_then(|image| {
+        let rgba_image = image.into_rgba8();
+        let (width, height) = rgba_image.dimensions();
+        iced::window::icon::from_rgba(rgba_image.into_raw(), width, height)
+            .map_err(|error| error.to_string())
+    })
+    .map(Some)
+    .unwrap_or_else(|error| {
+        eprintln!("Failed to load the embedded application icon: {error}");
+        None
+    });
 
     let window_settings = iced::window::Settings {
         icon,
         min_size: Some(Size::new(900.0, 640.0)),
         ..iced::window::Settings::default()
+    };
+
+    // Wayland associates a running window with its .desktop file through this
+    // ID. Matching the installed desktop-file basename lets docks display the
+    // application icon instead of a generic placeholder.
+    #[cfg(target_os = "linux")]
+    let window_settings = iced::window::Settings {
+        platform_specific: iced::window::settings::PlatformSpecific {
+            application_id: LINUX_APP_ID.to_string(),
+            ..iced::window::settings::PlatformSpecific::default()
+        },
+        ..window_settings
     };
 
     let application = iced::application(Program::boot, Program::update, Program::view)

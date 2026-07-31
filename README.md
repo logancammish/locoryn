@@ -26,7 +26,7 @@
 Locoryn is a fork of [ollama-gui-interface](https://github.com/logancammish/ollama-gui-interface).
 
 > [!NOTE]
-> This README describes the current `main` branch (`1.0.0`). Packaged releases
+> This README describes the current `main` branch (`1.0.1`). Packaged releases
 > may trail the source branch; check the release notes for the exact feature set
 > in a download.
 
@@ -63,10 +63,11 @@ ollama serve
 Open the [latest release](https://github.com/logancammish/locoryn/releases/latest)
 and choose the asset for your operating system.
 
-- **Windows 11:** use `locoryn-1.0.0-windows-11-x64-setup.exe` for the standard per-user
+- **Windows 11:** use `locoryn-1.0.1-windows-11-x64-setup.exe` for the standard per-user
   installation. It does not require administrator privileges.
-- **Linux:** download the Linux archive when one is provided, extract it, and
-  run the `locoryn` executable.
+- **Linux:** clone or download this repository, then run `./install-linux.sh`.
+  It detects x86_64 or ARM64, lets you override the result, offers the main or
+  beta release channel, and registers Locoryn with your desktop launcher.
 
 ### 3. Choose a model and chat
 
@@ -198,7 +199,7 @@ Temporary chats are not added to `chats.json`.
 | Platform | Default application-data folder |
 |---|---|
 | Windows | `%LOCALAPPDATA%\Ollama GUI` |
-| Linux | `$XDG_DATA_HOME/ollama-gui` or `~/.local/share/ollama-gui` |
+| Linux | `$XDG_DATA_HOME/locoryn` or `~/.local/share/locoryn` |
 
 Saved conversations live in the `chats` subfolder by default. The exact active
 path is always visible under **Settings → Chat storage**, and it can be changed
@@ -213,7 +214,7 @@ use `settings.json` and `history.json` in the application-data folder.
 | Platform | Status |
 |---|---|
 | Windows x64 | Officially supported; per-user installer available |
-| Linux x64 | Officially supported on Wayland |
+| Linux x86_64 and ARM64 | Officially supported; desktop installer available |
 | macOS Apple Silicon (ARM64) | Build supported; automated native build available |
 
 Ollama itself must be installed and running locally or reachable at the custom

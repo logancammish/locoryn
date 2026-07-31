@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Locoryn
+GenericName=Ollama desktop client
+Comment=Chat with local Ollama models
+Exec="@EXEC@"
+Icon=io.github.logancammish.locoryn
+Terminal=false
+Categories=Utility;Development;ArtificialIntelligence;
+Keywords=AI;LLM;Ollama;Chat;
+StartupNotify=true
+StartupWMClass=io.github.logancammish.locoryn

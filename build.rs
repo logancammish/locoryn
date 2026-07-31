@@ -37,7 +37,7 @@ fn main() -> io::Result<()> {
     // Copy assets folder to output directory
     let out_dir = env::var("OUT_DIR").unwrap();
     let target_dir = Path::new(&out_dir).ancestors().nth(3).unwrap();
-    let dirs: HashMap<&str, PathBuf> = vec![
+    let mut dirs: HashMap<&str, PathBuf> = vec![
         (
             "config",
             Path::new(&env::var("CARGO_MANIFEST_DIR").unwrap()).join("config"),
@@ -53,6 +53,13 @@ fn main() -> io::Result<()> {
     ]
     .into_iter()
     .collect();
+
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+        dirs.insert(
+            "linux_installations",
+            Path::new(&env::var("CARGO_MANIFEST_DIR").unwrap()).join("linux_installations"),
+        );
+    }
 
     for dir in dirs.iter() {
         if dir.1.deref().exists() {
