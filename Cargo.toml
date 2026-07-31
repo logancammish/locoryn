@@ -4,11 +4,11 @@ version = "1.0.0"
 edition = "2024"
 
 [dependencies]
-ollama-rs = { version = "0.3.5", default-features = false, features = ["rustls", "stream"] }
+ollama-rs = { version = "0.3.6", default-features = false, features = ["rustls", "stream"] }
 tokio = { version = "1.53.1", features = ["full"] }
 iced = { version = "0.14.0", features = ["advanced", "tokio", "image"]}
 iced_widget = { version = "0.14.2", features = ["markdown", "highlighter"] }
-webbrowser = "1.2.1"
+webbrowser = "1.2.2"
 crossbeam-channel = "0.5.16"
 reqwest = { version = "0.13.4", features = ["blocking", "json"] }
 async-trait = "0.1.89"
@@ -19,9 +19,9 @@ rustrict = "0.7.38"
 chrono = "0.4.45"
 image = "0.25.10"
 iced_selection = { version = "0.5", features = ["markdown"] }
-base64 = "0.22.1"
+base64 = "0.23.0"
 arboard = "3.6.1"
-rfd = "0.15.4"
+rfd = "0.17.2"
 
 [build-dependencies]
 winresource = "0.1.31"
