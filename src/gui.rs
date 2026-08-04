@@ -15,7 +15,7 @@ use std::{
 
 use crate::{
     AppUpdateState, ChatImage, Correspondence, GUIState, Language, MarkdownImageState, Message,
-    Program, ThinkingLevel, split_thinking_text,
+    Program, SettingsFeedbackTarget, ThinkingLevel, split_thinking_text,
     web_search::{WebSearchState, WebSource},
 };
 
@@ -103,6 +103,7 @@ fn tr(language: Language, english: &'static str) -> &'static str {
         }
         "Search result limit" => "Límite de resultados",
         "Deep follow-up research" => "Investigación de seguimiento exhaustiva",
+        "Deep research controls" => "Controles de investigación exhaustiva",
         "After web research starts, the model runs 3–6 targeted searches and checks 2–6 relevant pages across independent sites." => {
             "Cuando comienza la investigación web, el modelo realiza de 3 a 6 búsquedas específicas y comprueba de 2 a 6 páginas relevantes de sitios independientes."
         }
@@ -210,6 +211,8 @@ fn tr(language: Language, english: &'static str) -> &'static str {
         "APPEARANCE" => "APARIENCIA",
         "WEB SEARCH & TOOLS" => "BÚSQUEDA WEB Y HERRAMIENTAS",
         "DATA & MAINTENANCE" => "DATOS Y MANTENIMIENTO",
+        "MODELS & SAFETY" => "MODELOS Y SEGURIDAD",
+        "RUNTIME & CONNECTION" => "ENTORNO Y CONEXIÓN",
         "Application updates" => "Actualizaciones de la aplicación",
         "Current version and latest stable release from GitHub." => {
             "Versión actual y última versión estable de GitHub."
@@ -857,6 +860,120 @@ fn chip_style(color: Color) -> impl Fn(&Theme) -> Style {
     }
 }
 
+fn feedback_chip_style(color: Color, bounce: f32) -> impl Fn(&Theme) -> Style {
+    move |_theme: &Theme| Style {
+        snap: true,
+        text_color: Some(text_main()),
+        background: Some(Background::Color(mix_color(
+            panel_soft(),
+            color,
+            bounce * 0.08,
+        ))),
+        border: Border {
+            color: brighten(color, bounce * 0.08),
+            width: 1.0 + bounce * 0.65,
+            radius: Radius::from(999.0),
+        },
+        shadow: Shadow {
+            color: with_alpha(color, bounce * 0.24),
+            offset: Vector::from([0.0, bounce * 1.8]),
+            blur_radius: bounce * 8.0,
+        },
+    }
+}
+
+fn feedback_value_chip(value: String, color: Color, bounce: f32) -> Element<'static, Message> {
+    container(widget::text(value).size(13).color(text_main()))
+        .padding(8.0 + bounce * 1.1)
+        .style(feedback_chip_style(color, bounce))
+        .into()
+}
+
+fn feedback_apply_button<'a>(
+    label: &'a str,
+    message: Message,
+    bounce: f32,
+) -> Element<'a, Message> {
+    widget::button(widget::text(label).size(12).align_x(Horizontal::Center))
+        .padding([8.0 + bounce * 0.22, 10.0 + bounce * 0.35])
+        .style(move |_theme, status| {
+            let mut style = button_visual(panel_soft(), border_soft(), text_muted(), status);
+            style.border.color = mix_color(style.border.color, accent_2(), bounce * 0.24);
+            style.border.width += bounce * 0.16;
+            style.shadow.color = with_alpha(accent_2(), bounce * 0.10);
+            style.shadow.offset = Vector::from([0.0, 1.0 + bounce * 0.55]);
+            style.shadow.blur_radius += bounce * 2.0;
+            style
+        })
+        .on_press(message)
+        .into()
+}
+
+/// The brand mark is intentionally static and squircle-shaped: a square with
+/// heavily rounded corners, never a circle.
+fn status_brand_style(color: Color) -> impl Fn(&Theme) -> Style {
+    move |_theme: &Theme| Style {
+        snap: true,
+        text_color: None,
+        background: Some(Background::Color(with_alpha(color, 0.035))),
+        border: Border {
+            color: brighten(color, 0.04),
+            width: 1.2,
+            radius: Radius::from(10.0),
+        },
+        shadow: Shadow {
+            color: with_alpha(color, 0.13),
+            offset: Vector::from([0.0, 1.0]),
+            blur_radius: 5.0,
+        },
+    }
+}
+
+fn profile_chip_style(
+    open: bool,
+) -> impl Fn(&Theme, widget::button::Status) -> widget::button::Style {
+    move |_theme, status| {
+        let hovered = matches!(status, widget::button::Status::Hovered);
+        widget::button::Style {
+            snap: true,
+            background: Some(Background::Color(if open || hovered {
+                panel_lifted()
+            } else {
+                panel()
+            })),
+            text_color: text_main(),
+            border: Border {
+                color: border_soft(),
+                width: 1.0,
+                radius: Radius::from(10.0),
+            },
+            shadow: Shadow {
+                color: with_alpha(shadow_color(), 0.28),
+                offset: Vector::from([0.0, 2.0]),
+                blur_radius: 6.0,
+            },
+        }
+    }
+}
+
+fn profile_popup_style(_theme: &Theme) -> Style {
+    Style {
+        snap: true,
+        text_color: None,
+        background: Some(Background::Color(panel_lifted())),
+        border: Border {
+            color: border_soft(),
+            width: 1.0,
+            radius: Radius::from(12.0),
+        },
+        shadow: Shadow {
+            color: with_alpha(shadow_color(), 0.38),
+            offset: Vector::from([0.0, 6.0]),
+            blur_radius: 16.0,
+        },
+    }
+}
+
 fn resize_rail_style(_theme: &Theme) -> Style {
     Style {
         snap: true,
@@ -1039,6 +1156,28 @@ fn mini_button_owned(label: String, message: Message) -> Element<'static, Messag
         .style(|_theme, _status| button_visual(panel_soft(), border_soft(), text_muted(), _status))
         .on_press(message)
         .into()
+}
+
+fn settings_disclosure_button<'a>(
+    label: &'a str,
+    open: bool,
+    message: Message,
+) -> Element<'a, Message> {
+    widget::button(
+        widget::row![
+            widget::text(label).size(12).color(text_main()),
+            Space::new().width(Length::Fill),
+            widget::text(if open { "▾" } else { "▸" })
+                .size(13)
+                .color(accent_2()),
+        ]
+        .align_y(iced::Alignment::Center),
+    )
+    .padding([10, 12])
+    .width(Length::Fill)
+    .style(|_theme, status| button_visual(panel_soft(), border_soft(), text_main(), status))
+    .on_press(message)
+    .into()
 }
 
 fn toolbar_button<'a>(icon: &'a str, label: &'a str, message: Message) -> Element<'a, Message> {
@@ -1389,6 +1528,18 @@ fn text_input_style(
         placeholder: text_faint(),
         value: text_main(),
         selection: accent(),
+    }
+}
+
+fn feedback_text_input_style(
+    bounce: f32,
+) -> impl Fn(&Theme, widget::text_input::Status) -> widget::text_input::Style {
+    move |theme, status| {
+        let mut style = text_input_style(theme, status);
+        style.background = Background::Color(mix_color(panel_soft(), accent_2(), bounce * 0.05));
+        style.border.color = mix_color(style.border.color, accent_2(), bounce * 0.35);
+        style.border.width += bounce * 0.55;
+        style
     }
 }
 
@@ -1787,6 +1938,7 @@ fn message_bubble<'a>(
     model_name: String,
     copied_text: Option<&String>,
     thinking_expanded: bool,
+    sources_expanded: bool,
     language: Language,
     code_checking_enabled: bool,
     markdown_images: &'a std::collections::HashMap<String, MarkdownImageState>,
@@ -1892,18 +2044,31 @@ fn message_bubble<'a>(
             let source_list: Element<'a, Message> = if sources.is_empty() {
                 widget::column![].into()
             } else {
-                let entries = sources
-                    .iter()
-                    .enumerate()
-                    .map(|(index, source)| website_result_row(index, source, false, language))
-                    .collect::<Vec<Element<'a, Message>>>();
+                let label = if sources_expanded {
+                    format!("▾ {} ({})", tr(language, "Sources"), sources.len())
+                } else {
+                    format!("▸ {} ({})", tr(language, "Sources"), sources.len())
+                };
+                let entries: Element<'a, Message> = if sources_expanded {
+                    let entries = sources
+                        .iter()
+                        .enumerate()
+                        .map(|(source_index, source)| {
+                            website_result_row(source_index, source, false, language)
+                        })
+                        .collect::<Vec<Element<'a, Message>>>();
+                    widget::column![
+                        Space::new().height(Length::Fixed(5.0)),
+                        widget::Column::with_children(entries).spacing(iced::Pixels(5.0)),
+                    ]
+                    .into()
+                } else {
+                    widget::column![].into()
+                };
                 widget::column![
                     Space::new().height(Length::Fixed(12.0)),
-                    widget::text(tr(language, "Sources"))
-                        .size(11)
-                        .color(text_muted()),
-                    Space::new().height(Length::Fixed(5.0)),
-                    widget::Column::with_children(entries).spacing(iced::Pixels(5.0)),
+                    mini_button_owned(label, Message::ToggleSources(index)),
+                    entries,
                 ]
                 .into()
             };
@@ -2185,6 +2350,7 @@ impl Program {
                                 message_model_name,
                                 copied_text.as_ref(),
                                 self.expanded_thinking.contains(&index),
+                                self.expanded_sources.contains(&index),
                                 language,
                                 self.code_checking_enabled,
                                 &self.markdown_images,
@@ -2199,7 +2365,6 @@ impl Program {
                 let online = local_ollamastate.to_lowercase() != "offline";
                 let status_color = if online { success() } else { danger() };
                 let pulse = 1.0 - (self.ui_motion * 2.0 - 1.0).abs();
-                let status_dot_color = brighten(status_color, pulse * 0.035);
                 let visible_debug = self.current_debug_message().clone();
                 let debug_color = if visible_debug.is_error {
                     danger()
@@ -2510,7 +2675,7 @@ impl Program {
                     let mut temporary_jobs = self
                         .active_prompts
                         .iter()
-                        .filter(|(_, job)| job.temporary)
+                        .filter(|(_, job)| job.temporary && job.profile_id == self.active_profile_id)
                         .collect::<Vec<_>>();
                     temporary_jobs.sort_by_key(|(_, job)| job.started_at);
                     for (chat_id, job) in temporary_jobs {
@@ -2545,7 +2710,11 @@ impl Program {
                             .into(),
                         );
                     }
-                    let mut temporary_sessions = self.temporary_chats.iter().collect::<Vec<_>>();
+                    let mut temporary_sessions = self
+                        .temporary_chats
+                        .iter()
+                        .filter(|(_, session)| session.profile_id == self.active_profile_id)
+                        .collect::<Vec<_>>();
                     temporary_sessions.sort_by_key(|(chat_id, _)| *chat_id);
                     for (chat_id, session) in temporary_sessions {
                         let title = session
@@ -2586,7 +2755,11 @@ impl Program {
                             .color(text_muted())
                             .into(),
                     );
-                    for saved in &self.saved_chats {
+                    for saved in self
+                        .saved_chats
+                        .iter()
+                        .filter(|chat| crate::chat_profile_id(chat) == self.active_profile_id)
+                    {
                         let selected = saved.id == self.current_chat_id;
                         let title = ellipsize_chat_title(&saved.title, 20);
                         let working = self.active_prompts.contains_key(&saved.id);
@@ -2622,14 +2795,22 @@ impl Program {
                     }
                     container(widget::column![
                         widget::row![
-                            container(widget::text("●").size(14).color(status_dot_color))
-                                .center_x(Length::Fill)
-                                .center_y(Length::Fill)
-                                .width(Length::Fixed(35.0))
-                                .height(Length::Fixed(35.0)),
+                            container(
+                                widget::image(self.brand_icon.clone())
+                                    .width(Length::Fixed(25.0))
+                                    .height(Length::Fixed(25.0))
+                                    .content_fit(iced::ContentFit::Contain)
+                                    .border_radius(8.0)
+                            )
+                            .padding(4)
+                            .center_x(Length::Fill)
+                            .center_y(Length::Fill)
+                            .width(Length::Fixed(35.0))
+                            .height(Length::Fixed(35.0))
+                            .style(status_brand_style(status_color)),
                             Space::new().width(Length::Fixed(9.0)),
                             widget::column![
-                                widget::text("OLLAMA").size(10).color(accent_2()),
+                                widget::text("LOCORYN").size(10).color(accent_2()),
                                 widget::text(tr(language, "Chats"))
                                     .size(17)
                                     .color(text_main()),
@@ -2641,6 +2822,9 @@ impl Program {
                         widget::scrollable(
                             widget::Column::with_children(entries).spacing(iced::Pixels(6.0))
                         ),
+                        // Reserve room for the profile switcher overlaid in
+                        // the bottom-left corner.
+                        Space::new().height(Length::Fixed(46.0)),
                     ])
                     .padding(12)
                     .width(Length::Fixed(sidebar_width))
@@ -2664,7 +2848,7 @@ impl Program {
                     let mut temporary_jobs = self
                         .active_prompts
                         .iter()
-                        .filter(|(_, job)| job.temporary)
+                        .filter(|(_, job)| job.temporary && job.profile_id == self.active_profile_id)
                         .collect::<Vec<_>>();
                     temporary_jobs.sort_by_key(|(_, job)| job.started_at);
                     for (chat_id, _) in temporary_jobs {
@@ -2688,7 +2872,12 @@ impl Program {
                             .into(),
                         );
                     }
-                    let mut temporary_sessions = self.temporary_chats.keys().collect::<Vec<_>>();
+                    let mut temporary_sessions = self
+                        .temporary_chats
+                        .iter()
+                        .filter(|(_, session)| session.profile_id == self.active_profile_id)
+                        .map(|(chat_id, _)| chat_id)
+                        .collect::<Vec<_>>();
                     temporary_sessions.sort();
                     for chat_id in temporary_sessions {
                         compact_entries.push(
@@ -2708,7 +2897,11 @@ impl Program {
                             .into(),
                         );
                     }
-                    for saved in &self.saved_chats {
+                    for saved in self
+                        .saved_chats
+                        .iter()
+                        .filter(|chat| crate::chat_profile_id(chat) == self.active_profile_id)
+                    {
                         let short_title = ellipsize_chat_title(&saved.title, 8);
                         let working = self.active_prompts.contains_key(&saved.id);
                         let working_progress: Element<Message> = if working {
@@ -2737,15 +2930,195 @@ impl Program {
                             .into(),
                         );
                     }
-                    container(widget::scrollable(
-                        widget::Column::with_children(compact_entries).spacing(iced::Pixels(5.0)),
-                    ))
+                    container(widget::column![
+                        widget::scrollable(
+                            widget::Column::with_children(compact_entries)
+                                .spacing(iced::Pixels(5.0)),
+                        ),
+                        // Reserve room for the profile switcher overlaid in
+                        // the bottom-left corner.
+                        Space::new().height(Length::Fixed(46.0)),
+                    ])
                     .padding(8)
                     .width(Length::Fixed(sidebar_width))
                     .height(Length::Fill)
                     .style(sidebar_style)
                     .into()
                 };
+
+                let active_profile_name = self.active_profile_name();
+                let profile_chip_label: Element<Message> = if show_sidebar_details {
+                    widget::row![
+                        widget::text("👤").size(13),
+                        widget::text(ellipsize_chat_title(&active_profile_name, 18))
+                            .size(14)
+                            .wrapping(Wrapping::None),
+                        widget::text(if self.profile_menu_open { "▾" } else { "▴" })
+                            .size(11)
+                            .color(text_muted()),
+                    ]
+                    .spacing(7)
+                    .into()
+                } else {
+                    widget::text("👤").size(14).into()
+                };
+                let profile_chip: Element<Message> = widget::button(profile_chip_label)
+                    .on_press(Message::ToggleProfileMenu)
+                    .padding(if show_sidebar_details { [8, 13] } else { [8, 9] })
+                    .style(profile_chip_style(self.profile_menu_open))
+                    .into();
+                let profile_switcher: Element<Message> = if self.profile_menu_open {
+                    let mut rows: Vec<Element<Message>> = Vec::new();
+                    for profile in &self.profiles {
+                        let is_active = profile.id == self.active_profile_id;
+                        let is_editing = self
+                            .editing_profile_id
+                            .as_deref()
+                            .is_some_and(|editing| editing == profile.id);
+                        let active_marker: Element<Message> = if is_active {
+                            widget::text("✓").size(13).color(accent_2()).into()
+                        } else {
+                            widget::column![].into()
+                        };
+                        rows.push(
+                            widget::row![
+                                widget::button(
+                                    widget::text(ellipsize_chat_title(&profile.name, 24))
+                                        .size(14)
+                                        .wrapping(Wrapping::None)
+                                        .color(if is_active {
+                                            accent_2()
+                                        } else {
+                                            text_main()
+                                        }),
+                                )
+                                .on_press(Message::SelectProfile(profile.id.clone()))
+                                .style(chat_title_button_style)
+                                .clip(true)
+                                .width(Length::Fill),
+                                active_marker,
+                                mini_button(
+                                    if is_editing { "▾" } else { "✎" },
+                                    Message::StartEditProfile(profile.id.clone())
+                                ),
+                                mini_button("×", Message::DeleteProfile(profile.id.clone())),
+                            ]
+                            .spacing(5)
+                            .into(),
+                        );
+                    }
+                    let rows_height = (rows.len().min(5) * 40) as f32;
+                    let edit_panel: Element<Message> =
+                        if self.editing_profile_id.is_some()
+                            && self.profiles.iter().any(|profile| {
+                                Some(profile.id.as_str())
+                                    == self.editing_profile_id.as_deref()
+                            })
+                        {
+                            container(
+                                widget::column![
+                                    widget::text(tr(language, "EDIT PROFILE"))
+                                        .size(10)
+                                        .color(accent_2()),
+                                    iced::widget::TextInput::<Message>::new(
+                                        tr(language, "Profile name (only you see this)"),
+                                        &self.profile_edit_name,
+                                    )
+                                    .on_input(Message::ProfileEditNameChanged)
+                                    .padding(9)
+                                    .width(Length::Fill)
+                                    .style(text_input_style),
+                                    iced::widget::TextInput::<Message>::new(
+                                        tr(language, "User name (shared with the model)"),
+                                        &self.profile_edit_user_name,
+                                    )
+                                    .on_input(Message::ProfileEditUserNameChanged)
+                                    .padding(9)
+                                    .width(Length::Fill)
+                                    .style(text_input_style),
+                                    iced::widget::TextInput::<Message>::new(
+                                        tr(language, "Extra instructions for the model"),
+                                        &self.profile_edit_instructions,
+                                    )
+                                    .on_input(Message::ProfileEditInstructionsChanged)
+                                    .on_submit(Message::ConfirmProfileEdits)
+                                    .padding(9)
+                                    .width(Length::Fill)
+                                    .style(text_input_style),
+                                    widget::row![
+                                        Space::new().width(Length::Fill),
+                                        mini_button(
+                                            tr(language, "Cancel"),
+                                            Message::CancelEditProfile
+                                        ),
+                                        mini_button(
+                                            tr(language, "Save"),
+                                            Message::ConfirmProfileEdits
+                                        ),
+                                    ]
+                                    .spacing(5),
+                                ]
+                                .spacing(7),
+                            )
+                            .padding(10)
+                            .width(Length::Fill)
+                            .style(flat_card_style)
+                            .into()
+                        } else {
+                            widget::column![].into()
+                        };
+                    let popup: Element<Message> = container(
+                        widget::column![
+                            widget::text(tr(language, "PROFILES"))
+                                .size(11)
+                                .color(accent_2()),
+                            widget::scrollable(
+                                widget::Column::with_children(rows).spacing(iced::Pixels(6.0))
+                            )
+                            .height(Length::Fixed(rows_height)),
+                            edit_panel,
+                            widget::row![
+                                iced::widget::TextInput::<Message>::new(
+                                    tr(language, "New profile name"),
+                                    &self.profile_name_input,
+                                )
+                                .on_input(Message::ProfileNameInputChanged)
+                                .on_submit(Message::CreateProfile)
+                                .padding(9)
+                                .width(Length::Fill)
+                                .style(text_input_style),
+                                mini_button("＋", Message::CreateProfile),
+                            ]
+                            .spacing(5),
+                        ]
+                        .spacing(9),
+                    )
+                    .padding(12)
+                    .width(Length::Fixed(290.0))
+                    .style(profile_popup_style)
+                    .into();
+                    widget::column![
+                        popup,
+                        Space::new().height(Length::Fixed(6.0)),
+                        profile_chip,
+                    ]
+                    .align_x(iced::Alignment::Start)
+                    .into()
+                } else {
+                    profile_chip
+                };
+                // The switcher floats in the bottom-left corner, over the
+                // chat list, so it stays reachable on every page state.
+                let chat_sidebar: Element<Message> = widget::stack![
+                    chat_sidebar,
+                    container(profile_switcher)
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .align_x(iced::Alignment::Start)
+                        .align_y(iced::Alignment::End)
+                        .padding(10),
+                ]
+                .into();
 
                 let copy_response_action: Element<Message> = if chat_is_empty {
                     widget::column![].into()
@@ -3312,7 +3685,12 @@ impl Program {
                     Space::new().height(Length::Fixed(14.0)),
 
                     container(
-                        widget::column![
+                        widget::row![
+                            widget::column![
+                                Space::new().height(Length::Fixed(
+                                    (1.0 - eased(self.page_reveal * 1.12)) * 14.0
+                                )),
+                                widget::column![
                             settings_group_title(tr(language, "PERSONALIZATION")),
                             Space::new().height(Length::Fixed(8.0)),
                             container(
@@ -3343,32 +3721,19 @@ impl Program {
                                 widget::column![
                                     setting_label(
                                         tr(language, "Dynamic system prompt"),
-                                        tr(language, "Add current local information and your own instructions to every request.")
+                                        tr(language, "Add current local information and your own instructions to every request. Each profile can add its own user name and instructions; profile names stay private. Switch profiles from the bottom-left corner.")
                                     ),
                                     Space::new().height(Length::Fixed(10.0)),
                                     widget::row![
                                         widget::checkbox(self.dynamic_prompt_settings.include_date)
                                             .label(tr(language, "Include date"))
                                             .on_toggle(|_| Message::ToggleDynamicDate),
-                                        Space::new().width(Length::Fixed(18.0)),
+                                        Space::new().width(Length::Fill),
                                         widget::checkbox(self.dynamic_prompt_settings.include_time)
                                             .label(tr(language, "Include time"))
                                             .on_toggle(|_| Message::ToggleDynamicTime),
-                                        Space::new().width(Length::Fixed(18.0)),
-                                        widget::checkbox(self.dynamic_prompt_settings.include_user_name)
-                                            .label(tr(language, "Include user name"))
-                                            .on_toggle(|_| Message::ToggleDynamicUserName),
                                     ],
                                     Space::new().height(Length::Fixed(10.0)),
-                                    iced::widget::TextInput::<Message>::new(
-                                        tr(language, "User name"),
-                                        &self.dynamic_prompt_settings.user_name,
-                                    )
-                                    .on_input(Message::DynamicUserNameChanged)
-                                    .padding(11)
-                                    .width(Length::Fill)
-                                    .style(text_input_style),
-                                    Space::new().height(Length::Fixed(8.0)),
                                     iced::widget::TextInput::<Message>::new(
                                         tr(language, "Custom instructions appended to the system prompt"),
                                         &self.dynamic_prompt_settings.custom_instructions,
@@ -3409,10 +3774,24 @@ impl Program {
                                         )
                                         .on_input(Message::EditMaxResponseTokens)
                                         .on_submit(Message::ApplyMaxResponseTokens)
-                                        .padding(9)
+                                        .padding(
+                                            9.0 + self.settings_feedback(
+                                                SettingsFeedbackTarget::MaxResponse
+                                            ) * 0.8
+                                        )
                                         .width(Length::Fixed(130.0))
-                                        .style(text_input_style),
-                                        mini_button("Apply", Message::ApplyMaxResponseTokens),
+                                        .style(feedback_text_input_style(
+                                            self.settings_feedback(
+                                                SettingsFeedbackTarget::MaxResponse
+                                            )
+                                        )),
+                                        feedback_apply_button(
+                                            "Apply",
+                                            Message::ApplyMaxResponseTokens,
+                                            self.settings_feedback(
+                                                SettingsFeedbackTarget::ApplyMaxResponse
+                                            ),
+                                        ),
                                     ],
                                 ]
                             )
@@ -3443,10 +3822,24 @@ impl Program {
                                         )
                                         .on_input(Message::EditContextTokens)
                                         .on_submit(Message::ApplyContextTokens)
-                                        .padding(9)
+                                        .padding(
+                                            9.0 + self.settings_feedback(
+                                                SettingsFeedbackTarget::ContextWindow
+                                            ) * 0.8
+                                        )
                                         .width(Length::Fixed(130.0))
-                                        .style(text_input_style),
-                                        mini_button("Apply", Message::ApplyContextTokens),
+                                        .style(feedback_text_input_style(
+                                            self.settings_feedback(
+                                                SettingsFeedbackTarget::ContextWindow
+                                            )
+                                        )),
+                                        feedback_apply_button(
+                                            "Apply",
+                                            Message::ApplyContextTokens,
+                                            self.settings_feedback(
+                                                SettingsFeedbackTarget::ApplyContextWindow
+                                            ),
+                                        ),
                                     ],
                                 ]
                             )
@@ -3530,16 +3923,13 @@ impl Program {
                                             Message::UpdateTemperature,
                                         ),
                                         Space::new().width(Length::Fixed(12.0)),
-                                        container(
-                                            widget::text(format!(
-                                                "{:.1}",
-                                                self.user_information.temperature
-                                            ))
-                                            .size(13)
-                                            .color(text_main())
-                                        )
-                                        .padding(8)
-                                        .style(chip_style(accent())),
+                                        feedback_value_chip(
+                                            format!("{:.1}", self.user_information.temperature),
+                                            accent(),
+                                            self.settings_feedback(
+                                                SettingsFeedbackTarget::Temperature
+                                            ),
+                                        ),
                                     ],
                                 ]
                             )
@@ -3573,6 +3963,17 @@ impl Program {
 
                             Space::new().height(Length::Fixed(10.0)),
 
+                                ]
+                            ]
+                            .width(Length::Fill),
+
+                            Space::new().width(Length::Fixed(14.0)),
+
+                            widget::column![
+                                Space::new().height(Length::Fixed(
+                                    (1.0 - eased(self.page_reveal * 1.18 - 0.08)) * 22.0
+                                )),
+                                widget::column![
                             settings_group_title(tr(language, "APPEARANCE")),
                             Space::new().height(Length::Fixed(8.0)),
 
@@ -3590,16 +3991,13 @@ impl Program {
                                             Message::UpdateTextSize,
                                         ),
                                         Space::new().width(Length::Fixed(12.0)),
-                                        container(
-                                            widget::text(format!(
-                                                "{:.0}px",
-                                                self.user_information.text_size
-                                            ))
-                                            .size(13)
-                                            .color(text_main())
-                                        )
-                                        .padding(8)
-                                        .style(chip_style(accent_2())),
+                                        feedback_value_chip(
+                                            format!("{:.0}px", self.user_information.text_size),
+                                            accent_2(),
+                                            self.settings_feedback(
+                                                SettingsFeedbackTarget::TextSize
+                                            ),
+                                        ),
                                     ],
                                 ]
                             )
@@ -3681,16 +4079,13 @@ impl Program {
                                         )
                                         .step(1.0),
                                         Space::new().width(Length::Fixed(12.0)),
-                                        container(
-                                            widget::text(format!(
-                                                "{}",
-                                                self.web_search_settings.result_limit
-                                            ))
-                                            .size(13)
-                                            .color(text_main())
-                                        )
-                                        .padding(8)
-                                        .style(chip_style(accent_2())),
+                                        feedback_value_chip(
+                                            self.web_search_settings.result_limit.to_string(),
+                                            accent_2(),
+                                            self.settings_feedback(
+                                                SettingsFeedbackTarget::SearchResultLimit
+                                            ),
+                                        ),
                                     ],
                                     Space::new().height(Length::Fixed(12.0)),
                                     widget::row![
@@ -3705,10 +4100,16 @@ impl Program {
                                         .on_toggle(|_| Message::ToggleMultipleWebSearches),
                                     ],
                                     Space::new().height(Length::Fixed(16.0)),
-                                    widget::text(tr(language, "DEEP RESEARCH CONTROLS"))
-                                        .size(11)
-                                        .color(accent_2()),
-                                    Space::new().height(Length::Fixed(10.0)),
+                                    settings_disclosure_button(
+                                        tr(language, "Deep research controls"),
+                                        self.deep_research_controls_open,
+                                        Message::ToggleDeepResearchControls,
+                                    ),
+                                    if self.deep_research_controls_open {
+                                    widget::column![
+                                    Space::new().height(Length::Fixed(10.0 +
+                                        (1.0 - eased(self.page_reveal)) * 4.0
+                                    )),
                                     setting_label(
                                         tr(language, "Maximum searches"),
                                         tr(language, "Hard cap on distinct search queries in one deep-research response.")
@@ -3721,16 +4122,13 @@ impl Program {
                                         )
                                         .step(1.0),
                                         Space::new().width(Length::Fixed(12.0)),
-                                        container(
-                                            widget::text(format!(
-                                                "{}",
-                                                self.web_search_settings.maximum_searches
-                                            ))
-                                            .size(13)
-                                            .color(text_main())
-                                        )
-                                        .padding(8)
-                                        .style(chip_style(accent_2())),
+                                        feedback_value_chip(
+                                            self.web_search_settings.maximum_searches.to_string(),
+                                            accent_2(),
+                                            self.settings_feedback(
+                                                SettingsFeedbackTarget::MaximumSearches
+                                            ),
+                                        ),
                                     ],
                                     Space::new().height(Length::Fixed(12.0)),
                                     setting_label(
@@ -3745,16 +4143,13 @@ impl Program {
                                         )
                                         .step(1.0),
                                         Space::new().width(Length::Fixed(12.0)),
-                                        container(
-                                            widget::text(format!(
-                                                "{}",
-                                                self.web_search_settings.minimum_successful_searches
-                                            ))
-                                            .size(13)
-                                            .color(text_main())
-                                        )
-                                        .padding(8)
-                                        .style(chip_style(accent_2())),
+                                        feedback_value_chip(
+                                            self.web_search_settings.minimum_successful_searches.to_string(),
+                                            accent_2(),
+                                            self.settings_feedback(
+                                                SettingsFeedbackTarget::RequiredSearches
+                                            ),
+                                        ),
                                     ],
                                     Space::new().height(Length::Fixed(12.0)),
                                     setting_label(
@@ -3769,16 +4164,13 @@ impl Program {
                                         )
                                         .step(1.0),
                                         Space::new().width(Length::Fixed(12.0)),
-                                        container(
-                                            widget::text(format!(
-                                                "{}",
-                                                self.web_search_settings.maximum_page_fetches
-                                            ))
-                                            .size(13)
-                                            .color(text_main())
-                                        )
-                                        .padding(8)
-                                        .style(chip_style(accent_2())),
+                                        feedback_value_chip(
+                                            self.web_search_settings.maximum_page_fetches.to_string(),
+                                            accent_2(),
+                                            self.settings_feedback(
+                                                SettingsFeedbackTarget::MaximumPageReads
+                                            ),
+                                        ),
                                     ],
                                     Space::new().height(Length::Fixed(12.0)),
                                     setting_label(
@@ -3793,16 +4185,13 @@ impl Program {
                                         )
                                         .step(1.0),
                                         Space::new().width(Length::Fixed(12.0)),
-                                        container(
-                                            widget::text(format!(
-                                                "{}",
-                                                self.web_search_settings.minimum_independent_pages
-                                            ))
-                                            .size(13)
-                                            .color(text_main())
-                                        )
-                                        .padding(8)
-                                        .style(chip_style(accent_2())),
+                                        feedback_value_chip(
+                                            self.web_search_settings.minimum_independent_pages.to_string(),
+                                            accent_2(),
+                                            self.settings_feedback(
+                                                SettingsFeedbackTarget::RequiredPageReads
+                                            ),
+                                        ),
                                     ],
                                     Space::new().height(Length::Fixed(12.0)),
                                     setting_label(
@@ -3817,16 +4206,13 @@ impl Program {
                                         )
                                         .step(1.0),
                                         Space::new().width(Length::Fixed(12.0)),
-                                        container(
-                                            widget::text(format!(
-                                                "{}",
-                                                self.web_search_settings.tool_iteration_limit
-                                            ))
-                                            .size(13)
-                                            .color(text_main())
-                                        )
-                                        .padding(8)
-                                        .style(chip_style(accent_2())),
+                                        feedback_value_chip(
+                                            self.web_search_settings.tool_iteration_limit.to_string(),
+                                            accent_2(),
+                                            self.settings_feedback(
+                                                SettingsFeedbackTarget::ToolRounds
+                                            ),
+                                        ),
                                     ],
                                     Space::new().height(Length::Fixed(12.0)),
                                     setting_label(
@@ -3841,16 +4227,16 @@ impl Program {
                                         )
                                         .step(1.0),
                                         Space::new().width(Length::Fixed(12.0)),
-                                        container(
-                                            widget::text(format!(
+                                        feedback_value_chip(
+                                            format!(
                                                 "{}s",
                                                 self.web_search_settings.request_timeout_seconds
-                                            ))
-                                            .size(13)
-                                            .color(text_main())
-                                        )
-                                        .padding(8)
-                                        .style(chip_style(accent_2())),
+                                            ),
+                                            accent_2(),
+                                            self.settings_feedback(
+                                                SettingsFeedbackTarget::RequestTimeout
+                                            ),
+                                        ),
                                     ],
                                     Space::new().height(Length::Fixed(12.0)),
                                     setting_label(
@@ -3865,6 +4251,10 @@ impl Program {
                                     .padding(11)
                                     .width(Length::Fill)
                                     .style(text_input_style),
+                                    ]
+                                    } else {
+                                        widget::column![]
+                                    },
                                 ]
                             )
                             .padding(16)
@@ -3943,7 +4333,7 @@ impl Program {
                             Space::new().height(Length::Fixed(14.0)),
 
                             container(
-                                widget::row![
+                                widget::column![
                                     widget::column![
                                         widget::text(tr(language, "Maintenance"))
                                             .size(16)
@@ -3955,17 +4345,21 @@ impl Program {
                                     ]
                                     .width(Length::Fill),
 
-                                    danger_button(
-                                        tr(language, "Clear current context"),
-                                        Message::WipeChatHistory
-                                    ),
+                                    Space::new().height(Length::Fixed(12.0)),
 
-                                    Space::new().width(Length::Fixed(10.0)),
+                                    widget::row![
+                                        danger_button(
+                                            tr(language, "Clear current context"),
+                                            Message::WipeChatHistory
+                                        ),
 
-                                    secondary_button(
-                                        tr(language, "Advanced settings"),
-                                        Message::ToggleAdvancedSettings
-                                    ),
+                                        Space::new().width(Length::Fill),
+
+                                        secondary_button(
+                                            tr(language, "Advanced settings"),
+                                            Message::ToggleAdvancedSettings
+                                        ),
+                                    ],
                                 ]
                             )
                             .padding(16)
@@ -3977,6 +4371,9 @@ impl Program {
                             widget::text(self.debug_message.clone().message)
                                 .size(13)
                                 .color(debug_color),
+                                ]
+                            ]
+                            .width(Length::Fill),
                         ]
                     )
                     .padding(18)
@@ -4046,7 +4443,14 @@ impl Program {
                     .width(Length::Fill)
                     .style(top_bar_style),
                     Space::new().height(Length::Fixed(14.0)),
-                    container(widget::column![
+                    container(widget::row![
+                        widget::column![
+                            Space::new().height(Length::Fixed(
+                                (1.0 - eased(self.page_reveal * 1.12)) * 14.0
+                            )),
+                            settings_group_title(tr(language, "MODELS & SAFETY")),
+                            Space::new().height(Length::Fixed(8.0)),
+                            widget::column![
                         container(widget::column![
                             setting_label(tr(language, "System prompt"), tr(language, "Change the active prompt profile.")),
                             widget::pick_list(
@@ -4093,7 +4497,19 @@ impl Program {
                         .padding(16)
                         .width(Length::Fill)
                         .style(flat_card_style),
-                        Space::new().height(Length::Fixed(10.0)),
+                            ]
+                        ]
+                        .width(Length::Fill),
+
+                        Space::new().width(Length::Fixed(14.0)),
+
+                        widget::column![
+                            Space::new().height(Length::Fixed(
+                                (1.0 - eased(self.page_reveal * 1.18 - 0.08)) * 22.0
+                            )),
+                            settings_group_title(tr(language, "RUNTIME & CONNECTION")),
+                            Space::new().height(Length::Fixed(8.0)),
+                            widget::column![
                         container(widget::column![
                             setting_label(
                                 tr(language, "Batch tokens"),
@@ -4105,13 +4521,11 @@ impl Program {
                                     Message::ChangeBatchTokens(value as i32)
                                 },),
                                 Space::new().width(Length::Fixed(12.0)),
-                                container(
-                                    widget::text(format!("{}", self.batch_tokens))
-                                        .size(13)
-                                        .color(text_main())
-                                )
-                                .padding(8)
-                                .style(chip_style(accent())),
+                                feedback_value_chip(
+                                    self.batch_tokens.to_string(),
+                                    accent(),
+                                    self.settings_feedback(SettingsFeedbackTarget::BatchTokens),
+                                ),
                             ],
                         ])
                         .padding(16)
@@ -4181,6 +4595,9 @@ impl Program {
                         .padding(16)
                         .width(Length::Fill)
                         .style(flat_card_style),
+                            ]
+                        ]
+                        .width(Length::Fill),
                     ])
                     .padding(18)
                     .width(Length::Fill)

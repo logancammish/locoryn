@@ -26,8 +26,9 @@ mod web_search;
 
 use crate::app::{
     AppState, Channels, ChatImage, Correspondence, CurrentChat, DebugMessage,
-    DynamicPromptSettings, History, HostLocation, Language, Log, Prompt, SavedChat, SystemPrompt,
-    ThinkingLevel, UserInformation,
+    DynamicPromptSettings, History, HostLocation, LEGACY_PROFILE_ID, LEGACY_PROFILE_NAME,
+    Language, Log, Profile, ProfileRegistry, Prompt, SavedChat, SystemPrompt, ThinkingLevel,
+    UserInformation,
 };
 use crate::web_search::{
     ToolLoopProgress, ToolLoopRequest, WebSearchProviderKind, WebSearchSettings, WebSearchState,
@@ -49,6 +50,7 @@ const MAX_MARKDOWN_IMAGE_BYTES: usize = 12 * 1024 * 1024;
 const MAX_IMAGE_RESPONSE_BYTES: usize = MAX_MARKDOWN_IMAGE_BYTES * 2;
 const MAX_MARKDOWN_IMAGE_PIXELS: u64 = 32_000_000;
 const SETTINGS_SAVE_DEBOUNCE_MS: u64 = 450;
+const SETTINGS_FEEDBACK_DURATION_MS: u64 = 420;
 const DEFAULT_MAX_RESPONSE_TOKENS: u32 = 32_768;
 const DEFAULT_CONTEXT_TOKENS: u32 = 131_072;
 const MIN_RESPONSE_TOKENS: u32 = 512;
@@ -82,6 +84,24 @@ pub enum GUIState {
 enum UiResizeTarget {
     Sidebar,
     Composer,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsFeedbackTarget {
+    MaxResponse,
+    ApplyMaxResponse,
+    ContextWindow,
+    ApplyContextWindow,
+    Temperature,
+    TextSize,
+    SearchResultLimit,
+    MaximumSearches,
+    RequiredSearches,
+    MaximumPageReads,
+    RequiredPageReads,
+    ToolRounds,
+    RequestTimeout,
+    BatchTokens,
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -126,6 +146,7 @@ enum Message {
     ToggleChatMenu,
     ToggleWebSearch,
     ToggleMultipleWebSearches,
+    ToggleDeepResearchControls,
     ToggleChatWebSearch,
     WebSearchProviderChange(WebSearchProviderKind),
     WebSearchApiKeyChange(String),
@@ -187,6 +208,7 @@ enum Message {
     CopyPressed(String),
     CopyLatestResponse,
     ToggleThinking(usize),
+    ToggleSources(usize),
     UpdateTextSize(f32),
     InstallationPrompt,
     ModelChange(String),
@@ -204,9 +226,18 @@ enum Message {
     CodeChecked(Result<String, String>),
     ToggleDynamicDate,
     ToggleDynamicTime,
-    ToggleDynamicUserName,
-    DynamicUserNameChanged(String),
     DynamicCustomInstructionsChanged(String),
+    ToggleProfileMenu,
+    SelectProfile(String),
+    ProfileNameInputChanged(String),
+    CreateProfile,
+    StartEditProfile(String),
+    CancelEditProfile,
+    ProfileEditNameChanged(String),
+    ProfileEditUserNameChanged(String),
+    ProfileEditInstructionsChanged(String),
+    ConfirmProfileEdits,
+    DeleteProfile(String),
     LanguageChange(Language),
     ToggleInfoPopup,
     ToggleChatHistory,
@@ -234,6 +265,9 @@ struct ActivePrompt {
     had_image: bool,
     web_search_enabled: bool,
     temporary: bool,
+    /// The profile that owns the chat, captured when the prompt started so a
+    /// profile switch mid-response cannot orphan the finished chat.
+    profile_id: String,
 }
 
 struct LiveRender {
@@ -245,6 +279,7 @@ struct LiveRender {
 struct TemporaryChatSession {
     chat_history: Arc<Mutex<CurrentChat>>,
     web_search_enabled: bool,
+    profile_id: String,
 }
 
 #[derive(Clone, Debug)]
@@ -319,6 +354,11 @@ struct Program {
 
     /// Message indexes whose reasoning disclosure is open. Reasoning is hidden by default.
     expanded_thinking: HashSet<usize>,
+    /// Message indexes whose source disclosure is open. Sources are collapsed by default.
+    expanded_sources: HashSet<usize>,
+    deep_research_controls_open: bool,
+    settings_feedback: Option<(SettingsFeedbackTarget, Instant)>,
+    brand_icon: iced::widget::image::Handle,
 
     system_prompt: SystemPrompt,
     app_state: AppState,
@@ -345,6 +385,16 @@ struct Program {
     open_chat_dirty: bool,
     saved_chats: Vec<SavedChat>,
     chat_storage_dir: PathBuf,
+    /// Every chat belongs to a profile. The legacy profile collects the chats
+    /// saved before profiles existed.
+    profiles: Vec<Profile>,
+    active_profile_id: String,
+    profile_menu_open: bool,
+    profile_name_input: String,
+    editing_profile_id: Option<String>,
+    profile_edit_name: String,
+    profile_edit_user_name: String,
+    profile_edit_instructions: String,
     code_checking_enabled: bool,
     dynamic_prompt_settings: DynamicPromptSettings,
     max_response_tokens_input: String,
@@ -481,6 +531,72 @@ fn user_settings_path() -> PathBuf {
 
 fn history_path() -> PathBuf {
     app_data_dir().join("history.json")
+}
+
+fn profiles_path() -> PathBuf {
+    app_data_dir().join("profiles.json")
+}
+
+/// Chats saved before profiles existed carry no profile id; they belong to
+/// the legacy "Outdated Profile".
+fn chat_profile_id(chat: &SavedChat) -> &str {
+    chat.profile.as_deref().unwrap_or(LEGACY_PROFILE_ID)
+}
+
+/// Guarantees the registry contains the legacy profile and points at an
+/// existing active profile. Returns whether anything was changed.
+fn ensure_legacy_profile(registry: &mut ProfileRegistry) -> bool {
+    let mut changed = false;
+    if !registry.profiles.iter().any(|profile| profile.id == LEGACY_PROFILE_ID) {
+        registry.profiles.insert(
+            0,
+            Profile {
+                id: LEGACY_PROFILE_ID.to_string(),
+                name: LEGACY_PROFILE_NAME.to_string(),
+                user_name: String::new(),
+                custom_instructions: String::new(),
+            },
+        );
+        changed = true;
+    }
+    let active_is_known = registry
+        .profiles
+        .iter()
+        .any(|profile| profile.id == registry.active_profile_id);
+    if !active_is_known {
+        registry.active_profile_id = LEGACY_PROFILE_ID.to_string();
+        changed = true;
+    }
+    changed
+}
+
+/// Assigns every pre-profile chat to the legacy profile. Returns whether
+/// anything was changed.
+fn assign_legacy_profile_ids(saved_chats: &mut [SavedChat]) -> bool {
+    let mut changed = false;
+    for chat in saved_chats.iter_mut() {
+        if chat.profile.is_none() {
+            chat.profile = Some(LEGACY_PROFILE_ID.to_string());
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Frames the ongoing conversation as a single prompt. Naming the person the
+/// model is talking to keeps the profile's user name tied to the transcript
+/// itself, not only to a line buried in the system prompt.
+fn conversation_context_prompt(context: &str, user_name: &str, prompt: &str) -> String {
+    let user_name = user_name.trim();
+    let partner = if user_name.is_empty() { "a User" } else { user_name };
+    format!(
+        "The following is a conversation between an AI language model and {partner}. You are the AI language model:
+    {context}
+    [END CONVERSATION CONTEXT]
+    Now, the user is sending another message: {prompt}
+    Respond:
+    "
+    )
 }
 
 fn generated_images_dir() -> PathBuf {
@@ -1400,6 +1516,33 @@ impl Program {
         self.page_reveal = 0.0;
     }
 
+    fn trigger_settings_feedback(&mut self, target: SettingsFeedbackTarget) {
+        let should_restart = self.settings_feedback.is_none_or(|(active, started_at)| {
+            active != target || started_at.elapsed() >= Duration::from_millis(170)
+        });
+        if should_restart {
+            self.settings_feedback = Some((target, Instant::now()));
+        }
+    }
+
+    fn settings_feedback(&self, target: SettingsFeedbackTarget) -> f32 {
+        let Some((active, started_at)) = self.settings_feedback else {
+            return 0.0;
+        };
+        if active != target {
+            return 0.0;
+        }
+
+        let progress = (started_at.elapsed().as_secs_f32()
+            / (SETTINGS_FEEDBACK_DURATION_MS as f32 / 1_000.0))
+            .clamp(0.0, 1.0);
+        if progress >= 1.0 {
+            return 0.0;
+        }
+
+        (progress * std::f32::consts::PI * 3.0).sin().abs() * (1.0 - progress).powi(2)
+    }
+
     fn queue_missing_markdown_images(&mut self) -> Task<Message> {
         let mut urls = HashSet::new();
         let mut collect = |items: &[markdown::Item]| {
@@ -1471,6 +1614,9 @@ impl Program {
         !self.active_prompts.is_empty()
             || self.is_generating_image
             || self.page_reveal < 1.0
+            || self.settings_feedback.is_some_and(|(_, started_at)| {
+                started_at.elapsed() < Duration::from_millis(SETTINGS_FEEDBACK_DURATION_MS)
+            })
             || (sidebar_target - self.sidebar_animation).abs() >= 0.002
             || self
                 .markdown_images
@@ -1492,6 +1638,7 @@ impl Program {
         self.last_copied_text = None;
         self.last_copied_at = None;
         self.expanded_thinking.clear();
+        self.expanded_sources.clear();
         self.open_chat_dirty = false;
     }
 
@@ -1500,15 +1647,29 @@ impl Program {
             return;
         }
         let chat = self.user_information.chat_history.lock().unwrap().clone();
+        let profile = self
+            .saved_chats
+            .iter()
+            .find(|chat| chat.id == self.current_chat_id)
+            .map(chat_profile_id)
+            .map(str::to_string)
+            .unwrap_or_else(|| self.active_profile_id.clone());
         self.save_chat_snapshot(
             self.current_chat_id.clone(),
             &chat,
             self.web_search_for_chat,
+            profile,
         );
         self.open_chat_dirty = false;
     }
 
-    fn save_chat_snapshot(&mut self, id: String, chat: &CurrentChat, web_search_enabled: bool) {
+    fn save_chat_snapshot(
+        &mut self,
+        id: String,
+        chat: &CurrentChat,
+        web_search_enabled: bool,
+        profile: String,
+    ) {
         if chat.messages.is_empty() {
             return;
         }
@@ -1521,9 +1682,13 @@ impl Program {
             })
             .filter(|title: &String| !title.is_empty())
             .unwrap_or_else(|| "New chat".into());
-        let mut saved = SavedChat::from_current(id, title, chat, web_search_enabled);
+        let mut saved = SavedChat::from_current(id, title, chat, web_search_enabled, profile);
         if let Some(existing) = self.saved_chats.iter_mut().find(|item| item.id == saved.id) {
             saved.pinned = existing.pinned;
+            // A chat never changes profile when it is updated.
+            if existing.profile.is_some() {
+                saved.profile = existing.profile.clone();
+            }
             *existing = saved;
         } else {
             // New chats appear after the pinned section. Updating or opening an
@@ -1640,6 +1805,144 @@ impl Program {
             "chat_storage_dir": self.chat_storage_dir.to_string_lossy()
         });
         write_json_safely(&settings_path, &value)
+    }
+
+    fn persist_profiles(&mut self) {
+        let registry = ProfileRegistry {
+            profiles: self.profiles.clone(),
+            active_profile_id: self.active_profile_id.clone(),
+        };
+        if let Err(error) = write_json_safely(&profiles_path(), &registry) {
+            self.set_debug_message(DebugMessage {
+                message: format!("Could not save profiles: {error}"),
+                is_error: true,
+            });
+        }
+    }
+
+    fn profile_display_name(&self, profile_id: &str) -> String {
+        self.profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .map(|profile| profile.name.clone())
+            .unwrap_or_else(|| LEGACY_PROFILE_NAME.to_string())
+    }
+
+    fn active_profile_name(&self) -> String {
+        self.profile_display_name(&self.active_profile_id)
+    }
+
+    /// The only profile strings that may reach the model: its user name and
+    /// its extra instructions. The display name stays private.
+    fn profile_prompt_extras(&self, profile_id: &str) -> (String, String) {
+        self.profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .map(|profile| {
+                (
+                    profile.user_name.clone(),
+                    profile.custom_instructions.clone(),
+                )
+            })
+            .unwrap_or_default()
+    }
+
+    /// Opens the newest chat belonging to a profile, or starts a fresh one
+    /// when the profile has no chats yet.
+    fn open_latest_chat_for_profile(&mut self, profile_id: &str) -> Task<Message> {
+        let next_saved = self
+            .saved_chats
+            .iter()
+            .filter(|chat| chat_profile_id(chat) == profile_id)
+            .max_by(|left, right| left.updated_at.cmp(&right.updated_at))
+            .map(|chat| chat.id.clone());
+        if let Some(id) = next_saved {
+            return self.open_chat(id);
+        }
+
+        let next_temporary = self
+            .temporary_chats
+            .iter()
+            .find(|(_, session)| session.profile_id == profile_id)
+            .map(|(chat_id, _)| chat_id.clone());
+        if let Some(id) = next_temporary {
+            return self.open_chat(id);
+        }
+
+        self.temporary_chat = false;
+        self.current_chat_id = Self::new_chat_id();
+        self.web_search_for_chat = self.web_search_settings.enabled;
+        self.clear_open_chat();
+        Task::none()
+    }
+
+    fn switch_profile(&mut self, profile_id: String) -> Task<Message> {
+        if !self.profiles.iter().any(|profile| profile.id == profile_id)
+            || profile_id == self.active_profile_id
+        {
+            return Task::none();
+        }
+        self.save_open_chat();
+        self.active_profile_id = profile_id.clone();
+        self.persist_profiles();
+        let open_task = self.open_latest_chat_for_profile(&profile_id);
+        self.begin_page_transition();
+        open_task
+    }
+
+    fn open_chat(&mut self, id: String) -> Task<Message> {
+        self.save_open_chat();
+        let running_history = self
+            .active_prompts
+            .get(&id)
+            .map(|job| Arc::clone(&job.chat_history));
+        let running_settings = self
+            .active_prompts
+            .get(&id)
+            .map(|job| (job.temporary, job.web_search_enabled));
+        let temporary_history = self
+            .temporary_chats
+            .get(&id)
+            .map(|chat| Arc::clone(&chat.chat_history));
+        let temporary_settings = self
+            .temporary_chats
+            .get(&id)
+            .map(|chat| (true, chat.web_search_enabled));
+        let chat_settings = running_settings.or(temporary_settings);
+        let saved = self.saved_chats.iter().find(|chat| chat.id == id).cloned();
+        let saved_web_search_enabled = saved.as_ref().and_then(|chat| chat.web_search_enabled);
+        if let Some(chat_history) = running_history
+            .or(temporary_history)
+            .or_else(|| saved.map(|chat| Arc::new(Mutex::new(chat.to_current()))))
+        {
+            self.current_chat_id = id;
+            if let Some((_, shown_at)) = self.chat_notices.get_mut(&self.current_chat_id) {
+                *shown_at = Instant::now();
+            }
+            self.temporary_chat = chat_settings
+                .map(|(temporary, _)| temporary)
+                .unwrap_or(false);
+            self.web_search_for_chat = chat_settings
+                .map(|(_, web_search_enabled)| web_search_enabled)
+                .or(saved_web_search_enabled)
+                .unwrap_or(self.web_search_settings.enabled);
+            self.user_information.chat_history = chat_history;
+            self.open_chat_dirty = false;
+            // Rendering caches are positional and belong only to the
+            // previously open chat.
+            self.chat_messages_cache.clear();
+            self.chat_thinking_cache.clear();
+            self.chat_visible_text_cache.clear();
+            self.chat_markdown_cache.clear();
+            self.chat_model_name_cache.clear();
+            self.expanded_thinking.clear();
+            self.expanded_sources.clear();
+            self.last_copied_text = None;
+            self.last_copied_at = None;
+            self.refresh_chat_markdown_cache();
+            self.begin_page_transition();
+        }
+        self.queue_missing_markdown_images()
     }
 
     fn set_debug_message(&mut self, debug_message: DebugMessage) {
@@ -1817,10 +2120,16 @@ impl Program {
                 TemporaryChatSession {
                     chat_history: Arc::clone(&job.chat_history),
                     web_search_enabled: job.web_search_enabled,
+                    profile_id: job.profile_id.clone(),
                 },
             );
         } else {
-            self.save_chat_snapshot(chat_id.to_string(), &completed_chat, job.web_search_enabled);
+            self.save_chat_snapshot(
+                chat_id.to_string(),
+                &completed_chat,
+                job.web_search_enabled,
+                job.profile_id.clone(),
+            );
         }
 
         if job.had_image
@@ -1934,8 +2243,32 @@ impl Program {
             }
         });
 
-        let system_prompt: Option<String> = SystemPrompt::get_current(self)
-            .map(|base| self.dynamic_prompt_settings.apply(&base, Local::now()));
+        // The prompt belongs to the chat's own profile, not whichever profile
+        // happens to be active when the response finishes.
+        let prompt_profile_id = if self.temporary_chat {
+            self.temporary_chats
+                .get(&self.current_chat_id)
+                .map(|session| session.profile_id.clone())
+                .unwrap_or_else(|| self.active_profile_id.clone())
+        } else {
+            self.saved_chats
+                .iter()
+                .find(|chat| chat.id == self.current_chat_id)
+                .map(chat_profile_id)
+                .map(str::to_string)
+                .unwrap_or_else(|| self.active_profile_id.clone())
+        };
+        let (prompt_user_name, prompt_profile_instructions) =
+            self.profile_prompt_extras(&prompt_profile_id);
+
+        let system_prompt: Option<String> = SystemPrompt::get_current(self).map(|base| {
+            self.dynamic_prompt_settings.apply(
+                &base,
+                Local::now(),
+                &prompt_user_name,
+                &prompt_profile_instructions,
+            )
+        });
 
         if system_prompt.is_none() {
             Channels::send_request_to_channel(
@@ -2003,6 +2336,7 @@ impl Program {
                 had_image,
                 web_search_enabled,
                 temporary: self.temporary_chat,
+                profile_id: prompt_profile_id,
             },
         );
 
@@ -2013,15 +2347,10 @@ impl Program {
                 let system_prompt: String = system_prompt.unwrap();
                 let ip = user_info.ip_address.clone();
                 let to_send_prompt: String = if user_info.current_chat_history_enabled {
-                    format!(
-                        "The following is a conversation between an AI language model and a User. You are the AI language model:
-                    {}
-                    [END CONVERSATION CONTEXT]
-                    Now, the user is sending another message: {}
-                    Respond:
-                    ",
-                        user_info.chat_history.lock().unwrap().unravel(),
-                        prompt.clone()
+                    conversation_context_prompt(
+                        &user_info.chat_history.lock().unwrap().unravel(),
+                        &prompt_user_name,
+                        &prompt,
                     )
                 } else {
                     prompt.clone()
@@ -2692,6 +3021,7 @@ impl Program {
 
             Message::ChangeBatchTokens(new_batch_tokens) => {
                 self.batch_tokens = new_batch_tokens;
+                self.trigger_settings_feedback(SettingsFeedbackTarget::BatchTokens);
                 Task::none()
             }
 
@@ -2772,6 +3102,12 @@ impl Program {
                 Task::none()
             }
 
+            Message::ToggleDeepResearchControls => {
+                self.deep_research_controls_open = !self.deep_research_controls_open;
+                self.begin_page_transition();
+                Task::none()
+            }
+
             Message::ToggleChatWebSearch => {
                 if self.current_chat_is_processing() {
                     self.set_debug_message(DebugMessage {
@@ -2807,6 +3143,7 @@ impl Program {
                 self.web_search_settings.result_limit =
                     (value.round() as usize).clamp(1, crate::web_search::MAX_RESULT_LIMIT);
                 self.persist_web_search_settings();
+                self.trigger_settings_feedback(SettingsFeedbackTarget::SearchResultLimit);
                 Task::none()
             }
 
@@ -2818,6 +3155,7 @@ impl Program {
                     .minimum_successful_searches
                     .min(self.web_search_settings.maximum_searches);
                 self.persist_web_search_settings();
+                self.trigger_settings_feedback(SettingsFeedbackTarget::MaximumSearches);
                 Task::none()
             }
 
@@ -2829,6 +3167,7 @@ impl Program {
                     .minimum_independent_pages
                     .min(self.web_search_settings.maximum_page_fetches);
                 self.persist_web_search_settings();
+                self.trigger_settings_feedback(SettingsFeedbackTarget::MaximumPageReads);
                 Task::none()
             }
 
@@ -2836,6 +3175,7 @@ impl Program {
                 self.web_search_settings.minimum_successful_searches =
                     (value.round() as usize).clamp(1, self.web_search_settings.maximum_searches);
                 self.persist_web_search_settings();
+                self.trigger_settings_feedback(SettingsFeedbackTarget::RequiredSearches);
                 Task::none()
             }
 
@@ -2843,6 +3183,7 @@ impl Program {
                 self.web_search_settings.minimum_independent_pages =
                     (value.round() as usize).min(self.web_search_settings.maximum_page_fetches);
                 self.persist_web_search_settings();
+                self.trigger_settings_feedback(SettingsFeedbackTarget::RequiredPageReads);
                 Task::none()
             }
 
@@ -2850,6 +3191,7 @@ impl Program {
                 self.web_search_settings.tool_iteration_limit = (value.round() as usize)
                     .clamp(2, crate::web_search::MAX_CONFIGURABLE_TOOL_ITERATIONS);
                 self.persist_web_search_settings();
+                self.trigger_settings_feedback(SettingsFeedbackTarget::ToolRounds);
                 Task::none()
             }
 
@@ -2857,6 +3199,7 @@ impl Program {
                 self.web_search_settings.request_timeout_seconds =
                     (value.round() as u64).clamp(3, 60);
                 self.persist_web_search_settings();
+                self.trigger_settings_feedback(SettingsFeedbackTarget::RequestTimeout);
                 Task::none()
             }
 
@@ -2935,60 +3278,7 @@ impl Program {
                 Task::none()
             }
 
-            Message::OpenChat(id) => {
-                self.save_open_chat();
-                let running_history = self
-                    .active_prompts
-                    .get(&id)
-                    .map(|job| Arc::clone(&job.chat_history));
-                let running_settings = self
-                    .active_prompts
-                    .get(&id)
-                    .map(|job| (job.temporary, job.web_search_enabled));
-                let temporary_history = self
-                    .temporary_chats
-                    .get(&id)
-                    .map(|chat| Arc::clone(&chat.chat_history));
-                let temporary_settings = self
-                    .temporary_chats
-                    .get(&id)
-                    .map(|chat| (true, chat.web_search_enabled));
-                let chat_settings = running_settings.or(temporary_settings);
-                let saved = self.saved_chats.iter().find(|chat| chat.id == id).cloned();
-                let saved_web_search_enabled =
-                    saved.as_ref().and_then(|chat| chat.web_search_enabled);
-                if let Some(chat_history) = running_history
-                    .or(temporary_history)
-                    .or_else(|| saved.map(|chat| Arc::new(Mutex::new(chat.to_current()))))
-                {
-                    self.current_chat_id = id;
-                    if let Some((_, shown_at)) = self.chat_notices.get_mut(&self.current_chat_id) {
-                        *shown_at = Instant::now();
-                    }
-                    self.temporary_chat = chat_settings
-                        .map(|(temporary, _)| temporary)
-                        .unwrap_or(false);
-                    self.web_search_for_chat = chat_settings
-                        .map(|(_, web_search_enabled)| web_search_enabled)
-                        .or(saved_web_search_enabled)
-                        .unwrap_or(self.web_search_settings.enabled);
-                    self.user_information.chat_history = chat_history;
-                    self.open_chat_dirty = false;
-                    // Rendering caches are positional and belong only to the
-                    // previously open chat.
-                    self.chat_messages_cache.clear();
-                    self.chat_thinking_cache.clear();
-                    self.chat_visible_text_cache.clear();
-                    self.chat_markdown_cache.clear();
-                    self.chat_model_name_cache.clear();
-                    self.expanded_thinking.clear();
-                    self.last_copied_text = None;
-                    self.last_copied_at = None;
-                    self.refresh_chat_markdown_cache();
-                    self.begin_page_transition();
-                }
-                self.queue_missing_markdown_images()
-            }
+            Message::OpenChat(id) => self.open_chat(id),
 
             Message::DeleteChat(id) => {
                 if self.active_prompts.contains_key(&id) {
@@ -3025,11 +3315,26 @@ impl Program {
             }
 
             Message::ToggleChatPin(id) => {
-                if let Some(chat) = self.saved_chats.iter_mut().find(|chat| chat.id == id) {
+                if let Some(index) = self.saved_chats.iter().position(|chat| chat.id == id) {
+                    let mut chat = self.saved_chats.remove(index);
                     chat.pinned = !chat.pinned;
-                    // Stable sorting changes only the toggled chat's section and
-                    // preserves the relative order of every other chat.
-                    self.saved_chats.sort_by_key(|chat| !chat.pinned);
+                    let pinned_count =
+                        self.saved_chats.iter().filter(|chat| chat.pinned).count();
+                    let insert_at = if chat.pinned {
+                        // New pins stack right after the chats already pinned.
+                        pinned_count
+                    } else {
+                        // Unpinning returns the chat to its place in time among
+                        // the unpinned chats (newest first) instead of leaving
+                        // it at the top of the list.
+                        self.saved_chats
+                            .iter()
+                            .skip(pinned_count)
+                            .position(|other| other.updated_at < chat.updated_at)
+                            .map(|offset| pinned_count + offset)
+                            .unwrap_or(self.saved_chats.len())
+                    };
+                    self.saved_chats.insert(insert_at, chat);
                     self.persist_saved_chats();
                 }
                 Task::none()
@@ -3096,6 +3401,20 @@ impl Program {
                 if result.is_ok() {
                     self.saved_chats =
                         read_json_with_backup(&folder.join("chats.json")).unwrap_or_default();
+                    // Chats from another install may predate profiles; adopt
+                    // them into the legacy profile instead of hiding them.
+                    let mut registry = ProfileRegistry {
+                        profiles: self.profiles.clone(),
+                        active_profile_id: self.active_profile_id.clone(),
+                    };
+                    let changed = ensure_legacy_profile(&mut registry)
+                        | assign_legacy_profile_ids(&mut self.saved_chats);
+                    if changed {
+                        self.profiles = registry.profiles;
+                        self.active_profile_id = registry.active_profile_id;
+                        self.persist_profiles();
+                        self.persist_saved_chats();
+                    }
                 } else {
                     self.chat_storage_dir = previous_directory;
                 }
@@ -3313,6 +3632,7 @@ impl Program {
 
             Message::UpdateTextSize(n) => {
                 self.user_information.text_size = n;
+                self.trigger_settings_feedback(SettingsFeedbackTarget::TextSize);
                 Task::none()
             }
 
@@ -3351,6 +3671,7 @@ impl Program {
 
             Message::UpdateTemperature(n) => {
                 self.user_information.temperature = n;
+                self.trigger_settings_feedback(SettingsFeedbackTarget::Temperature);
                 Task::none()
             }
 
@@ -3362,6 +3683,7 @@ impl Program {
                 self.user_information.max_response_tokens = tokens;
                 self.max_response_tokens_input = tokens.to_string();
                 self.persist_setting_value("max_response_tokens", serde_json::Value::from(tokens));
+                self.trigger_settings_feedback(SettingsFeedbackTarget::MaxResponse);
                 Task::none()
             }
 
@@ -3371,6 +3693,7 @@ impl Program {
             }
 
             Message::ApplyMaxResponseTokens => {
+                self.trigger_settings_feedback(SettingsFeedbackTarget::ApplyMaxResponse);
                 match self.max_response_tokens_input.trim().parse::<u32>() {
                     Ok(tokens) if (MIN_RESPONSE_TOKENS..=MAX_RESPONSE_TOKENS).contains(&tokens) => {
                         self.user_information.max_response_tokens = tokens;
@@ -3397,6 +3720,7 @@ impl Program {
                 self.user_information.context_tokens = tokens;
                 self.context_tokens_input = tokens.to_string();
                 self.persist_setting_value("context_tokens", serde_json::Value::from(tokens));
+                self.trigger_settings_feedback(SettingsFeedbackTarget::ContextWindow);
                 Task::none()
             }
 
@@ -3406,6 +3730,7 @@ impl Program {
             }
 
             Message::ApplyContextTokens => {
+                self.trigger_settings_feedback(SettingsFeedbackTarget::ApplyContextWindow);
                 match self.context_tokens_input.trim().parse::<u32>() {
                     Ok(tokens) if (MIN_CONTEXT_TOKENS..=MAX_CONTEXT_TOKENS).contains(&tokens) => {
                         self.user_information.context_tokens = tokens;
@@ -3478,16 +3803,165 @@ impl Program {
                 Task::none()
             }
 
-            Message::ToggleDynamicUserName => {
-                self.dynamic_prompt_settings.include_user_name =
-                    !self.dynamic_prompt_settings.include_user_name;
-                self.persist_dynamic_prompt_settings();
+            Message::ToggleProfileMenu => {
+                self.profile_menu_open = !self.profile_menu_open;
+                if !self.profile_menu_open {
+                    self.editing_profile_id = None;
+                }
                 Task::none()
             }
 
-            Message::DynamicUserNameChanged(value) => {
-                self.dynamic_prompt_settings.user_name = value;
-                self.persist_dynamic_prompt_settings();
+            Message::SelectProfile(id) => {
+                self.profile_menu_open = false;
+                self.editing_profile_id = None;
+                self.switch_profile(id)
+            }
+
+            Message::ProfileNameInputChanged(value) => {
+                self.profile_name_input = value;
+                Task::none()
+            }
+
+            Message::CreateProfile => {
+                let name = self.profile_name_input.trim().to_string();
+                if name.is_empty() {
+                    self.set_debug_message(DebugMessage {
+                        message: "Give the new profile a name first.".to_string(),
+                        is_error: false,
+                    });
+                    return Task::none();
+                }
+                if self
+                    .profiles
+                    .iter()
+                    .any(|profile| profile.name.eq_ignore_ascii_case(&name))
+                {
+                    self.set_debug_message(DebugMessage {
+                        message: "A profile with that name already exists.".to_string(),
+                        is_error: true,
+                    });
+                    return Task::none();
+                }
+                let id = format!(
+                    "profile-{}",
+                    chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+                );
+                self.profiles.push(Profile {
+                    id: id.clone(),
+                    name: name.clone(),
+                    user_name: String::new(),
+                    custom_instructions: String::new(),
+                });
+                self.profile_name_input.clear();
+                self.profile_menu_open = true;
+                // Open the editor so the new profile can be customised right
+                // away (user name and instructions stay empty by default).
+                self.profile_edit_name = name;
+                self.profile_edit_user_name.clear();
+                self.profile_edit_instructions.clear();
+                self.editing_profile_id = Some(id.clone());
+                self.switch_profile(id)
+            }
+
+            Message::StartEditProfile(id) => {
+                if let Some(profile) = self.profiles.iter().find(|profile| profile.id == id) {
+                    self.profile_edit_name = profile.name.clone();
+                    self.profile_edit_user_name = profile.user_name.clone();
+                    self.profile_edit_instructions = profile.custom_instructions.clone();
+                    self.editing_profile_id = Some(id);
+                    self.profile_menu_open = true;
+                }
+                Task::none()
+            }
+
+            Message::CancelEditProfile => {
+                self.editing_profile_id = None;
+                Task::none()
+            }
+
+            Message::ProfileEditNameChanged(value) => {
+                self.profile_edit_name = value;
+                Task::none()
+            }
+
+            Message::ProfileEditUserNameChanged(value) => {
+                self.profile_edit_user_name = value;
+                Task::none()
+            }
+
+            Message::ProfileEditInstructionsChanged(value) => {
+                self.profile_edit_instructions = value;
+                Task::none()
+            }
+
+            Message::ConfirmProfileEdits => {
+                let Some(id) = self.editing_profile_id.clone() else {
+                    return Task::none();
+                };
+                let name = self.profile_edit_name.trim().to_string();
+                if name.is_empty() {
+                    self.set_debug_message(DebugMessage {
+                        message: "Profile names cannot be empty.".to_string(),
+                        is_error: true,
+                    });
+                    return Task::none();
+                }
+                if self.profiles.iter().any(|profile| {
+                    profile.id != id && profile.name.eq_ignore_ascii_case(&name)
+                }) {
+                    self.set_debug_message(DebugMessage {
+                        message: "A profile with that name already exists.".to_string(),
+                        is_error: true,
+                    });
+                    return Task::none();
+                }
+                if let Some(profile) =
+                    self.profiles.iter_mut().find(|profile| profile.id == id)
+                {
+                    profile.name = name;
+                    profile.user_name = self.profile_edit_user_name.trim().to_string();
+                    profile.custom_instructions =
+                        self.profile_edit_instructions.trim().to_string();
+                }
+                self.editing_profile_id = None;
+                self.persist_profiles();
+                Task::none()
+            }
+
+            Message::DeleteProfile(id) => {
+                if id == self.active_profile_id {
+                    self.set_debug_message(DebugMessage {
+                        message: "Switch to another profile before deleting this one."
+                            .to_string(),
+                        is_error: false,
+                    });
+                    return Task::none();
+                }
+                let still_has_chats = self
+                    .saved_chats
+                    .iter()
+                    .any(|chat| chat_profile_id(chat) == id)
+                    || self
+                        .temporary_chats
+                        .values()
+                        .any(|session| session.profile_id == id)
+                    || self
+                        .active_prompts
+                        .values()
+                        .any(|job| job.profile_id == id);
+                if still_has_chats {
+                    self.set_debug_message(DebugMessage {
+                        message: "That profile still has chats. Delete them first."
+                            .to_string(),
+                        is_error: true,
+                    });
+                    return Task::none();
+                }
+                self.profiles.retain(|profile| profile.id != id);
+                if self.editing_profile_id.as_deref() == Some(id.as_str()) {
+                    self.editing_profile_id = None;
+                }
+                self.persist_profiles();
                 Task::none()
             }
 
@@ -3515,6 +3989,13 @@ impl Program {
             Message::ToggleThinking(index) => {
                 if !self.expanded_thinking.insert(index) {
                     self.expanded_thinking.remove(&index);
+                }
+                Task::none()
+            }
+
+            Message::ToggleSources(index) => {
+                if !self.expanded_sources.insert(index) {
+                    self.expanded_sources.remove(&index);
                 }
                 Task::none()
             }
@@ -3984,7 +4465,7 @@ impl Default for Program {
                 .or(legacy_configured_dir)
                 .unwrap_or_else(default_chat_storage_dir);
 
-        let saved_chats: Vec<SavedChat> =
+        let mut saved_chats: Vec<SavedChat> =
             read_json_with_backup(&chat_storage_dir.join("chats.json"))
                 .or_else(|| {
                     fs::read_to_string("./output/chats.json")
@@ -3992,8 +4473,20 @@ impl Default for Program {
                         .and_then(|data| serde_json::from_str(&data).ok())
                 })
                 .unwrap_or_default();
+
+        // First launch after the profiles update: adopt every existing chat
+        // into the legacy "Outdated Profile" so nothing is lost or moved.
+        // The registry file is written the first time the user changes it.
+        let mut profiles_registry =
+            read_json_with_backup::<ProfileRegistry>(&profiles_path()).unwrap_or_default();
+        ensure_legacy_profile(&mut profiles_registry);
+        assign_legacy_profile_ids(&mut saved_chats);
+        let profiles = profiles_registry.profiles.clone();
+        let active_profile_id = profiles_registry.active_profile_id.clone();
+
         let restored_chat = saved_chats
             .iter()
+            .filter(|chat| chat_profile_id(chat) == active_profile_id)
             .max_by(|left, right| left.updated_at.cmp(&right.updated_at))
             .cloned();
         let current_chat_id = restored_chat
@@ -4044,6 +4537,14 @@ impl Default for Program {
             open_chat_dirty: false,
             saved_chats,
             chat_storage_dir,
+            profiles,
+            active_profile_id,
+            profile_menu_open: false,
+            profile_name_input: String::new(),
+            editing_profile_id: None,
+            profile_edit_name: String::new(),
+            profile_edit_user_name: String::new(),
+            profile_edit_instructions: String::new(),
             code_checking_enabled,
             dynamic_prompt_settings,
             max_response_tokens_input: max_response_tokens.to_string(),
@@ -4081,6 +4582,12 @@ impl Default for Program {
             vision_responses: HashMap::new(),
             markdown_images: HashMap::new(),
             expanded_thinking: HashSet::new(),
+            expanded_sources: HashSet::new(),
+            deep_research_controls_open: false,
+            settings_feedback: None,
+            brand_icon: iced::widget::image::Handle::from_bytes(
+                include_bytes!("../assets/icon-transparent.png").to_vec(),
+            ),
 
             system_prompt: SystemPrompt {
                 system_prompts_as_hashmap: system_prompts_as_prompt,
@@ -4197,12 +4704,15 @@ mod tests {
     use iced_widget::markdown;
 
     use super::{
-        ActivePrompt, Correspondence, CurrentChat, Message, ModelCapabilities, Point, Program,
-        Size, ThinkingLevel, ToolLoopProgress, UiResizeTarget, WebSearchState, app_data_dir,
-        canonical_code_language, censor_text, compare_versions, decode_generation_line,
-        disabled_web_tool_message, generated_image_payload, model_capabilities,
-        normalize_code_fence_languages, parse_markdown_items, read_json_with_backup,
-        remote_image_url_is_safe, sidecar_path, split_thinking_text, write_json_safely,
+        ActivePrompt, Correspondence, CurrentChat, LEGACY_PROFILE_ID, Message, ModelCapabilities,
+        Point, Profile, ProfileRegistry, Program, SavedChat, SettingsFeedbackTarget, Size,
+        ThinkingLevel, ToolLoopProgress, UiResizeTarget, UserInformation, WebSearchState,
+        app_data_dir, assign_legacy_profile_ids, canonical_code_language, censor_text,
+        chat_profile_id, compare_versions, conversation_context_prompt,
+        decode_generation_line, disabled_web_tool_message, ensure_legacy_profile,
+        generated_image_payload, model_capabilities, normalize_code_fence_languages,
+        parse_markdown_items, read_json_with_backup, remote_image_url_is_safe, sidecar_path,
+        split_thinking_text, write_json_safely,
     };
 
     fn test_active_prompt(
@@ -4229,7 +4739,28 @@ mod tests {
             had_image: false,
             web_search_enabled: true,
             temporary: false,
+            profile_id: LEGACY_PROFILE_ID.to_string(),
         }
+    }
+
+    fn empty_current_chat() -> CurrentChat {
+        CurrentChat {
+            chats: vec![],
+            messages: vec![],
+            bot_responding: false,
+        }
+    }
+
+    fn test_saved_chat(id: &str, profile: &str, updated_at: &str) -> SavedChat {
+        let mut chat = SavedChat::from_current(
+            id.to_string(),
+            format!("{id} title"),
+            &empty_current_chat(),
+            false,
+            profile.to_string(),
+        );
+        chat.updated_at = updated_at.to_string();
+        chat
     }
 
     #[test]
@@ -4309,6 +4840,50 @@ mod tests {
 
         program.begin_page_transition();
         assert!(program.needs_frame_updates());
+    }
+
+    #[test]
+    fn response_sources_are_collapsed_until_explicitly_opened() {
+        let mut program = Program::default();
+        assert!(program.expanded_sources.is_empty());
+
+        let _ = program.update(Message::ToggleSources(3));
+        assert!(program.expanded_sources.contains(&3));
+
+        let _ = program.update(Message::ToggleSources(3));
+        assert!(!program.expanded_sources.contains(&3));
+    }
+
+    #[test]
+    fn settings_value_changes_start_spring_feedback_frames() {
+        let mut program = Program {
+            page_reveal: 1.0,
+            sidebar_animation: 1.0,
+            ..Program::default()
+        };
+        assert!(program.settings_feedback.is_none());
+
+        let _ = program.update(Message::UpdateTemperature(0.7));
+        assert!(matches!(
+            program.settings_feedback,
+            Some((SettingsFeedbackTarget::Temperature, _))
+        ));
+        assert!(program.needs_frame_updates());
+
+        let _ = program.update(Message::ApplyContextTokens);
+        assert!(matches!(
+            program.settings_feedback,
+            Some((SettingsFeedbackTarget::ApplyContextWindow, _))
+        ));
+    }
+
+    #[test]
+    fn deep_research_controls_are_collapsed_by_default() {
+        let mut program = Program::default();
+        assert!(!program.deep_research_controls_open);
+
+        let _ = program.update(Message::ToggleDeepResearchControls);
+        assert!(program.deep_research_controls_open);
     }
 
     #[test]
@@ -4760,5 +5335,376 @@ mod tests {
                 "{blocked} should be blocked"
             );
         }
+    }
+
+    #[test]
+    fn pre_profile_chats_are_adopted_by_the_outdated_profile() {
+        let legacy_json = r#"{
+            "id":"chat-old",
+            "title":"Older chat",
+            "updated_at":"2026-01-01T00:00:00Z",
+            "context":[],
+            "messages":[]
+        }"#;
+        let mut chats: Vec<SavedChat> = vec![serde_json::from_str(legacy_json).unwrap()];
+        assert_eq!(chats[0].profile, None);
+
+        let changed = assign_legacy_profile_ids(&mut chats);
+
+        assert!(changed);
+        assert_eq!(chats[0].profile.as_deref(), Some(LEGACY_PROFILE_ID));
+        assert_eq!(chat_profile_id(&chats[0]), LEGACY_PROFILE_ID);
+    }
+
+    #[test]
+    fn profiled_chats_keep_their_profile_during_migration() {
+        let mut chats = vec![test_saved_chat("chat-1", "profile-9", "2026-01-01T00:00:00Z")];
+
+        let changed = assign_legacy_profile_ids(&mut chats);
+
+        assert!(!changed);
+        assert_eq!(chats[0].profile.as_deref(), Some("profile-9"));
+    }
+
+    #[test]
+    fn empty_registry_gains_the_outdated_profile_and_selects_it() {
+        let mut registry = ProfileRegistry::default();
+
+        let changed = ensure_legacy_profile(&mut registry);
+
+        assert!(changed);
+        assert_eq!(registry.profiles.len(), 1);
+        assert_eq!(registry.profiles[0].id, LEGACY_PROFILE_ID);
+        assert_eq!(registry.profiles[0].name, "Outdated Profile");
+        assert_eq!(registry.active_profile_id, LEGACY_PROFILE_ID);
+    }
+
+    #[test]
+    fn migration_keeps_a_valid_active_profile_selected() {
+        let mut registry = ProfileRegistry {
+            profiles: vec![
+                Profile {
+                    id: LEGACY_PROFILE_ID.into(),
+                    name: "Outdated Profile".into(),
+                    user_name: String::new(),
+                    custom_instructions: String::new(),
+                },
+                Profile {
+                    id: "profile-1".into(),
+                    name: "Logan".into(),
+                    user_name: String::new(),
+                    custom_instructions: String::new(),
+                },
+            ],
+            active_profile_id: "profile-1".into(),
+        };
+
+        let changed = ensure_legacy_profile(&mut registry);
+
+        assert!(!changed);
+        assert_eq!(registry.active_profile_id, "profile-1");
+    }
+
+    #[test]
+    fn switching_profiles_opens_that_profiles_newest_chat() {
+        let mut program = Program {
+            profiles: vec![
+                Profile {
+                    id: LEGACY_PROFILE_ID.into(),
+                    name: "Outdated Profile".into(),
+                    user_name: String::new(),
+                    custom_instructions: String::new(),
+                },
+                Profile {
+                    id: "profile-1".into(),
+                    name: "Logan".into(),
+                    user_name: String::new(),
+                    custom_instructions: String::new(),
+                },
+            ],
+            active_profile_id: LEGACY_PROFILE_ID.to_string(),
+            saved_chats: vec![
+                test_saved_chat("chat-legacy", LEGACY_PROFILE_ID, "2026-01-03T00:00:00Z"),
+                test_saved_chat("chat-b", "profile-1", "2026-01-02T00:00:00Z"),
+                test_saved_chat("chat-a", "profile-1", "2026-01-01T00:00:00Z"),
+            ],
+            ..Program::default()
+        };
+
+        drop(program.update(Message::SelectProfile("profile-1".into())));
+
+        assert_eq!(program.active_profile_id, "profile-1");
+        assert_eq!(program.current_chat_id, "chat-b");
+        assert!(!program.profile_menu_open);
+    }
+
+    #[test]
+    fn switching_to_an_empty_profile_starts_a_fresh_chat() {
+        let mut program = Program {
+            profiles: vec![
+                Profile {
+                    id: LEGACY_PROFILE_ID.into(),
+                    name: "Outdated Profile".into(),
+                    user_name: String::new(),
+                    custom_instructions: String::new(),
+                },
+                Profile {
+                    id: "profile-1".into(),
+                    name: "Logan".into(),
+                    user_name: String::new(),
+                    custom_instructions: String::new(),
+                },
+            ],
+            active_profile_id: LEGACY_PROFILE_ID.to_string(),
+            saved_chats: vec![test_saved_chat(
+                "chat-legacy",
+                LEGACY_PROFILE_ID,
+                "2026-01-03T00:00:00Z",
+            )],
+            ..Program::default()
+        };
+
+        drop(program.update(Message::SelectProfile("profile-1".into())));
+
+        assert_eq!(program.active_profile_id, "profile-1");
+        assert!(program
+            .saved_chats
+            .iter()
+            .all(|chat| chat.id != program.current_chat_id));
+        assert!(!program.temporary_chat);
+        assert!(program.chat_messages_cache.is_empty());
+    }
+
+    #[test]
+    fn profiles_with_chats_cannot_be_deleted() {
+        let mut program = Program {
+            profiles: vec![
+                Profile {
+                    id: LEGACY_PROFILE_ID.into(),
+                    name: "Outdated Profile".into(),
+                    user_name: String::new(),
+                    custom_instructions: String::new(),
+                },
+                Profile {
+                    id: "profile-1".into(),
+                    name: "Logan".into(),
+                    user_name: String::new(),
+                    custom_instructions: String::new(),
+                },
+            ],
+            active_profile_id: LEGACY_PROFILE_ID.to_string(),
+            saved_chats: vec![test_saved_chat("chat-1", "profile-1", "2026-01-01T00:00:00Z")],
+            ..Program::default()
+        };
+
+        drop(program.update(Message::DeleteProfile("profile-1".into())));
+        assert!(program.profiles.iter().any(|profile| profile.id == "profile-1"));
+
+        // The active profile is protected as well.
+        drop(program.update(Message::DeleteProfile(LEGACY_PROFILE_ID.into())));
+        assert!(program
+            .profiles
+            .iter()
+            .any(|profile| profile.id == LEGACY_PROFILE_ID));
+
+        program.saved_chats.clear();
+        drop(program.update(Message::DeleteProfile("profile-1".into())));
+        assert!(program
+            .profiles
+            .iter()
+            .all(|profile| profile.id != "profile-1"));
+    }
+
+    #[test]
+    fn new_chats_are_saved_into_the_active_profile() {
+        let default_program = Program::default();
+        let user_information = UserInformation {
+            chat_history: Arc::new(Mutex::new(CurrentChat {
+                chats: Vec::new(),
+                messages: vec![Correspondence::User {
+                    text: "Hello there".to_string(),
+                    images: Vec::new(),
+                }],
+                bot_responding: false,
+            })),
+            ..default_program.user_information.clone()
+        };
+        let mut program = Program {
+            profiles: vec![Profile {
+                id: "profile-1".into(),
+                name: "Logan".into(),
+                user_name: String::new(),
+                custom_instructions: String::new(),
+            }],
+            active_profile_id: "profile-1".to_string(),
+            current_chat_id: "chat-new".to_string(),
+            open_chat_dirty: true,
+            user_information,
+            ..default_program
+        };
+
+        program.save_open_chat();
+
+        let saved = program
+            .saved_chats
+            .iter()
+            .find(|chat| chat.id == "chat-new")
+            .expect("new chat should be saved");
+        assert_eq!(saved.profile.as_deref(), Some("profile-1"));
+    }
+
+    #[test]
+    fn system_prompt_shares_profile_user_name_but_not_display_name() {
+        let program = Program {
+            profiles: vec![Profile {
+                id: "profile-1".into(),
+                name: "Secret label".into(),
+                user_name: "Logan".into(),
+                custom_instructions: "Answer like a pirate.".into(),
+            }],
+            active_profile_id: "profile-1".to_string(),
+            ..Program::default()
+        };
+
+        let (user_name, instructions) = program.profile_prompt_extras("profile-1");
+        let prompt = program.dynamic_prompt_settings.apply(
+            "You are helpful.",
+            chrono::Local::now(),
+            &user_name,
+            &instructions,
+        );
+
+        assert!(prompt.contains("The user's name is Logan."));
+        assert!(prompt.contains("Answer like a pirate."));
+        assert!(!prompt.contains("Secret label"));
+    }
+
+    #[test]
+    fn confirming_profile_edits_updates_name_user_name_and_instructions() {
+        let mut program = Program {
+            profiles: vec![Profile {
+                id: "profile-1".into(),
+                name: "Work".into(),
+                user_name: String::new(),
+                custom_instructions: String::new(),
+            }],
+            active_profile_id: "profile-1".to_string(),
+            ..Program::default()
+        };
+
+        drop(program.update(Message::StartEditProfile("profile-1".into())));
+        drop(program.update(Message::ProfileEditNameChanged("Personal".into())));
+        drop(program.update(Message::ProfileEditUserNameChanged("Logan".into())));
+        drop(program.update(Message::ProfileEditInstructionsChanged(
+            "Keep it casual.".into(),
+        )));
+        drop(program.update(Message::ConfirmProfileEdits));
+
+        let profile = &program.profiles[0];
+        assert_eq!(profile.name, "Personal");
+        assert_eq!(profile.user_name, "Logan");
+        assert_eq!(profile.custom_instructions, "Keep it casual.");
+        assert!(program.editing_profile_id.is_none());
+    }
+
+    #[test]
+    fn system_prompt_phrases_user_name_as_an_instruction() {
+        let program = Program {
+            profiles: vec![Profile {
+                id: "profile-1".into(),
+                name: "Label".into(),
+                user_name: "Logan".into(),
+                custom_instructions: String::new(),
+            }],
+            active_profile_id: "profile-1".to_string(),
+            ..Program::default()
+        };
+
+        let (user_name, instructions) = program.profile_prompt_extras("profile-1");
+        let prompt = program.dynamic_prompt_settings.apply(
+            "You are helpful.",
+            chrono::Local::now(),
+            &user_name,
+            &instructions,
+        );
+
+        assert!(prompt.contains(
+            "The user's name is Logan. Use this name when addressing the user."
+        ));
+    }
+
+    #[test]
+    fn conversation_context_names_the_user_the_profile_provides() {
+        let prompt = conversation_context_prompt(
+            "User: Hello there",
+            "Logan",
+            "What is my name?",
+        );
+
+        assert!(prompt
+            .contains("a conversation between an AI language model and Logan. You are the AI language model:"));
+        assert!(prompt.contains("User: Hello there"));
+        assert!(prompt.contains("What is my name?"));
+    }
+
+    #[test]
+    fn conversation_context_falls_back_to_anonymous_user_without_a_name() {
+        let prompt = conversation_context_prompt("User: Hello there", "   ", "Hi");
+
+        assert!(prompt
+            .contains("a conversation between an AI language model and a User. You are the AI language model:"));
+    }
+
+    #[test]
+    fn pinning_moves_a_chat_to_the_pinned_section() {
+        let mut program = Program {
+            profiles: vec![Profile {
+                id: "profile-1".into(),
+                name: "Logan".into(),
+                user_name: String::new(),
+                custom_instructions: String::new(),
+            }],
+            active_profile_id: "profile-1".to_string(),
+            saved_chats: vec![
+                test_saved_chat("chat-a", "profile-1", "2026-01-03T00:00:00Z"),
+                test_saved_chat("chat-b", "profile-1", "2026-01-02T00:00:00Z"),
+                test_saved_chat("chat-c", "profile-1", "2026-01-01T00:00:00Z"),
+            ],
+            ..Program::default()
+        };
+
+        drop(program.update(Message::ToggleChatPin("chat-c".into())));
+
+        let ids: Vec<&str> = program.saved_chats.iter().map(|chat| chat.id.as_str()).collect();
+        assert_eq!(ids, vec!["chat-c", "chat-a", "chat-b"]);
+        assert!(program.saved_chats[0].pinned);
+    }
+
+    #[test]
+    fn unpinning_returns_a_chat_to_its_place_in_time() {
+        let mut program = Program {
+            profiles: vec![Profile {
+                id: "profile-1".into(),
+                name: "Logan".into(),
+                user_name: String::new(),
+                custom_instructions: String::new(),
+            }],
+            active_profile_id: "profile-1".to_string(),
+            saved_chats: vec![
+                test_saved_chat("chat-b", "profile-1", "2026-01-02T00:00:00Z"),
+                test_saved_chat("chat-a", "profile-1", "2026-01-03T00:00:00Z"),
+                test_saved_chat("chat-c", "profile-1", "2026-01-01T00:00:00Z"),
+            ],
+            ..Program::default()
+        };
+        program.saved_chats[0].pinned = true;
+
+        // chat-b is pinned at the top; unpinning should slot it back by its
+        // updated_at (2026-01-02) between chat-a (01-03) and chat-c (01-01).
+        drop(program.update(Message::ToggleChatPin("chat-b".into())));
+
+        let ids: Vec<&str> = program.saved_chats.iter().map(|chat| chat.id.as_str()).collect();
+        assert_eq!(ids, vec!["chat-a", "chat-b", "chat-c"]);
+        assert!(program.saved_chats.iter().all(|chat| !chat.pinned));
     }
 }

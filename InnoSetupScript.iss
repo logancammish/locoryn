@@ -1,4 +1,6 @@
-#define MyAppVersion "1.0.1"
+#ifndef MyAppVersion
+  #define MyAppVersion "1.0.1"
+#endif
 
 [Setup]
 AppName=Locoryn

@@ -1,22 +1,144 @@
-name: build
+name: Build desktop artifacts
 
 on:
+  workflow_dispatch:
   push:
-    branches: [ "main" ]
+    branches: [main, beta]
   pull_request:
-    branches: [ "main" ]
+    branches: [main, beta]
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   build:
+    name: ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Linux x86_64
+            runner: ubuntu-24.04
+            platform: linux-x86_64
+          - label: Windows x86_64
+            runner: windows-2022
+            platform: windows-x86_64
+          - label: macOS Apple Silicon
+            runner: macos-15
+            platform: macos-arm64
 
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --locked --release
+
+      - name: Prepare Linux portable and installer
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          portable="dist/locoryn-${{ matrix.platform }}"
+          installer="dist/locoryn-linux-installer"
+
+          mkdir -p "$portable" "$installer/payload"
+          install -m 755 target/release/locoryn "$portable/locoryn"
+          cp -R assets config "$portable/"
+
+          cp -R "$portable"/. "$installer/payload/"
+          printf '%s\n' "$version" > "$installer/payload/VERSION"
+          install -m 755 linux_installations/install-local.sh "$installer/install-linux.sh"
+          install -m 755 linux_installations/uninstall-linux.sh "$installer/uninstall-linux.sh"
+          install -m 644 linux_installations/io.github.logancammish.locoryn.desktop.in \
+            "$installer/io.github.logancammish.locoryn.desktop.in"
+          install -m 644 linux_installations/LOCAL_INSTALL_README.md "$installer/README.md"
+
+          tar -czf "dist/locoryn-${{ matrix.platform }}-portable.tar.gz" \
+            -C dist "locoryn-${{ matrix.platform }}"
+          tar -czf dist/locoryn-linux-local-installer.tar.gz \
+            -C dist locoryn-linux-installer
+
+      - name: Upload Linux portable
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: locoryn-${{ matrix.platform }}-portable
+          path: dist/locoryn-${{ matrix.platform }}-portable.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload Linux local installer
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: locoryn-linux-local-installer
+          path: dist/locoryn-linux-local-installer.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Prepare Windows portable
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $portable = "dist/locoryn-${{ matrix.platform }}"
+          New-Item -ItemType Directory -Force -Path $portable | Out-Null
+          Copy-Item target/release/locoryn.exe "$portable/locoryn.exe"
+          Copy-Item assets, config -Destination $portable -Recurse
+          Compress-Archive -Path "$portable/*" -DestinationPath "dist/locoryn-${{ matrix.platform }}-portable.zip"
+
+      - name: Upload Windows portable
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: locoryn-${{ matrix.platform }}-portable
+          path: dist/locoryn-${{ matrix.platform }}-portable.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Build Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --no-progress --yes
+          }
+          & $iscc "/DMyAppVersion=$version" InnoSetupScript.iss
+
+      - name: Upload Windows installer
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: locoryn-windows-x86_64-installer
+          path: dist/*-setup.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Prepare macOS portable
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          portable="dist/locoryn-${{ matrix.platform }}"
+          mkdir -p "$portable"
+          install -m 755 target/release/locoryn "$portable/locoryn"
+          cp -R assets config "$portable/"
+          tar -czf "dist/locoryn-${{ matrix.platform }}-portable.tar.gz" \
+            -C dist "locoryn-${{ matrix.platform }}"
+
+      - name: Upload macOS portable
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: locoryn-${{ matrix.platform }}-portable
+          path: dist/locoryn-${{ matrix.platform }}-portable.tar.gz
+          if-no-files-found: error
+          retention-days: 30

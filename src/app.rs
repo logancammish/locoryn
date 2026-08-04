@@ -14,6 +14,9 @@ pub enum Correspondence {
         text: String,
         model: Option<String>,
         thinking_seconds: Option<u64>,
+        /// Generation speed reported by Ollama for this reply. Measured from
+        /// the model's own statistics, so it is independent of render batching.
+        tokens_per_second: Option<f32>,
         sources: Vec<WebSource>,
         web_search_used: bool,
     },
@@ -44,6 +47,11 @@ pub struct SavedChat {
     pub models: Vec<Option<String>>,
     #[serde(default)]
     pub thinking_seconds: Vec<Option<u64>>,
+    /// Generation speed in tokens per second, as reported by Ollama's own
+    /// evaluation statistics for each reply. `None` when the response gave no
+    /// stats (web-search answers, cancellations, older chats).
+    #[serde(default)]
+    pub tokens_per_second: Vec<Option<f32>>,
     #[serde(default)]
     pub sources: Vec<Vec<WebSource>>,
     #[serde(default)]
@@ -51,6 +59,11 @@ pub struct SavedChat {
     /// `None` lets chats saved before 0.5.2 inherit the global default.
     #[serde(default)]
     pub web_search_enabled: Option<bool>,
+    /// The profile that owns this chat. `None` marks chats saved before
+    /// profiles existed; they belong to the legacy "Outdated Profile".
+    /// Older app versions ignore this field and keep reading every chat.
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 impl SavedChat {
@@ -59,6 +72,7 @@ impl SavedChat {
         title: String,
         chat: &CurrentChat,
         web_search_enabled: bool,
+        profile: String,
     ) -> Self {
         Self {
             id,
@@ -92,6 +106,16 @@ impl SavedChat {
                     Correspondence::User { .. } => None,
                 })
                 .collect(),
+            tokens_per_second: chat
+                .messages
+                .iter()
+                .map(|message| match message {
+                    Correspondence::Bot {
+                        tokens_per_second, ..
+                    } => *tokens_per_second,
+                    Correspondence::User { .. } => None,
+                })
+                .collect(),
             sources: chat
                 .messages
                 .iter()
@@ -114,6 +138,7 @@ impl SavedChat {
                 })
                 .collect(),
             web_search_enabled: Some(web_search_enabled),
+            profile: Some(profile),
         }
     }
 
@@ -133,6 +158,7 @@ impl SavedChat {
                         text: text.clone(),
                         model: self.models.get(index).cloned().flatten(),
                         thinking_seconds: self.thinking_seconds.get(index).copied().flatten(),
+                        tokens_per_second: self.tokens_per_second.get(index).copied().flatten(),
                         sources: self.sources.get(index).cloned().unwrap_or_default(),
                         web_search_used: self.web_search_used.get(index).copied().unwrap_or(false),
                     },
@@ -161,9 +187,11 @@ mod saved_chat_tests {
         assert!(!chat.pinned);
         assert!(chat.models.is_empty());
         assert!(chat.thinking_seconds.is_empty());
+        assert!(chat.tokens_per_second.is_empty());
         assert!(chat.sources.is_empty());
         assert!(chat.web_search_used.is_empty());
         assert_eq!(chat.web_search_enabled, None);
+        assert_eq!(chat.profile, None);
     }
 
     #[test]
@@ -177,8 +205,9 @@ mod saved_chat_tests {
                 },
                 Correspondence::Bot {
                     text: "<think>Work</think>Answer".into(),
-                    model: Some("model-a".into()),
+                    model: Some("model-a".into(),
                     thinking_seconds: Some(30),
+                    tokens_per_second: Some(18.75),
                     sources: vec![crate::web_search::WebSource {
                         title: "Example".into(),
                         url: "https://example.com".into(),
@@ -189,20 +218,57 @@ mod saved_chat_tests {
             bot_responding: false,
         };
 
-        let saved = SavedChat::from_current("chat-1".into(), "Question".into(), &current, true);
+        let saved = SavedChat::from_current(
+            "chat-1".into(),
+            "Question".into(),
+            &current,
+            true,
+            "profile-1".into(),
+        );
         assert_eq!(saved.web_search_enabled, Some(true));
+        assert_eq!(saved.profile.as_deref(), Some("profile-1"));
+        assert_eq!(saved.tokens_per_second, vec![None, Some(18.75)]);
         let reopened = saved.to_current();
         assert!(matches!(
             &reopened.messages[1],
             Correspondence::Bot {
                 model: Some(model),
                 thinking_seconds: Some(30),
+                tokens_per_second: Some(tps),
                 sources,
                 web_search_used: true,
                 ..
-            } if model == "model-a" && sources.len() == 1
+            } if model == "model-a" && sources.len() == 1 && (tps - 18.75).abs() < f32::EPSILON
         ));
     }
+}
+
+/// The profile that owns every chat saved before profiles existed.
+pub const LEGACY_PROFILE_ID: &str = "legacy";
+pub const LEGACY_PROFILE_NAME: &str = "Outdated Profile";
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Profile {
+    pub id: String,
+    /// Display label shown in the profile switcher. It is private to the
+    /// user and never sent to the model.
+    pub name: String,
+    /// The name the model is told the user goes by. Empty shares no name.
+    #[serde(default)]
+    pub user_name: String,
+    /// Per-profile text appended to the system prompt after the global
+    /// custom instructions.
+    #[serde(default)]
+    pub custom_instructions: String,
+}
+
+/// Persisted beside the other app data. Kept tolerant of missing fields so a
+/// partially written file still yields a usable legacy profile.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ProfileRegistry {
+    pub profiles: Vec<Profile>,
+    pub active_profile_id: String,
 }
 
 #[derive(Clone, Debug)]
@@ -321,8 +387,6 @@ pub struct SystemPrompt {
 pub struct DynamicPromptSettings {
     pub include_date: bool,
     pub include_time: bool,
-    pub include_user_name: bool,
-    pub user_name: String,
     pub custom_instructions: String,
 }
 
@@ -331,15 +395,21 @@ impl Default for DynamicPromptSettings {
         Self {
             include_date: true,
             include_time: true,
-            include_user_name: false,
-            user_name: String::new(),
             custom_instructions: String::new(),
         }
     }
 }
 
 impl DynamicPromptSettings {
-    pub fn apply(&self, base_prompt: &str, now: chrono::DateTime<Local>) -> String {
+    /// The user's name and extra instructions come from the active profile.
+    /// The profile's display name stays private and is never included.
+    pub fn apply(
+        &self,
+        base_prompt: &str,
+        now: chrono::DateTime<Local>,
+        user_name: &str,
+        profile_instructions: &str,
+    ) -> String {
         let mut prompt = base_prompt.trim().to_string();
         let mut dynamic = Vec::new();
 
@@ -353,11 +423,19 @@ impl DynamicPromptSettings {
                 now.format("%:z")
             ));
         }
-        if self.include_user_name && !self.user_name.trim().is_empty() {
-            dynamic.push(format!("The user's name is {}.", self.user_name.trim()));
+        let user_name = user_name.trim();
+        if !user_name.is_empty() {
+            // A bare fact is easy for smaller models to overlook, so phrase
+            // the name as an instruction the model is expected to act on.
+            dynamic.push(format!(
+                "The user's name is {user_name}. Use this name when addressing the user."
+            ));
         }
         if !self.custom_instructions.trim().is_empty() {
             dynamic.push(self.custom_instructions.trim().to_string());
+        }
+        if !profile_instructions.trim().is_empty() {
+            dynamic.push(profile_instructions.trim().to_string());
         }
 
         if !dynamic.is_empty() {
@@ -575,8 +653,6 @@ mod dynamic_prompt_tests {
         let settings = DynamicPromptSettings {
             include_date: true,
             include_time: false,
-            include_user_name: true,
-            user_name: "Aroha".into(),
             custom_instructions: "Prefer concise answers.".into(),
         };
         let now = FixedOffset::east_opt(12 * 3600)
@@ -584,11 +660,99 @@ mod dynamic_prompt_tests {
             .with_ymd_and_hms(2026, 7, 26, 14, 30, 0)
             .unwrap()
             .with_timezone(&Local);
-        let prompt = settings.apply("You are helpful.", now);
+        let prompt = settings.apply(
+            "You are helpful.",
+            now,
+            "Aroha",
+            "This profile is for work tasks.",
+        );
 
         assert!(prompt.contains("Current date: 2026-07-26"));
         assert!(!prompt.contains("Current local time:"));
         assert!(prompt.contains("The user's name is Aroha."));
         assert!(prompt.contains("Prefer concise answers."));
+        assert!(prompt.contains("This profile is for work tasks."));
+    }
+
+    #[test]
+    fn dynamic_prompt_omits_blank_profile_names_and_instructions() {
+        let settings = DynamicPromptSettings {
+            include_date: false,
+            include_time: false,
+            custom_instructions: String::new(),
+        };
+        let now = FixedOffset::east_opt(12 * 3600)
+            .unwrap()
+            .with_ymd_and_hms(2026, 7, 26, 14, 30, 0)
+            .unwrap()
+            .with_timezone(&Local);
+        let prompt = settings.apply("You are helpful.", now, "   ", "  ");
+
+        assert!(!prompt.contains("The user's name is"));
+        assert!(!prompt.contains("Dynamic context:"));
+    }
+
+    #[test]
+    fn legacy_dynamic_prompt_settings_still_load_without_user_name() {
+        let json = r#"{
+            "include_date": false,
+            "include_time": false,
+            "include_user_name": true,
+            "user_name": "Old setting",
+            "custom_instructions": ""
+        }"#;
+
+        let settings: DynamicPromptSettings = serde_json::from_str(json).unwrap();
+        assert!(!settings.include_date);
+        assert!(!settings.include_time);
+        assert!(settings.custom_instructions.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::{LEGACY_PROFILE_ID, Profile, ProfileRegistry};
+
+    #[test]
+    fn empty_registry_defaults_to_no_profiles() {
+        let registry: ProfileRegistry = serde_json::from_str("{}").unwrap();
+        assert!(registry.profiles.is_empty());
+        assert!(registry.active_profile_id.is_empty());
+    }
+
+    #[test]
+    fn registry_round_trips_profiles_and_active_selection() {
+        let registry = ProfileRegistry {
+            profiles: vec![
+                Profile {
+                    id: LEGACY_PROFILE_ID.into(),
+                    name: "Outdated Profile".into(),
+                    user_name: String::new(),
+                    custom_instructions: String::new(),
+                },
+                Profile {
+                    id: "profile-1".into(),
+                    name: "Work".into(),
+                    user_name: "Logan".into(),
+                    custom_instructions: "Keep answers brief.".into(),
+                },
+            ],
+            active_profile_id: "profile-1".into(),
+        };
+
+        let json = serde_json::to_string(&registry).unwrap();
+        let restored: ProfileRegistry = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.profiles, registry.profiles);
+        assert_eq!(restored.active_profile_id, "profile-1");
+    }
+
+    #[test]
+    fn profiles_saved_before_customisation_default_to_empty_extras() {
+        let json = r#"{"id":"profile-1","name":"Work"}"#;
+
+        let profile: Profile = serde_json::from_str(json).unwrap();
+        assert_eq!(profile.name, "Work");
+        assert!(profile.user_name.is_empty());
+        assert!(profile.custom_instructions.is_empty());
     }
 }
