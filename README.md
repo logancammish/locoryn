@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/icon.png" alt="Locoryn icon" width="180">
+  <img src="assets/icon-transparent.png" alt="Locoryn icon" width="180">
 </p>
 
 <h1 align="center">Locoryn</h1>
