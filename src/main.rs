@@ -243,6 +243,7 @@ enum Message {
     ToggleChatHistory,
     ToggleFiltering,
     ToggleDarkMode,
+    ToggleShowTokensPerSecond,
     WipeChatHistory,
     ToggleAdvancedSettings,
     ChangeIp(String),
@@ -259,6 +260,10 @@ struct ActivePrompt {
     web_search_state_receiver: crossbeam_channel::Receiver<WebSearchState>,
     web_progress_receiver: tokio::sync::watch::Receiver<ToolLoopProgress>,
     cancel: Arc<AtomicBool>,
+    /// Generation speed captured from Ollama's final stream statistics. The
+    /// async response loop writes it; the finish handler reads it when
+    /// stamping the reply. Independent of render batching.
+    tokens_per_second: Arc<Mutex<Option<f32>>>,
     model_name: String,
     started_at: Instant,
     response_start_index: usize,
@@ -367,6 +372,8 @@ struct Program {
     prompt: Prompt,
     batch_tokens: i32,
     fast_streaming: bool,
+    /// Persisted setting that shows the generation speed under each reply.
+    show_tokens_per_second: bool,
     chat_menu_open: bool,
     /// Normalized sidebar reveal progress. This is animated instead of
     /// switching between two hard-coded widths in a single frame.
@@ -381,6 +388,11 @@ struct Program {
     temporary_chat: bool,
     web_search_settings: WebSearchSettings,
     web_search_for_chat: bool,
+    /// Web-search choice applied to newly started chats. New chats no longer
+    /// inherit the persisted global setting; they start OFF and then follow
+    /// whatever the user last picked for a chat this session. Deliberately
+    /// in-memory only: it is never read from or written to storage.
+    new_chat_web_search: bool,
     current_chat_id: String,
     open_chat_dirty: bool,
     saved_chats: Vec<SavedChat>,
@@ -601,6 +613,18 @@ fn conversation_context_prompt(context: &str, user_name: &str, prompt: &str) -> 
 
 fn generated_images_dir() -> PathBuf {
     app_data_dir().join("generated")
+}
+
+/// Tokens per second straight from Ollama's final stream statistics. Because
+/// the numbers come from the server's own counters they are unaffected by the
+/// client-side render batching that groups tokens while streaming.
+fn tokens_per_second(eval_count: Option<u64>, eval_duration: Option<u64>) -> Option<f32> {
+    let tokens = eval_count? as f64;
+    let duration_ns = eval_duration? as f64;
+    if tokens <= 0.0 || duration_ns <= 0.0 {
+        return None;
+    }
+    Some((tokens / (duration_ns / 1_000_000_000.0)) as f32)
 }
 
 fn load_generated_images() -> Vec<String> {
@@ -1465,6 +1489,7 @@ fn append_failed_response(
             text: message,
             model,
             thinking_seconds: None,
+            tokens_per_second: None,
             sources: Vec::new(),
             web_search_used: false,
         });
@@ -1871,7 +1896,9 @@ impl Program {
 
         self.temporary_chat = false;
         self.current_chat_id = Self::new_chat_id();
-        self.web_search_for_chat = self.web_search_settings.enabled;
+        // New chats start with the session's remembered choice, which begins
+        // OFF and is never persisted.
+        self.web_search_for_chat = self.new_chat_web_search;
         self.clear_open_chat();
         Task::none()
     }
@@ -1925,7 +1952,7 @@ impl Program {
             self.web_search_for_chat = chat_settings
                 .map(|(_, web_search_enabled)| web_search_enabled)
                 .or(saved_web_search_enabled)
-                .unwrap_or(self.web_search_settings.enabled);
+                .unwrap_or(self.new_chat_web_search);
             self.user_information.chat_history = chat_history;
             self.open_chat_dirty = false;
             // Rendering caches are positional and belong only to the
@@ -2074,10 +2101,12 @@ impl Program {
         response_start_index: usize,
         model_name: &str,
         elapsed_seconds: u64,
+        tokens_per_second: Option<f32>,
     ) {
         if let Some(Correspondence::Bot {
             model: stored_model,
             thinking_seconds,
+            tokens_per_second: stored_tokens_per_second,
             ..
         }) = chat
             .messages
@@ -2092,17 +2121,26 @@ impl Program {
             if thinking_seconds.is_none() {
                 *thinking_seconds = Some(elapsed_seconds);
             }
+            if stored_tokens_per_second.is_none() {
+                *stored_tokens_per_second = tokens_per_second;
+            }
         }
     }
 
     fn finalize_response_metadata(job: &ActivePrompt) {
         let elapsed_seconds = job.started_at.elapsed().as_secs().max(1);
+        let tokens_per_second = job
+            .tokens_per_second
+            .lock()
+            .ok()
+            .and_then(|stats| *stats);
         if let Ok(mut chat) = job.chat_history.lock() {
             Self::apply_response_metadata(
                 &mut chat,
                 job.response_start_index,
                 &job.model_name,
                 elapsed_seconds,
+                tokens_per_second,
             );
         }
     }
@@ -2296,6 +2334,10 @@ impl Program {
         let (web_search_state_sender, web_search_state_receiver) = crossbeam_channel::unbounded();
         let (web_progress_sender, web_progress_receiver) =
             tokio::sync::watch::channel(ToolLoopProgress::default());
+        // Generation speed captured from Ollama's own statistics so the value
+        // is unaffected by render batching. Written by the async loop, read
+        // when the response is finalized.
+        let tokens_per_second_stats = Arc::new(Mutex::new(None::<f32>));
         let chat_id = self.current_chat_id.clone();
         let completion_chat_id = chat_id.clone();
         let notice_chat_id = chat_id.clone();
@@ -2330,6 +2372,7 @@ impl Program {
                 web_search_state_receiver,
                 web_progress_receiver,
                 cancel: Arc::clone(&cancel),
+                tokens_per_second: Arc::clone(&tokens_per_second_stats),
                 model_name,
                 started_at,
                 response_start_index,
@@ -2378,6 +2421,7 @@ impl Program {
                                     text: format!("Web search could not start: {message}"),
                                     model: user_info.model.clone(),
                                     thinking_seconds: None,
+                                    tokens_per_second: None,
                                     sources: Vec::new(),
                                     web_search_used: true,
                                 },
@@ -2461,6 +2505,7 @@ impl Program {
                                     text: complete_response,
                                     model: user_info.model.clone(),
                                     thinking_seconds: None,
+                                    tokens_per_second: None,
                                     sources: result.sources,
                                     web_search_used: true,
                                 },
@@ -2490,6 +2535,7 @@ impl Program {
                                     text: format!("Web search failed: {message}"),
                                     model: user_info.model.clone(),
                                     thinking_seconds: None,
+                                    tokens_per_second: None,
                                     sources: Vec::new(),
                                     web_search_used: true,
                                 },
@@ -2660,6 +2706,14 @@ impl Program {
 
                                 final_response.push(token.response.clone());
 
+                                // Capture the generation speed from Ollama's own
+                                // statistics on the final message, so the value is
+                                // independent of client-side render batching.
+                                if token.done {
+                                    *tokens_per_second_stats.lock().unwrap() =
+                                        tokens_per_second(token.eval_count, token.eval_duration);
+                                }
+
                                 // Filtering must see the complete response: Ollama can
                                 // split a profane word across arbitrary stream tokens.
                                 if !filtering {
@@ -2720,6 +2774,10 @@ impl Program {
                                     format!("<think>{thinking}</think>{}", token.response);
                             }
                             final_response.push(token.response.clone());
+                            if token.done {
+                                *tokens_per_second_stats.lock().unwrap() =
+                                    tokens_per_second(token.eval_count, token.eval_duration);
+                            }
                             if !filtering {
                                 let _ = tx.send(token).await;
                             }
@@ -2817,6 +2875,7 @@ impl Program {
                             text: partial_response,
                             model: None,
                             thinking_seconds: None,
+                            tokens_per_second: None,
                             sources: Vec::new(),
                             web_search_used: false,
                         });
@@ -3089,6 +3148,9 @@ impl Program {
                 self.web_search_settings.enabled = !self.web_search_settings.enabled;
                 if !self.current_chat_is_processing() {
                     self.web_search_for_chat = self.web_search_settings.enabled;
+                    // The user's latest explicit choice becomes the default
+                    // for chats started later in this session (in-memory only).
+                    self.new_chat_web_search = self.web_search_for_chat;
                     self.persist_current_chat_web_search_setting();
                 }
                 self.persist_web_search_settings();
@@ -3118,6 +3180,9 @@ impl Program {
                     return Task::none();
                 }
                 self.web_search_for_chat = !self.web_search_for_chat;
+                // Remember the user's latest choice as the default for chats
+                // started later this session. In-memory only: never persisted.
+                self.new_chat_web_search = self.web_search_for_chat;
                 self.persist_current_chat_web_search_setting();
                 Task::none()
             }
@@ -3272,7 +3337,7 @@ impl Program {
                 self.save_open_chat();
                 self.current_chat_id = Self::new_chat_id();
                 self.temporary_chat = false;
-                self.web_search_for_chat = self.web_search_settings.enabled;
+                self.web_search_for_chat = self.new_chat_web_search;
                 self.clear_open_chat();
                 self.begin_page_transition();
                 Task::none()
@@ -3293,6 +3358,7 @@ impl Program {
                 self.vision_responses.remove(&id);
                 if self.current_chat_id == id {
                     self.current_chat_id = Self::new_chat_id();
+                    self.web_search_for_chat = self.new_chat_web_search;
                     self.clear_open_chat();
                     self.begin_page_transition();
                 }
@@ -3307,7 +3373,7 @@ impl Program {
                 if self.current_chat_id == id {
                     self.current_chat_id = Self::new_chat_id();
                     self.temporary_chat = false;
-                    self.web_search_for_chat = self.web_search_settings.enabled;
+                    self.web_search_for_chat = self.new_chat_web_search;
                     self.clear_open_chat();
                     self.begin_page_transition();
                 }
@@ -3349,13 +3415,13 @@ impl Program {
                     }
                     self.temporary_chat = false;
                     self.current_chat_id = Self::new_chat_id();
-                    self.web_search_for_chat = self.web_search_settings.enabled;
+                    self.web_search_for_chat = self.new_chat_web_search;
                     self.clear_open_chat();
                 } else {
                     self.save_open_chat();
                     self.temporary_chat = true;
                     self.current_chat_id = Self::new_chat_id();
-                    self.web_search_for_chat = self.web_search_settings.enabled;
+                    self.web_search_for_chat = self.new_chat_web_search;
                     self.clear_open_chat();
                 }
                 self.begin_page_transition();
@@ -3610,6 +3676,15 @@ impl Program {
                 gui::set_dark_mode(self.app_state.dark_mode);
                 self.persist_boolean_setting("dark_mode", self.app_state.dark_mode);
                 self.begin_page_transition();
+                Task::none()
+            }
+
+            Message::ToggleShowTokensPerSecond => {
+                self.show_tokens_per_second = !self.show_tokens_per_second;
+                self.persist_boolean_setting(
+                    "show_tokens_per_second",
+                    self.show_tokens_per_second,
+                );
                 Task::none()
             }
 
@@ -4411,6 +4486,7 @@ impl Default for Program {
         let logging = setting_bool("logging", false);
         let info_popup = setting_bool("info_popup", false);
         let fast_streaming = setting_bool("fast_streaming", true);
+        let show_tokens_per_second = setting_bool("show_tokens_per_second", false);
         let current_chat_history_enabled = setting_bool("current_chat_history_enabled", true);
         let code_checking_enabled = setting_bool("code_checking_enabled", false);
         let dynamic_prompt_settings = settings_hmap
@@ -4493,10 +4569,14 @@ impl Default for Program {
             .as_ref()
             .map(|chat| chat.id.clone())
             .unwrap_or_else(Self::new_chat_id);
+        // The remembered web-search choice for new chats is deliberately not
+        // persisted, so every launch starts from OFF regardless of the global
+        // setting. Restored chats keep their own saved per-chat value.
+        let new_chat_web_search = false;
         let web_search_for_chat = restored_chat
             .as_ref()
             .and_then(|chat| chat.web_search_enabled)
-            .unwrap_or(web_search_settings.enabled);
+            .unwrap_or(new_chat_web_search);
         let current_chat =
             restored_chat
                 .as_ref()
@@ -4523,6 +4603,7 @@ impl Default for Program {
         Self {
             batch_tokens: 3,
             fast_streaming,
+            show_tokens_per_second,
             chat_menu_open: true,
             sidebar_animation: 1.0,
             ui_motion: 0.0,
@@ -4532,6 +4613,7 @@ impl Default for Program {
             window_size: Size::new(1100.0, 800.0),
             temporary_chat: false,
             web_search_for_chat,
+            new_chat_web_search,
             web_search_settings,
             current_chat_id,
             open_chat_dirty: false,
@@ -4706,13 +4788,13 @@ mod tests {
     use super::{
         ActivePrompt, Correspondence, CurrentChat, LEGACY_PROFILE_ID, Message, ModelCapabilities,
         Point, Profile, ProfileRegistry, Program, SavedChat, SettingsFeedbackTarget, Size,
-        ThinkingLevel, ToolLoopProgress, UiResizeTarget, UserInformation, WebSearchState,
-        app_data_dir, assign_legacy_profile_ids, canonical_code_language, censor_text,
-        chat_profile_id, compare_versions, conversation_context_prompt,
+        ThinkingLevel, ToolLoopProgress, UiResizeTarget, UserInformation, WebSearchSettings,
+        WebSearchState, app_data_dir, assign_legacy_profile_ids, canonical_code_language,
+        censor_text, chat_profile_id, compare_versions, conversation_context_prompt,
         decode_generation_line, disabled_web_tool_message, ensure_legacy_profile,
         generated_image_payload, model_capabilities, normalize_code_fence_languages,
         parse_markdown_items, read_json_with_backup, remote_image_url_is_safe, sidecar_path,
-        split_thinking_text, write_json_safely,
+        split_thinking_text, tokens_per_second, write_json_safely,
     };
 
     fn test_active_prompt(
@@ -4733,6 +4815,7 @@ mod tests {
             web_search_state_receiver,
             web_progress_receiver,
             cancel,
+            tokens_per_second: Arc::new(Mutex::new(None)),
             model_name: "test-model".to_string(),
             started_at: Instant::now(),
             response_start_index: 1,
@@ -4917,6 +5000,7 @@ mod tests {
                 text: "<think>Reasoning</think>Visible answer".into(),
                 model: Some("test-model".into()),
                 thinking_seconds: Some(1),
+                tokens_per_second: None,
                 sources: Vec::new(),
                 web_search_used: false,
             }],
@@ -5116,19 +5200,21 @@ mod tests {
                 text: "Older answer".into(),
                 model: None,
                 thinking_seconds: None,
+                tokens_per_second: None,
                 sources: Vec::new(),
                 web_search_used: false,
             }],
             bot_responding: false,
         };
 
-        Program::apply_response_metadata(&mut chat, 1, "new-model", 9);
+        Program::apply_response_metadata(&mut chat, 1, "new-model", 9, Some(42.0));
 
         assert!(matches!(
             &chat.messages[0],
             Correspondence::Bot {
                 model: None,
                 thinking_seconds: None,
+                tokens_per_second: None,
                 ..
             }
         ));
@@ -5143,6 +5229,7 @@ mod tests {
                     text: "Older answer".into(),
                     model: None,
                     thinking_seconds: None,
+                    tokens_per_second: None,
                     sources: Vec::new(),
                     web_search_used: false,
                 },
@@ -5154,6 +5241,7 @@ mod tests {
                     text: "New answer".into(),
                     model: None,
                     thinking_seconds: None,
+                    tokens_per_second: None,
                     sources: Vec::new(),
                     web_search_used: false,
                 },
@@ -5161,13 +5249,14 @@ mod tests {
             bot_responding: false,
         };
 
-        Program::apply_response_metadata(&mut chat, 2, "new-model", 9);
+        Program::apply_response_metadata(&mut chat, 2, "new-model", 9, Some(42.0));
 
         assert!(matches!(
             &chat.messages[0],
             Correspondence::Bot {
                 model: None,
                 thinking_seconds: None,
+                tokens_per_second: None,
                 ..
             }
         ));
@@ -5176,8 +5265,9 @@ mod tests {
             Correspondence::Bot {
                 model: Some(model),
                 thinking_seconds: Some(9),
+                tokens_per_second: Some(tps),
                 ..
-            } if model == "new-model"
+            } if model == "new-model" && (tps - 42.0).abs() < f32::EPSILON
         ));
     }
 
@@ -5233,6 +5323,7 @@ mod tests {
             text: "Background answer".to_string(),
             model: None,
             thinking_seconds: None,
+            tokens_per_second: None,
             sources: Vec::new(),
             web_search_used: true,
         });
@@ -5706,5 +5797,74 @@ mod tests {
         let ids: Vec<&str> = program.saved_chats.iter().map(|chat| chat.id.as_str()).collect();
         assert_eq!(ids, vec!["chat-a", "chat-b", "chat-c"]);
         assert!(program.saved_chats.iter().all(|chat| !chat.pinned));
+    }
+
+    #[test]
+    fn tokens_per_second_uses_ollama_statistics() {
+        // 100 tokens in 2.5 seconds -> 40 tokens/s.
+        let tps = tokens_per_second(Some(100), Some(2_500_000_000)).unwrap();
+        assert!((tps - 40.0).abs() < 0.01);
+
+        // Missing or empty stats never produce a rate.
+        assert_eq!(tokens_per_second(None, Some(2_500_000_000)), None);
+        assert_eq!(tokens_per_second(Some(100), None), None);
+        assert_eq!(tokens_per_second(Some(0), Some(2_500_000_000)), None);
+        assert_eq!(tokens_per_second(Some(100), Some(0)), None);
+    }
+
+    #[test]
+    fn new_chats_start_with_web_search_off_even_when_globally_enabled() {
+        let mut program = Program {
+            web_search_settings: WebSearchSettings {
+                enabled: true,
+                ..WebSearchSettings::default()
+            },
+            ..Program::default()
+        };
+
+        drop(program.update(Message::NewChat));
+
+        assert!(!program.web_search_for_chat);
+    }
+
+    #[test]
+    fn chat_web_search_toggle_becomes_the_default_for_new_chats() {
+        let mut program = Program::default();
+
+        // Turn web search on for the chat; new chats now follow that choice.
+        drop(program.update(Message::ToggleChatWebSearch));
+        assert!(program.web_search_for_chat);
+        drop(program.update(Message::NewChat));
+        assert!(program.web_search_for_chat);
+
+        // Turn it off again; new chats follow it back down.
+        drop(program.update(Message::ToggleChatWebSearch));
+        assert!(!program.web_search_for_chat);
+        drop(program.update(Message::NewChat));
+        assert!(!program.web_search_for_chat);
+    }
+
+    #[test]
+    fn remembered_chat_web_search_choice_is_not_restored_after_restart() {
+        let mut program = Program::default();
+        drop(program.update(Message::ToggleChatWebSearch));
+        assert!(program.new_chat_web_search);
+
+        // Simulates a restart: the remembered choice lives in memory only.
+        let restarted = Program::default();
+        assert!(!restarted.new_chat_web_search);
+        assert!(!restarted.web_search_for_chat);
+    }
+
+    #[test]
+    fn show_tokens_per_second_toggle_flips_and_defaults_off() {
+        let mut program = Program::default();
+        assert!(!program.show_tokens_per_second);
+
+        drop(program.update(Message::ToggleShowTokensPerSecond));
+        assert!(program.show_tokens_per_second);
+
+        drop(program.update(Message::ToggleShowTokensPerSecond));
+        assert!(!program.show_tokens_per_second);
     }
 }

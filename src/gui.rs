@@ -296,6 +296,12 @@ fn tr(language: Language, english: &'static str) -> &'static str {
         "Render as soon as the API yields output. Turn off to use token batching." => {
             "Muestra la respuesta en cuanto la API produce contenido. Desactívalo para usar lotes de tokens."
         }
+        "Show tokens per second at bottom of message" => {
+            "Mostrar tokens por segundo al final del mensaje"
+        }
+        "Display the generation speed under each assistant reply. Measured from the model's own statistics, independent of token batching." => {
+            "Muestra la velocidad de generación bajo cada respuesta. Se mide con las estadísticas del propio modelo, sin verse afectada por el lote de tokens."
+        }
         "Content filtering" => "Filtro de contenido",
         "Censor offensive, profane, sexual, and severely inappropriate words with # characters." => {
             "Censura palabras ofensivas, malsonantes, sexuales y gravemente inapropiadas con caracteres #."
@@ -1941,6 +1947,7 @@ fn message_bubble<'a>(
     sources_expanded: bool,
     language: Language,
     code_checking_enabled: bool,
+    show_tokens_per_second: bool,
     markdown_images: &'a std::collections::HashMap<String, MarkdownImageState>,
     reveal: f32,
     motion: f32,
@@ -1974,6 +1981,7 @@ fn message_bubble<'a>(
         Correspondence::Bot {
             text,
             thinking_seconds,
+            tokens_per_second,
             sources,
             web_search_used,
             ..
@@ -2073,6 +2081,24 @@ fn message_bubble<'a>(
                 .into()
             };
 
+            // Generation speed shown at the bottom of the reply when the
+            // setting is enabled. The value comes straight from Ollama's
+            // statistics, so render batching never distorts it.
+            let speed_note: Element<'a, Message> = if show_tokens_per_second {
+                match tokens_per_second {
+                    Some(tps) => widget::column![
+                        Space::new().height(Length::Fixed(10.0)),
+                        widget::text(format!("{tps:.1} tokens/s"))
+                            .size(11)
+                            .color(text_muted()),
+                    ]
+                    .into(),
+                    None => widget::column![].into(),
+                }
+            } else {
+                widget::column![].into()
+            };
+
             widget::row![
                 Space::new().width(Length::Fixed((1.0 - reveal) * 8.0)),
                 container(widget::text("✦").size(17).color(Color::WHITE))
@@ -2095,6 +2121,7 @@ fn message_bubble<'a>(
                     reasoning,
                     body,
                     source_list,
+                    speed_note,
                 ])
                 .padding(14)
                 .width(Length::Fill)
@@ -2353,6 +2380,7 @@ impl Program {
                                 self.expanded_sources.contains(&index),
                                 language,
                                 self.code_checking_enabled,
+                                self.show_tokens_per_second,
                                 &self.markdown_images,
                                 reveal,
                                 motion,
@@ -4540,6 +4568,19 @@ impl Program {
                             widget::checkbox(self.fast_streaming)
                                 .label(tr(language, "Enabled"))
                                 .on_toggle(|_| Message::ToggleFastStreaming),
+                        ])
+                        .padding(16)
+                        .width(Length::Fill)
+                        .style(flat_card_style),
+                        Space::new().height(Length::Fixed(10.0)),
+                        container(widget::row![
+                            setting_label(
+                                tr(language, "Show tokens per second at bottom of message"),
+                                tr(language, "Display the generation speed under each assistant reply. Measured from the model's own statistics, independent of token batching.")
+                            ),
+                            widget::checkbox(self.show_tokens_per_second)
+                                .label(tr(language, "Enabled"))
+                                .on_toggle(|_| Message::ToggleShowTokensPerSecond),
                         ])
                         .padding(16)
                         .width(Length::Fill)

@@ -205,7 +205,7 @@ mod saved_chat_tests {
                 },
                 Correspondence::Bot {
                     text: "<think>Work</think>Answer".into(),
-                    model: Some("model-a".into(),
+                    model: Some("model-a".into()),
                     thinking_seconds: Some(30),
                     tokens_per_second: Some(18.75),
                     sources: vec![crate::web_search::WebSource {
