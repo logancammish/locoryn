@@ -430,10 +430,11 @@ pub trait WebSearchProvider: Send + Sync {
 pub fn create_search_provider(
     settings: &WebSearchSettings,
 ) -> Result<Arc<dyn WebSearchProvider>, WebSearchError> {
-    match settings.provider {
-        WebSearchProviderKind::Brave => Ok(Arc::new(BraveSearchProvider::new(settings)?)),
-        WebSearchProviderKind::Tavily => Ok(Arc::new(TavilySearchProvider::new(settings)?)),
-        WebSearchProviderKind::Exa => Ok(Arc::new(ExaSearchProvider::new(settings)?)),
+    let normalized = settings.clone().normalized();
+    match normalized.provider {
+        WebSearchProviderKind::Brave => Ok(Arc::new(BraveSearchProvider::new(&normalized)?)),
+        WebSearchProviderKind::Tavily => Ok(Arc::new(TavilySearchProvider::new(&normalized)?)),
+        WebSearchProviderKind::Exa => Ok(Arc::new(ExaSearchProvider::new(&normalized)?)),
     }
 }
 
@@ -869,12 +870,8 @@ async fn safe_get_with_client(
 ) -> Result<reqwest::Response, WebSearchError> {
     let mut current = url;
     for redirect_count in 0..=MAX_REDIRECTS {
-        validate_public_url(&current).await?;
-        let response = client
-            .get(current.clone())
-            .send()
-            .await
-            .map_err(map_reqwest_error)?;
+        let addresses = validate_public_url(&current).await?;
+        let response = send_with_pinned_addresses(client, &current, &addresses).await?;
         if !response.status().is_redirection() {
             return Ok(response);
         }
@@ -891,6 +888,46 @@ async fn safe_get_with_client(
             .map_err(|_| WebSearchError::InvalidUrl)?;
     }
     Err(WebSearchError::TooManyRedirects)
+}
+
+async fn send_with_pinned_addresses(
+    _client: &Client,
+    url: &Url,
+    addresses: &[SocketAddr],
+) -> Result<reqwest::Response, WebSearchError> {
+    let host = url.host_str().unwrap_or("").to_string();
+    let pinned = PinnedDnsResolver {
+        host: host.clone(),
+        addresses: addresses.to_vec(),
+    };
+    let client = Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(concat!("locoryn/", env!("CARGO_PKG_VERSION")))
+        .dns_resolver(pinned)
+        .build()
+        .map_err(|error| WebSearchError::ProviderUnavailable(error.to_string()))?;
+    client
+        .get(url.clone())
+        .send()
+        .await
+        .map_err(map_reqwest_error)
+}
+
+struct PinnedDnsResolver {
+    host: String,
+    addresses: Vec<SocketAddr>,
+}
+
+impl reqwest::dns::Resolve for PinnedDnsResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        if name.as_str() == self.host {
+            let addrs: reqwest::dns::Addrs = Box::new(self.addresses.clone().into_iter());
+            Box::pin(std::future::ready(Ok(addrs)))
+        } else {
+            let addrs: reqwest::dns::Addrs = Box::new(std::iter::empty());
+            Box::pin(std::future::ready(Ok(addrs)))
+        }
+    }
 }
 
 async fn fetch_page_with_client(
@@ -932,10 +969,16 @@ async fn fetch_page_with_client(
         }
         bytes.extend_from_slice(&chunk);
     }
-    let raw = String::from_utf8_lossy(&bytes);
+
+    // Detect charset from Content-Type header, then from <meta> tags in the
+    // HTML head. Falls back to UTF-8 with replacement when detection fails.
+    let encoding = detect_charset(&content_type, &bytes);
+    let (raw, _encoding, _had_errors) = encoding.decode(&bytes);
+    let raw = raw.into_owned();
+
     let title = html_title(&raw);
     let text = if content_type.starts_with("text/plain") {
-        raw.into_owned()
+        raw
     } else {
         html_to_text(&raw)
     };
@@ -944,6 +987,51 @@ async fn fetch_page_with_client(
         title,
         text: text.chars().take(MAX_PAGE_BYTES).collect(),
     })
+}
+
+fn detect_charset(
+    content_type: &str,
+    bytes: &[u8],
+) -> &'static encoding_rs::Encoding {
+    // 1. Try Content-Type header charset parameter
+    if let Some(charset) = content_type
+        .split(';')
+        .skip(1)
+        .find_map(|part| {
+            let (key, value) = part.split_once('=')?;
+            key.trim()
+                .eq_ignore_ascii_case("charset")
+                .then(|| value.trim().trim_matches('"').trim_matches('\''))
+        })
+    {
+        if let Some(encoding) = encoding_rs::Encoding::for_label(charset.as_bytes()) {
+            return encoding;
+        }
+    }
+
+    // 2. Look for <meta charset> or <meta http-equiv> in the first 4 KiB
+    let head = String::from_utf8_lossy(&bytes[..bytes.len().min(4096)]);
+    let lowercase = head.to_ascii_lowercase();
+
+    // <meta charset="...">
+    if let Some(charset_pos) = lowercase.find("charset") {
+        let after = &lowercase[charset_pos + 7..];
+        let after = after.trim_start_matches(|ch: char| ch == '=' || ch.is_whitespace());
+        let charset = after
+            .trim_start_matches('"')
+            .trim_start_matches('\'')
+            .split(|ch: char| ch == '"' || ch == '\'' || ch == '>' || ch == '/' || ch.is_whitespace())
+            .next()
+            .unwrap_or("");
+        if !charset.is_empty() {
+            if let Some(encoding) = encoding_rs::Encoding::for_label(charset.as_bytes()) {
+                return encoding;
+            }
+        }
+    }
+
+    // 3. Default to UTF-8 with replacement
+    encoding_rs::UTF_8
 }
 
 fn map_status(status: StatusCode) -> Result<(), WebSearchError> {
@@ -1029,7 +1117,7 @@ pub(crate) async fn send_ollama_request_with_retry(
     }
 }
 
-pub async fn validate_public_url(url: &Url) -> Result<(), WebSearchError> {
+pub async fn validate_public_url(url: &Url) -> Result<Vec<SocketAddr>, WebSearchError> {
     if !matches!(url.scheme(), "http" | "https") {
         return Err(WebSearchError::UnsupportedScheme);
     }
@@ -1037,8 +1125,16 @@ pub async fn validate_public_url(url: &Url) -> Result<(), WebSearchError> {
         return Err(WebSearchError::InvalidUrl);
     }
     let host = match url.host().ok_or(WebSearchError::InvalidUrl)? {
-        Host::Ipv4(ip) => return validate_public_ip(IpAddr::V4(ip)),
-        Host::Ipv6(ip) => return validate_public_ip(IpAddr::V6(ip)),
+        Host::Ipv4(ip) => {
+            validate_public_ip(IpAddr::V4(ip))?;
+            let port = url.port_or_known_default().ok_or(WebSearchError::InvalidUrl)?;
+            return Ok(vec![SocketAddr::new(IpAddr::V4(ip), port)]);
+        }
+        Host::Ipv6(ip) => {
+            validate_public_ip(IpAddr::V6(ip))?;
+            let port = url.port_or_known_default().ok_or(WebSearchError::InvalidUrl)?;
+            return Ok(vec![SocketAddr::new(IpAddr::V6(ip), port)]);
+        }
         Host::Domain(host) => host,
     };
     if host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost") {
@@ -1054,10 +1150,10 @@ pub async fn validate_public_url(url: &Url) -> Result<(), WebSearchError> {
     if addresses.is_empty() {
         return Err(WebSearchError::InvalidUrl);
     }
-    for address in addresses {
+    for address in &addresses {
         validate_public_ip(address.ip())?;
     }
-    Ok(())
+    Ok(addresses)
 }
 
 fn validate_public_ip(ip: IpAddr) -> Result<(), WebSearchError> {
@@ -1102,26 +1198,103 @@ fn html_title(html: &str) -> Option<String> {
 
 fn html_to_text(html: &str) -> String {
     let lowercase = html.to_ascii_lowercase();
+
     let mut sanitized = String::with_capacity(html.len());
     let mut cursor = 0;
+    let block_tags: &[(&str, &str)] = &[
+        ("<script", "</script>"),
+        ("<style", "</style>"),
+        ("<nav", "</nav>"),
+        ("<header", "</header>"),
+        ("<footer", "</footer>"),
+        ("<aside", "</aside>"),
+        ("<noscript", "</noscript>"),
+    ];
+
     loop {
-        let remaining = &lowercase[cursor..];
-        let next_script = remaining.find("<script");
-        let next_style = remaining.find("<style");
-        let relative = match (next_script, next_style) {
-            (Some(script), Some(style)) => script.min(style),
-            (Some(script), None) => script,
-            (None, Some(style)) => style,
-            (None, None) => break,
-        };
-        let start = cursor + relative;
-        sanitized.push_str(&html[cursor..start]);
-        let is_script = lowercase[start..].starts_with("<script");
-        let closing = if is_script { "</script>" } else { "</style>" };
-        cursor = lowercase[start..]
-            .find(closing)
-            .map(|end| start + end + closing.len())
-            .unwrap_or(html.len());
+        let remaining_lower = &lowercase[cursor..];
+        let mut earliest: Option<(usize, usize)> = None;
+
+        // Strip known non-content block elements
+        for (open, close) in block_tags {
+            if let Some(start) = remaining_lower.find(open) {
+                if let Some(end) = lowercase[cursor + start..]
+                    .find(close)
+                    .map(|pos| cursor + start + pos + close.len())
+                {
+                    if earliest.is_none() || start < earliest.unwrap().0 {
+                        earliest = Some((start, end));
+                    }
+                }
+            }
+        }
+
+        // Strip elements with hidden / aria-hidden / non-content roles
+        let non_content_attrs: &[&str] = &[
+            "hidden",
+            "aria-hidden=\"true\"",
+            "aria-hidden='true'",
+            "role=\"banner\"",
+            "role='banner'",
+            "role=\"navigation\"",
+            "role='navigation'",
+            "role=\"complementary\"",
+            "role='complementary'",
+            "role=\"contentinfo\"",
+            "role='contentinfo'",
+        ];
+        for attr in non_content_attrs {
+            if let Some(attr_pos) = remaining_lower.find(attr) {
+                let tag_start = remaining_lower[..attr_pos].rfind('<').unwrap_or(attr_pos);
+                let tag_name_end = remaining_lower[tag_start..]
+                    .find(|ch: char| ch == '>' || ch.is_whitespace())
+                    .map(|pos| tag_start + pos)
+                    .unwrap_or(tag_start + 1);
+                let tag_name = &lowercase[tag_start + 1..tag_name_end];
+                let close_tag = format!("</{tag_name}>");
+                if let Some(end) = lowercase[cursor + tag_name_end..]
+                    .find(&close_tag)
+                    .map(|pos| cursor + tag_name_end + pos + close_tag.len())
+                {
+                    let start = cursor + tag_start;
+                    if earliest.is_none() || start - cursor < earliest.unwrap().0 {
+                        earliest = Some((start - cursor, end));
+                    }
+                }
+            }
+        }
+
+        // Strip elements with display:none / visibility:hidden in inline style
+        if let Some(style_pos) = remaining_lower.find("display:none")
+            .or_else(|| remaining_lower.find("display: none"))
+            .or_else(|| remaining_lower.find("visibility:hidden"))
+            .or_else(|| remaining_lower.find("visibility: hidden"))
+        {
+            let tag_start = remaining_lower[..style_pos].rfind('<').unwrap_or(style_pos);
+            let tag_name_end = remaining_lower[tag_start..]
+                .find(|ch: char| ch == '>' || ch.is_whitespace())
+                .map(|pos| tag_start + pos)
+                .unwrap_or(tag_start + 1);
+            let tag_name = &lowercase[tag_start + 1..tag_name_end];
+            let close_tag = format!("</{tag_name}>");
+            if let Some(end) = lowercase[cursor + tag_name_end..]
+                .find(&close_tag)
+                .map(|pos| cursor + tag_name_end + pos + close_tag.len())
+            {
+                let start = cursor + tag_start;
+                if earliest.is_none() || start - cursor < earliest.unwrap().0 {
+                    earliest = Some((start - cursor, end));
+                }
+            }
+        }
+
+        match earliest {
+            Some((start, end)) => {
+                sanitized.push_str(&html[cursor..cursor + start]);
+                cursor = end;
+            }
+            None => break,
+        }
     }
     sanitized.push_str(&html[cursor..]);
 
@@ -1263,6 +1436,14 @@ impl ToolBudget {
         }
     }
 
+    fn refund_search(&mut self) {
+        self.searches = self.searches.saturating_sub(1);
+    }
+
+    fn refund_page(&mut self) {
+        self.pages = self.pages.saturating_sub(1);
+    }
+
     fn page_limit(&self) -> usize {
         self.page_limit
     }
@@ -1343,8 +1524,121 @@ fn requested_result_count(
 }
 
 fn normalized_host(url: &str) -> Option<String> {
-    let host = Url::parse(url).ok()?.host_str()?.to_ascii_lowercase();
-    Some(host.strip_prefix("www.").unwrap_or(&host).to_string())
+    let parsed = Url::parse(url).ok()?;
+    let domain = parsed.domain()?.to_ascii_lowercase();
+    let without_www = domain.strip_prefix("www.").unwrap_or(&domain);
+    Some(registrable_domain(without_www))
+}
+
+/// Extracts the registrable domain (eTLD+1) from a hostname.
+///
+/// Uses a built-in static suffix list for common multi-part TLDs. For
+/// unrecognized suffixes the last two labels are treated as the registrable
+/// domain (a reasonable heuristic for most domains).
+fn registrable_domain(host: &str) -> String {
+    let labels: Vec<&str> = host.split('.').collect();
+    if labels.len() <= 1 {
+        return host.to_string();
+    }
+    // Known multi-part TLD suffixes (e.g. co.uk, com.au). The list is not
+    // exhaustive but covers the most common cases.
+    let known_multi_part: &[&[&str]] = &[
+        &["co", "uk"],
+        &["ac", "uk"],
+        &["gov", "uk"],
+        &["org", "uk"],
+        &["me", "uk"],
+        &["net", "uk"],
+        &["sch", "uk"],
+        &["com", "au"],
+        &["net", "au"],
+        &["org", "au"],
+        &["gov", "au"],
+        &["edu", "au"],
+        &["co", "nz"],
+        &["net", "nz"],
+        &["org", "nz"],
+        &["govt", "nz"],
+        &["co", "jp"],
+        &["or", "jp"],
+        &["ne", "jp"],
+        &["ac", "jp"],
+        &["go", "jp"],
+        &["co", "za"],
+        &["web", "za"],
+        &["co", "in"],
+        &["net", "in"],
+        &["org", "in"],
+        &["firm", "in"],
+        &["gen", "in"],
+        &["ind", "in"],
+        &["com", "br"],
+        &["org", "br"],
+        &["net", "br"],
+        &["gov", "br"],
+        &["co", "il"],
+        &["org", "il"],
+        &["net", "il"],
+        &["ac", "il"],
+        &["gov", "il"],
+        &["k12", "il"],
+        &["muni", "il"],
+    ];
+
+    for suffix in known_multi_part {
+        let suffix_len = suffix.len();
+        if labels.len() > suffix_len
+            && labels[labels.len() - suffix_len..]
+                .iter()
+                .zip(suffix.iter())
+                .all(|(a, b)| a.eq_ignore_ascii_case(b))
+        {
+            let start = labels.len() - suffix_len - 1;
+            return labels[start..].join(".");
+        }
+    }
+    // Default: last two labels
+    let start = labels.len() - 2;
+    labels[start..].join(".")
+}
+
+fn normalized_url_for_dedup(url: &str) -> Option<String> {
+    let mut parsed = Url::parse(url).ok()?;
+    parsed.set_fragment(None);
+    {
+        let tracking_params: &[&str] = &[
+            "utm_source",
+            "utm_medium",
+            "utm_campaign",
+            "utm_term",
+            "utm_content",
+            "utm_id",
+            "fbclid",
+            "gclid",
+            "gclsrc",
+            "dclid",
+            "msclkid",
+            "twclid",
+            "igshid",
+            "mc_cid",
+            "mc_eid",
+            "_ga",
+            "_gl",
+            "ref",
+            "source",
+            "referrer",
+        ];
+        let keep: Vec<(String, String)> = parsed
+            .query_pairs()
+            .filter(|(key, _)| !tracking_params.contains(&key.as_ref()))
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect();
+        parsed
+            .query_pairs_mut()
+            .clear()
+            .extend_pairs(keep.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    }
+    Some(parsed.to_string())
 }
 
 fn add_distinct_host(hosts: &mut Vec<String>, url: &str) {
@@ -2108,24 +2402,30 @@ pub async fn run_tool_loop(request: ToolLoopRequest) -> Result<ToolLoopResponse,
                                     }
                                 })
                             }
-                            Err(WebSearchError::EmptyResults) => serde_json::json!({
-                                "error": "no results for this query; try a different targeted query",
-                                "research_progress": {
-                                    "successful_searches": successful_searches,
-                                    "maximum_searches": budget.search_limit(),
-                                }
-                            }),
+                            Err(WebSearchError::EmptyResults) => {
+                                budget.refund_search();
+                                serde_json::json!({
+                                    "error": "no results for this query; try a different targeted query",
+                                    "research_progress": {
+                                        "successful_searches": successful_searches,
+                                        "maximum_searches": budget.search_limit(),
+                                    }
+                                })
+                            }
                             Err(WebSearchError::Cancelled) => return cancel_request(&request),
                             Err(WebSearchError::Disabled) => {
                                 return Err(WebSearchError::Disabled);
                             }
-                            Err(error) => serde_json::json!({
-                                "error": error.user_message(),
-                                "research_progress": {
-                                    "successful_searches": successful_searches,
-                                    "remaining_searches": budget.search_limit() - budget.searches,
-                                }
-                            }),
+                            Err(error) => {
+                                budget.refund_search();
+                                serde_json::json!({
+                                    "error": error.user_message(),
+                                    "research_progress": {
+                                        "successful_searches": successful_searches,
+                                        "remaining_searches": budget.search_limit() - budget.searches,
+                                    }
+                                })
+                            }
                         }
                     }
                 }
@@ -2193,14 +2493,17 @@ pub async fn run_tool_loop(request: ToolLoopRequest) -> Result<ToolLoopResponse,
                             Err(WebSearchError::Disabled) => {
                                 return Err(WebSearchError::Disabled);
                             }
-                            Err(error) => serde_json::json!({
-                                "error": error.user_message(),
-                                "try_another_search_result": true,
-                                "research_progress": {
-                                    "independent_pages_read": page_hosts.len(),
-                                    "remaining_page_fetches": budget.page_limit() - budget.pages,
-                                }
-                            }),
+                            Err(error) => {
+                                budget.refund_page();
+                                serde_json::json!({
+                                    "error": error.user_message(),
+                                    "try_another_search_result": true,
+                                    "research_progress": {
+                                        "independent_pages_read": page_hosts.len(),
+                                        "remaining_page_fetches": budget.page_limit() - budget.pages,
+                                    }
+                                })
+                            }
                         }
                     }
                 }
@@ -2380,7 +2683,11 @@ fn required_string(arguments: &serde_json::Value, key: &str) -> Result<String, W
 }
 
 fn add_source(sources: &mut Vec<WebSource>, title: String, url: String) -> usize {
-    if let Some(index) = sources.iter().position(|source| source.url == url) {
+    let normalized = normalized_url_for_dedup(&url).unwrap_or_else(|| url.clone());
+    if let Some(index) = sources
+        .iter()
+        .position(|source| normalized_url_for_dedup(&source.url).as_deref() == Some(&normalized))
+    {
         index + 1
     } else {
         sources.push(WebSource { title, url });
@@ -2408,9 +2715,10 @@ async fn wait_for_cancel(cancel: &AtomicBool) {
 }
 
 fn set_state(sender: &Sender<WebSearchState>, next: WebSearchState) {
-    // Search workers must never wait for the renderer. A disconnected receiver
-    // only means the window has already been closed.
-    let _ = sender.send(next);
+    // Search workers must never wait for the renderer. Use try_send so a full
+    // bounded channel does not block the tool loop. A disconnected receiver
+    // means the window has already been closed.
+    let _ = sender.try_send(next);
 }
 
 #[cfg(test)]
@@ -3490,5 +3798,265 @@ mod tests {
         );
         assert_eq!(result_states[2].0, "third");
         assert_eq!(result_states[2].1.len(), 3);
+    }
+
+    // --- Tests for the fixes ---
+
+    #[test]
+    fn normalized_host_strips_www_and_uses_registrable_domain() {
+        assert_eq!(
+            normalized_host("https://www.example.com/page").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(
+            normalized_host("https://blog.example.com/post").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(
+            normalized_host("https://docs.example.com/reference").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(
+            normalized_host("https://sub.domain.example.com/page").as_deref(),
+            Some("example.com")
+        );
+    }
+
+    #[test]
+    fn normalized_host_handles_multi_part_tlds() {
+        assert_eq!(
+            normalized_host("https://www.example.co.uk/page").as_deref(),
+            Some("example.co.uk")
+        );
+        assert_eq!(
+            normalized_host("https://blog.example.co.uk/post").as_deref(),
+            Some("example.co.uk")
+        );
+        assert_eq!(
+            normalized_host("https://www.example.com.au/page").as_deref(),
+            Some("example.com.au")
+        );
+        assert_eq!(
+            normalized_host("https://www.example.co.jp/page").as_deref(),
+            Some("example.co.jp")
+        );
+    }
+
+    #[test]
+    fn normalized_host_handles_single_label() {
+        assert_eq!(
+            normalized_host("https://localhost/page").as_deref(),
+            Some("localhost")
+        );
+    }
+
+    #[test]
+    fn normalized_url_strips_tracking_params_and_fragments() {
+        let a = normalized_url_for_dedup("https://example.com/page?utm_source=twitter&id=42");
+        let b = normalized_url_for_dedup("https://example.com/page?utm_source=facebook&id=42");
+        assert_eq!(a, b);
+        let resolved = a.unwrap();
+        assert!(resolved.contains("id=42"));
+        assert!(!resolved.contains("utm_source"));
+    }
+
+    #[test]
+    fn normalized_url_strips_fragments() {
+        let a = normalized_url_for_dedup("https://example.com/page#section1");
+        let b = normalized_url_for_dedup("https://example.com/page#section2");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn normalized_url_strips_gclid_and_fbclid() {
+        let a = normalized_url_for_dedup("https://example.com/page?fbclid=abc&id=1");
+        let b = normalized_url_for_dedup("https://example.com/page?gclid=xyz&id=1");
+        assert_eq!(a, b);
+        assert!(a.unwrap().contains("id=1"));
+    }
+
+    #[test]
+    fn source_dedup_uses_normalized_urls() {
+        let mut sources: Vec<WebSource> = Vec::new();
+        let idx1 = add_source(
+            &mut sources,
+            "Title".into(),
+            "https://example.com/page?utm_source=a".into(),
+        );
+        let idx2 = add_source(
+            &mut sources,
+            "Title".into(),
+            "https://example.com/page?utm_source=b".into(),
+        );
+        assert_eq!(idx1, idx2);
+        assert_eq!(sources.len(), 1);
+    }
+
+    #[test]
+    fn source_dedup_still_allows_different_paths() {
+        let mut sources: Vec<WebSource> = Vec::new();
+        let idx1 = add_source(
+            &mut sources,
+            "Page A".into(),
+            "https://example.com/page-a".into(),
+        );
+        let idx2 = add_source(
+            &mut sources,
+            "Page B".into(),
+            "https://example.com/page-b".into(),
+        );
+        assert_ne!(idx1, idx2);
+        assert_eq!(sources.len(), 2);
+    }
+
+    #[test]
+    fn html_to_text_strips_nav_footer_header_aside() {
+        let html = "<html><body><nav>Navigation links</nav><main>Article content</main><footer>Copyright</footer></body></html>";
+        let text = html_to_text(html);
+        assert!(!text.contains("Navigation"));
+        assert!(text.contains("Article content"));
+        assert!(!text.contains("Copyright"));
+    }
+
+    #[test]
+    fn html_to_text_strips_hidden_elements() {
+        let html = "<html><body><div>Visible</div><div hidden>Hidden content</div></body></html>";
+        let text = html_to_text(html);
+        assert!(text.contains("Visible"));
+        assert!(!text.contains("Hidden content"));
+    }
+
+    #[test]
+    fn html_to_text_strips_display_none_elements() {
+        let html =
+            "<html><body><div>Visible</div><div style=\"display:none\">Invisible</div></body></html>";
+        let text = html_to_text(html);
+        assert!(text.contains("Visible"));
+        assert!(!text.contains("Invisible"));
+    }
+
+    #[test]
+    fn html_to_text_strips_visibility_hidden() {
+        let html = "<html><body><div>Visible</div><div style=\"visibility:hidden\">Invisible</div></body></html>";
+        let text = html_to_text(html);
+        assert!(text.contains("Visible"));
+        assert!(!text.contains("Invisible"));
+    }
+
+    #[test]
+    fn html_to_text_strips_banner_role() {
+        let html = "<html><body><div role=\"banner\">Cookie banner</div><main>Content</main></body></html>";
+        let text = html_to_text(html);
+        assert!(!text.contains("Cookie banner"));
+        assert!(text.contains("Content"));
+    }
+
+    #[test]
+    fn html_to_text_strips_script_and_style() {
+        let html = "<html><head><style>body { color: red; }</style></head><body><script>console.log('hi');</script><p>Hello</p></body></html>";
+        let text = html_to_text(html);
+        assert!(!text.contains("color: red"));
+        assert!(!text.contains("console.log"));
+        assert!(text.contains("Hello"));
+    }
+
+    #[test]
+    fn detect_charset_from_content_type() {
+        let content_type = "text/html; charset=Shift_JIS";
+        let bytes = b"<html></html>";
+        let encoding = detect_charset(content_type, bytes);
+        assert_eq!(encoding.name(), "Shift_JIS");
+    }
+
+    #[test]
+    fn detect_charset_from_meta_tag() {
+        let content_type = "text/html";
+        let bytes = b"<html><head><meta charset=\"euc-jp\"></head><body></body></html>";
+        let encoding = detect_charset(content_type, bytes);
+        assert_eq!(encoding.name(), "EUC-JP");
+    }
+
+    #[test]
+    fn detect_charset_falls_back_to_utf8() {
+        let content_type = "text/html";
+        let bytes = b"<html></html>";
+        let encoding = detect_charset(content_type, bytes);
+        assert_eq!(encoding.name(), "UTF-8");
+    }
+
+    #[test]
+    fn budget_refund_search_does_not_underflow() {
+        let settings = WebSearchSettings {
+            allow_multiple_searches: true,
+            maximum_searches: 3,
+            maximum_page_fetches: 5,
+            ..Default::default()
+        };
+        let mut budget = ToolBudget::new(&settings);
+        assert!(budget.take_search());
+        assert!(budget.take_search());
+        budget.refund_search();
+        budget.refund_search(); // Should not underflow
+        assert_eq!(budget.searches, 0);
+    }
+
+    #[test]
+    fn budget_refund_page_does_not_underflow() {
+        let settings = WebSearchSettings {
+            allow_multiple_searches: true,
+            maximum_searches: 3,
+            maximum_page_fetches: 5,
+            ..Default::default()
+        };
+        let mut budget = ToolBudget::new(&settings);
+        assert!(budget.take_page());
+        budget.refund_page();
+        budget.refund_page(); // Should not underflow
+        assert_eq!(budget.pages, 0);
+    }
+
+    #[test]
+    fn provider_settings_are_normalized_on_creation() {
+        let settings = WebSearchSettings {
+            enabled: true,
+            allow_multiple_searches: false,
+            provider: WebSearchProviderKind::Brave,
+            api_key: Some("sk-test".into()),
+            tavily_api_key: None,
+            exa_api_key: None,
+            result_limit: 0,
+            request_timeout_seconds: 0,
+            maximum_searches: 0,
+            maximum_page_fetches: 0,
+            minimum_successful_searches: 0,
+            minimum_independent_pages: 0,
+            tool_iteration_limit: 0,
+            custom_research_instructions: String::new(),
+        };
+        let provider = create_search_provider(&settings);
+        // The provider should be created successfully with normalized settings
+        // (timeout 0 gets clamped to 3, search/page limit 0 gets clamped to 1)
+        assert!(provider.is_ok());
+    }
+
+    #[test]
+    fn registrable_domain_handles_known_multi_part_tlds() {
+        assert_eq!(registrable_domain("www.example.co.uk"), "example.co.uk");
+        assert_eq!(registrable_domain("blog.example.com.au"), "example.com.au");
+        assert_eq!(registrable_domain("sub.example.co.jp"), "example.co.jp");
+        assert_eq!(registrable_domain("example.co.nz"), "example.co.nz");
+    }
+
+    #[test]
+    fn registrable_domain_falls_back_to_last_two_labels() {
+        assert_eq!(registrable_domain("www.example.com"), "example.com");
+        assert_eq!(registrable_domain("blog.example.org"), "example.org");
+        assert_eq!(registrable_domain("deep.sub.example.io"), "example.io");
+    }
+
+    #[test]
+    fn registrable_domain_handles_single_label() {
+        assert_eq!(registrable_domain("localhost"), "localhost");
+        assert_eq!(registrable_domain("myhost"), "myhost");
     }
 }
