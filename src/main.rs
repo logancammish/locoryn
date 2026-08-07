@@ -22,15 +22,15 @@ use ollama_rs::models::ModelOptions;
 use rustrict::{Censor, Type};
 mod app;
 mod gui;
-mod web_search;
+mod tools;
 
 use crate::app::{
     AppState, Channels, ChatImage, Correspondence, CurrentChat, DebugMessage,
-    DynamicPromptSettings, History, HostLocation, LEGACY_PROFILE_ID, LEGACY_PROFILE_NAME,
-    Language, Log, Profile, ProfileRegistry, Prompt, SavedChat, SystemPrompt, ThinkingLevel,
+    DynamicPromptSettings, FontFamily, HostLocation, LEGACY_PROFILE_ID, LEGACY_PROFILE_NAME,
+    Language, Profile, ProfileRegistry, Prompt, SavedChat, SystemPrompt, ThinkingLevel,
     UserInformation,
 };
-use crate::web_search::{
+use crate::tools::web_search::{
     ToolLoopProgress, ToolLoopRequest, WebSearchProviderKind, WebSearchSettings, WebSearchState,
     create_search_provider, run_tool_loop, send_ollama_request_with_retry, validate_public_url,
 };
@@ -57,6 +57,9 @@ const MIN_RESPONSE_TOKENS: u32 = 512;
 const MAX_RESPONSE_TOKENS: u32 = 1_048_576;
 const MIN_CONTEXT_TOKENS: u32 = 4_096;
 const MAX_CONTEXT_TOKENS: u32 = 4_194_304;
+const DEFAULT_TEXT_SIZE: f32 = 15.0;
+const MIN_TEXT_SIZE: f32 = 1.0;
+const MAX_TEXT_SIZE: f32 = 40.0;
 const DEFAULT_SIDEBAR_WIDTH: f32 = 278.0;
 const MIN_SIDEBAR_WIDTH: f32 = 210.0;
 const MAX_SIDEBAR_WIDTH: f32 = 460.0;
@@ -145,7 +148,11 @@ enum Message {
     ToggleFastStreaming,
     ToggleChatMenu,
     ToggleWebSearch,
+    ToggleTools,
     ToggleMultipleWebSearches,
+    ToggleWebSearchTool,
+    ToggleFetchWebpageTool,
+    ToggleConversationSearchTool,
     ToggleDeepResearchControls,
     ToggleChatWebSearch,
     WebSearchProviderChange(WebSearchProviderKind),
@@ -210,6 +217,7 @@ enum Message {
     ToggleThinking(usize),
     ToggleSources(usize),
     UpdateTextSize(f32),
+    FontFamilyChange(FontFamily),
     InstallationPrompt,
     ModelChange(String),
     InstallModel(String),
@@ -244,6 +252,7 @@ enum Message {
     ToggleFiltering,
     ToggleDarkMode,
     ToggleShowTokensPerSecond,
+    ToggleInfoPopupSetting,
     WipeChatHistory,
     ToggleAdvancedSettings,
     ChangeIp(String),
@@ -369,6 +378,7 @@ struct Program {
     app_state: AppState,
     channels: Channels,
     user_information: UserInformation,
+    show_info_popup: bool,
     prompt: Prompt,
     batch_tokens: i32,
     fast_streaming: bool,
@@ -387,6 +397,7 @@ struct Program {
     window_size: Size,
     temporary_chat: bool,
     web_search_settings: WebSearchSettings,
+    tool_settings: crate::tools::ToolSettings,
     web_search_for_chat: bool,
     /// Web-search choice applied to newly started chats. New chats no longer
     /// inherit the persisted global setting; they start OFF and then follow
@@ -541,10 +552,6 @@ fn user_settings_path() -> PathBuf {
     app_data_dir().join("settings.json")
 }
 
-fn history_path() -> PathBuf {
-    app_data_dir().join("history.json")
-}
-
 fn profiles_path() -> PathBuf {
     app_data_dir().join("profiles.json")
 }
@@ -559,7 +566,11 @@ fn chat_profile_id(chat: &SavedChat) -> &str {
 /// existing active profile. Returns whether anything was changed.
 fn ensure_legacy_profile(registry: &mut ProfileRegistry) -> bool {
     let mut changed = false;
-    if !registry.profiles.iter().any(|profile| profile.id == LEGACY_PROFILE_ID) {
+    if !registry
+        .profiles
+        .iter()
+        .any(|profile| profile.id == LEGACY_PROFILE_ID)
+    {
         registry.profiles.insert(
             0,
             Profile {
@@ -600,7 +611,11 @@ fn assign_legacy_profile_ids(saved_chats: &mut [SavedChat]) -> bool {
 /// itself, not only to a line buried in the system prompt.
 fn conversation_context_prompt(context: &str, user_name: &str, prompt: &str) -> String {
     let user_name = user_name.trim();
-    let partner = if user_name.is_empty() { "a User" } else { user_name };
+    let partner = if user_name.is_empty() {
+        "a User"
+    } else {
+        user_name
+    };
     format!(
         "The following is a conversation between an AI language model and {partner}. You are the AI language model:
     {context}
@@ -869,17 +884,23 @@ fn resource_path(relative: &str) -> PathBuf {
 }
 
 /// Iced intentionally starts with a tiny, deterministic font database instead
-/// of scanning the operating system. Load the platform emoji/symbol fonts
-/// explicitly so both interface icons and emoji in model output have a real
-/// fallback instead of rendering as empty boxes.
+/// of scanning the operating system. Load the platform chat, emoji, and symbol
+/// fonts explicitly so every appearance choice works and model output has a
+/// real fallback instead of rendering unsupported glyphs as empty boxes.
 fn fallback_font_bytes() -> Vec<Vec<u8>> {
     let candidates = [
         resource_path("assets/NotoColorEmoji.ttf"),
         resource_path("assets/NotoSansSymbols2-Regular.ttf"),
+        PathBuf::from(r"C:\Windows\Fonts\times.ttf"),
+        PathBuf::from(r"C:\Windows\Fonts\consola.ttf"),
         PathBuf::from(r"C:\Windows\Fonts\seguiemj.ttf"),
         PathBuf::from(r"C:\Windows\Fonts\seguisym.ttf"),
+        PathBuf::from("/System/Library/Fonts/Times.ttc"),
+        PathBuf::from("/System/Library/Fonts/Menlo.ttc"),
         PathBuf::from("/System/Library/Fonts/Apple Color Emoji.ttc"),
         PathBuf::from("/System/Library/Fonts/Apple Symbols.ttf"),
+        PathBuf::from("/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf"),
+        PathBuf::from("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"),
         PathBuf::from("/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf"),
         PathBuf::from("/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf"),
         PathBuf::from("/usr/share/fonts/noto/NotoColorEmoji.ttf"),
@@ -1771,6 +1792,16 @@ impl Program {
         }
     }
 
+    fn persist_tool_settings(&mut self) {
+        match serde_json::to_value(&self.tool_settings) {
+            Ok(value) => self.persist_setting_value("tools", value),
+            Err(error) => self.set_debug_message(DebugMessage {
+                message: format!("Could not save tool settings: {error}"),
+                is_error: true,
+            }),
+        }
+    }
+
     fn persist_dynamic_prompt_settings(&mut self) {
         match serde_json::to_value(&self.dynamic_prompt_settings) {
             Ok(value) => self.persist_setting_value("dynamic_prompt", value),
@@ -2129,11 +2160,7 @@ impl Program {
 
     fn finalize_response_metadata(job: &ActivePrompt) {
         let elapsed_seconds = job.started_at.elapsed().as_secs().max(1);
-        let tokens_per_second = job
-            .tokens_per_second
-            .lock()
-            .ok()
-            .and_then(|stats| *stats);
+        let tokens_per_second = job.tokens_per_second.lock().ok().and_then(|stats| *stats);
         if let Ok(mut chat) = job.chat_history.lock() {
             Self::apply_response_metadata(
                 &mut chat,
@@ -2324,13 +2351,13 @@ impl Program {
         // preview while the async request is being prepared.
         let attached_images = self.pending_images.clone();
         let had_image = !attached_images.is_empty();
-        let logging = self.app_state.logging;
         let filtering = self.app_state.filtering;
         let user_info = self.user_information.clone();
-        let channels = self.channels.clone();
         let web_search_enabled = self.web_search_for_chat;
         let mut web_search_settings = self.web_search_settings.clone();
         web_search_settings.enabled = web_search_enabled;
+        let mut tool_settings = self.tool_settings.clone();
+        tool_settings.enabled = web_search_enabled;
         let (web_search_state_sender, web_search_state_receiver) = crossbeam_channel::unbounded();
         let (web_progress_sender, web_progress_receiver) =
             tokio::sync::watch::channel(ToolLoopProgress::default());
@@ -2342,6 +2369,7 @@ impl Program {
         let completion_chat_id = chat_id.clone();
         let notice_chat_id = chat_id.clone();
         let chat_notice_sender = self.chat_notice_sender.clone();
+        let chat_storage_dir = self.chat_storage_dir.clone();
         self.chat_notices.remove(&chat_id);
 
         let response_start_index = {
@@ -2399,36 +2427,40 @@ impl Program {
                     prompt.clone()
                 };
 
-                if web_search_enabled {
-                    let provider = match create_search_provider(&web_search_settings) {
-                        Ok(provider) => provider,
-                        Err(error) => {
-                            let api_key = web_search_settings.resolved_api_key();
-                            let message = error.detailed_user_message(api_key.as_deref());
-                            let _ = web_search_state_sender.send(WebSearchState::Failed {
-                                message: message.clone(),
-                            });
-                            send_chat_notice(
-                                &chat_notice_sender,
-                                &notice_chat_id,
-                                DebugMessage {
+                if tool_settings.any_tool_enabled() {
+                    let provider = if tool_settings.web_tools_enabled() {
+                        match create_search_provider(&web_search_settings) {
+                            Ok(provider) => Some(provider),
+                            Err(error) => {
+                                let api_key = web_search_settings.resolved_api_key();
+                                let message = error.detailed_user_message(api_key.as_deref());
+                                let _ = web_search_state_sender.send(WebSearchState::Failed {
                                     message: message.clone(),
-                                    is_error: true,
-                                },
-                            );
-                            user_info.chat_history.lock().unwrap().push_message(
-                                Correspondence::Bot {
-                                    text: format!("Web search could not start: {message}"),
-                                    model: user_info.model.clone(),
-                                    thinking_seconds: None,
-                                    tokens_per_second: None,
-                                    sources: Vec::new(),
-                                    web_search_used: true,
-                                },
-                            );
-                            user_info.chat_history.lock().unwrap().bot_responding = false;
-                            return;
+                                });
+                                send_chat_notice(
+                                    &chat_notice_sender,
+                                    &notice_chat_id,
+                                    DebugMessage {
+                                        message: message.clone(),
+                                        is_error: true,
+                                    },
+                                );
+                                user_info.chat_history.lock().unwrap().push_message(
+                                    Correspondence::Bot {
+                                        text: format!("Web search could not start: {message}"),
+                                        model: user_info.model.clone(),
+                                        thinking_seconds: None,
+                                        tokens_per_second: None,
+                                        sources: Vec::new(),
+                                        web_search_used: true,
+                                    },
+                                );
+                                user_info.chat_history.lock().unwrap().bot_responding = false;
+                                return;
+                            }
                         }
+                    } else {
+                        None
                     };
                     let result = run_tool_loop(ToolLoopRequest {
                         ollama_url: format!("http://{}:{}/api/chat", ip.ip, ip.port),
@@ -2444,10 +2476,12 @@ impl Program {
                             .collect(),
                         thinking: user_info.thinking_level.api_value(),
                         settings: web_search_settings.clone(),
+                        tool_settings: tool_settings.clone(),
                         provider,
                         state_sender: web_search_state_sender.clone(),
                         progress_sender: web_progress_sender,
                         cancel: Arc::clone(&cancel),
+                        chat_storage_dir: Some(chat_storage_dir),
                     })
                     .await;
 
@@ -2480,18 +2514,6 @@ impl Program {
                                     logprobs: None,
                                 })
                                 .await;
-                            if logging {
-                                Channels::send_request_to_channel(
-                                    Arc::clone(&channels.logging_channel),
-                                    Log::create_with_current_time(
-                                        filtering,
-                                        user_info.model.clone(),
-                                        vec![complete_response.clone()],
-                                        Some(system_prompt),
-                                        prompt.clone(),
-                                    ),
-                                );
-                            }
                             if user_info.current_chat_history_enabled {
                                 let (_, visible_response) = split_thinking_text(&complete_response);
                                 user_info
@@ -2511,7 +2533,7 @@ impl Program {
                                 },
                             );
                         }
-                        Err(crate::web_search::WebSearchError::Cancelled) => {}
+                        Err(crate::tools::web_search::WebSearchError::Cancelled) => {}
                         Err(error) => {
                             let api_key = web_search_settings.resolved_api_key();
                             let message = error.detailed_user_message(api_key.as_deref());
@@ -2839,19 +2861,6 @@ impl Program {
                         .await;
                 }
 
-                if logging && !was_cancelled {
-                    Channels::send_request_to_channel(
-                        Arc::clone(&channels.logging_channel),
-                        Log::create_with_current_time(
-                            filtering,
-                            user_info.model,
-                            final_response.clone(),
-                            Some(system_prompt),
-                            prompt.clone(),
-                        ),
-                    );
-                }
-
                 if user_info.current_chat_history_enabled && !was_cancelled {
                     let complete = final_response.join("");
                     let (_, visible_response) = split_thinking_text(&complete);
@@ -3157,10 +3166,34 @@ impl Program {
                 Task::none()
             }
 
+            Message::ToggleTools => {
+                self.tool_settings.enabled = !self.tool_settings.enabled;
+                self.persist_tool_settings();
+                Task::none()
+            }
+
             Message::ToggleMultipleWebSearches => {
                 self.web_search_settings.allow_multiple_searches =
                     !self.web_search_settings.allow_multiple_searches;
                 self.persist_web_search_settings();
+                Task::none()
+            }
+
+            Message::ToggleWebSearchTool => {
+                self.tool_settings.web_search = !self.tool_settings.web_search;
+                self.persist_tool_settings();
+                Task::none()
+            }
+
+            Message::ToggleFetchWebpageTool => {
+                self.tool_settings.fetch_webpage = !self.tool_settings.fetch_webpage;
+                self.persist_tool_settings();
+                Task::none()
+            }
+
+            Message::ToggleConversationSearchTool => {
+                self.tool_settings.conversation_search = !self.tool_settings.conversation_search;
+                self.persist_tool_settings();
                 Task::none()
             }
 
@@ -3206,15 +3239,15 @@ impl Program {
 
             Message::WebSearchResultLimitChange(value) => {
                 self.web_search_settings.result_limit =
-                    (value.round() as usize).clamp(1, crate::web_search::MAX_RESULT_LIMIT);
+                    (value.round() as usize).clamp(1, crate::tools::web_search::MAX_RESULT_LIMIT);
                 self.persist_web_search_settings();
                 self.trigger_settings_feedback(SettingsFeedbackTarget::SearchResultLimit);
                 Task::none()
             }
 
             Message::WebSearchMaximumSearchesChange(value) => {
-                self.web_search_settings.maximum_searches =
-                    (value.round() as usize).clamp(1, crate::web_search::MAX_CONFIGURABLE_SEARCHES);
+                self.web_search_settings.maximum_searches = (value.round() as usize)
+                    .clamp(1, crate::tools::web_search::MAX_CONFIGURABLE_SEARCHES);
                 self.web_search_settings.minimum_successful_searches = self
                     .web_search_settings
                     .minimum_successful_searches
@@ -3226,7 +3259,7 @@ impl Program {
 
             Message::WebSearchMaximumPageFetchesChange(value) => {
                 self.web_search_settings.maximum_page_fetches =
-                    (value.round() as usize).min(crate::web_search::MAX_CONFIGURABLE_PAGES);
+                    (value.round() as usize).min(crate::tools::web_search::MAX_CONFIGURABLE_PAGES);
                 self.web_search_settings.minimum_independent_pages = self
                     .web_search_settings
                     .minimum_independent_pages
@@ -3253,8 +3286,10 @@ impl Program {
             }
 
             Message::WebSearchToolIterationLimitChange(value) => {
-                self.web_search_settings.tool_iteration_limit = (value.round() as usize)
-                    .clamp(2, crate::web_search::MAX_CONFIGURABLE_TOOL_ITERATIONS);
+                self.web_search_settings.tool_iteration_limit = (value.round() as usize).clamp(
+                    2,
+                    crate::tools::web_search::MAX_CONFIGURABLE_TOOL_ITERATIONS,
+                );
                 self.persist_web_search_settings();
                 self.trigger_settings_feedback(SettingsFeedbackTarget::ToolRounds);
                 Task::none()
@@ -3271,7 +3306,7 @@ impl Program {
             Message::WebSearchCustomInstructionsChange(value) => {
                 self.web_search_settings.custom_research_instructions = value
                     .chars()
-                    .take(crate::web_search::MAX_CUSTOM_RESEARCH_INSTRUCTIONS_CHARS)
+                    .take(crate::tools::web_search::MAX_CUSTOM_RESEARCH_INSTRUCTIONS_CHARS)
                     .collect();
                 self.persist_web_search_settings();
                 Task::none()
@@ -3384,8 +3419,7 @@ impl Program {
                 if let Some(index) = self.saved_chats.iter().position(|chat| chat.id == id) {
                     let mut chat = self.saved_chats.remove(index);
                     chat.pinned = !chat.pinned;
-                    let pinned_count =
-                        self.saved_chats.iter().filter(|chat| chat.pinned).count();
+                    let pinned_count = self.saved_chats.iter().filter(|chat| chat.pinned).count();
                     let insert_at = if chat.pinned {
                         // New pins stack right after the chats already pinned.
                         pinned_count
@@ -3615,28 +3649,6 @@ impl Program {
                     self.set_debug_message(debug_msg);
                 }
 
-                let log_result = {
-                    let guard = self.channels.logging_channel.lock().unwrap();
-                    guard.1.try_recv()
-                };
-
-                if let Ok(log) = log_result {
-                    self.app_state.logs.push_log(log);
-
-                    let path = history_path();
-                    let result = write_json_safely(&path, &self.app_state.logs);
-                    match result {
-                        Ok(_) => {}
-                        Err(_) => {
-                            eprintln!("An error writing to history.json");
-                            self.set_debug_message(DebugMessage {
-                                message: "Failed to write to history.json".to_string(),
-                                is_error: true,
-                            });
-                        }
-                    };
-                }
-
                 if content_changed {
                     self.queue_missing_markdown_images()
                 } else {
@@ -3666,7 +3678,6 @@ impl Program {
 
             Message::ToggleFiltering => {
                 self.app_state.filtering = !self.app_state.filtering;
-                self.app_state.logs.filtering = self.app_state.filtering;
                 self.persist_boolean_setting("filtering", self.app_state.filtering);
                 Task::none()
             }
@@ -3681,10 +3692,7 @@ impl Program {
 
             Message::ToggleShowTokensPerSecond => {
                 self.show_tokens_per_second = !self.show_tokens_per_second;
-                self.persist_boolean_setting(
-                    "show_tokens_per_second",
-                    self.show_tokens_per_second,
-                );
+                self.persist_boolean_setting("show_tokens_per_second", self.show_tokens_per_second);
                 Task::none()
             }
 
@@ -3706,8 +3714,24 @@ impl Program {
             }
 
             Message::UpdateTextSize(n) => {
-                self.user_information.text_size = n;
+                self.user_information.text_size = n.clamp(MIN_TEXT_SIZE, MAX_TEXT_SIZE);
+                self.persist_setting_value(
+                    "text_size",
+                    serde_json::Value::from(self.user_information.text_size as f64),
+                );
                 self.trigger_settings_feedback(SettingsFeedbackTarget::TextSize);
+                Task::none()
+            }
+
+            Message::FontFamilyChange(font_family) => {
+                self.user_information.font_family = font_family;
+                match serde_json::to_value(font_family) {
+                    Ok(value) => self.persist_setting_value("font_family", value),
+                    Err(error) => self.set_debug_message(DebugMessage {
+                        message: format!("Could not save the response font: {error}"),
+                        is_error: true,
+                    }),
+                }
                 Task::none()
             }
 
@@ -3719,6 +3743,12 @@ impl Program {
                 }
                 self.begin_page_transition();
 
+                Task::none()
+            }
+
+            Message::ToggleInfoPopupSetting => {
+                self.show_info_popup = !self.show_info_popup;
+                self.persist_boolean_setting("info_popup", self.show_info_popup);
                 Task::none()
             }
 
@@ -3981,22 +4011,21 @@ impl Program {
                     });
                     return Task::none();
                 }
-                if self.profiles.iter().any(|profile| {
-                    profile.id != id && profile.name.eq_ignore_ascii_case(&name)
-                }) {
+                if self
+                    .profiles
+                    .iter()
+                    .any(|profile| profile.id != id && profile.name.eq_ignore_ascii_case(&name))
+                {
                     self.set_debug_message(DebugMessage {
                         message: "A profile with that name already exists.".to_string(),
                         is_error: true,
                     });
                     return Task::none();
                 }
-                if let Some(profile) =
-                    self.profiles.iter_mut().find(|profile| profile.id == id)
-                {
+                if let Some(profile) = self.profiles.iter_mut().find(|profile| profile.id == id) {
                     profile.name = name;
                     profile.user_name = self.profile_edit_user_name.trim().to_string();
-                    profile.custom_instructions =
-                        self.profile_edit_instructions.trim().to_string();
+                    profile.custom_instructions = self.profile_edit_instructions.trim().to_string();
                 }
                 self.editing_profile_id = None;
                 self.persist_profiles();
@@ -4006,8 +4035,7 @@ impl Program {
             Message::DeleteProfile(id) => {
                 if id == self.active_profile_id {
                     self.set_debug_message(DebugMessage {
-                        message: "Switch to another profile before deleting this one."
-                            .to_string(),
+                        message: "Switch to another profile before deleting this one.".to_string(),
                         is_error: false,
                     });
                     return Task::none();
@@ -4020,14 +4048,10 @@ impl Program {
                         .temporary_chats
                         .values()
                         .any(|session| session.profile_id == id)
-                    || self
-                        .active_prompts
-                        .values()
-                        .any(|job| job.profile_id == id);
+                    || self.active_prompts.values().any(|job| job.profile_id == id);
                 if still_has_chats {
                     self.set_debug_message(DebugMessage {
-                        message: "That profile still has chats. Delete them first."
-                            .to_string(),
+                        message: "That profile still has chats. Delete them first.".to_string(),
                         is_error: true,
                     });
                     return Task::none();
@@ -4481,9 +4505,15 @@ impl Default for Program {
                 .unwrap_or(default)
                 .clamp(minimum, maximum)
         };
+        let setting_f32 = |key, default| {
+            settings_hmap
+                .get(key)
+                .and_then(serde_json::Value::as_f64)
+                .map(|value| value as f32)
+                .unwrap_or(default)
+        };
         let filtering = setting_bool("filtering", true);
         let dark_mode = setting_bool("dark_mode", true);
-        let logging = setting_bool("logging", false);
         let info_popup = setting_bool("info_popup", false);
         let fast_streaming = setting_bool("fast_streaming", true);
         let show_tokens_per_second = setting_bool("show_tokens_per_second", false);
@@ -4500,6 +4530,11 @@ impl Default for Program {
             .and_then(|value| serde_json::from_value::<WebSearchSettings>(value).ok())
             .unwrap_or_default()
             .normalized();
+        let tool_settings = settings_hmap
+            .get("tools")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<crate::tools::ToolSettings>(value).ok())
+            .unwrap_or_default();
         let ui_layout = settings_hmap
             .get("ui_layout")
             .cloned()
@@ -4518,6 +4553,13 @@ impl Default for Program {
             MIN_CONTEXT_TOKENS,
             MAX_CONTEXT_TOKENS,
         );
+        let text_size =
+            setting_f32("text_size", DEFAULT_TEXT_SIZE).clamp(MIN_TEXT_SIZE, MAX_TEXT_SIZE);
+        let font_family = settings_hmap
+            .get("font_family")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<FontFamily>(value).ok())
+            .unwrap_or_default();
         let language = match settings_hmap
             .get("language")
             .and_then(|value| value.as_str())
@@ -4587,16 +4629,6 @@ impl Default for Program {
                     bot_responding: false,
                 });
 
-        let history_file = history_path();
-        let mut history = read_json_with_backup::<History>(&history_file).unwrap_or(History {
-            began_logging: Local::now().to_rfc3339(),
-            version: APP_VERSION.to_string(),
-            filtering,
-            logs: vec![],
-        });
-        history.version = APP_VERSION.to_string();
-        history.filtering = filtering;
-
         let (chat_notice_sender, chat_notice_receiver) = crossbeam_channel::unbounded();
         gui::set_dark_mode(dark_mode);
 
@@ -4615,6 +4647,7 @@ impl Default for Program {
             web_search_for_chat,
             new_chat_web_search,
             web_search_settings,
+            tool_settings,
             current_chat_id,
             open_chat_dirty: false,
             saved_chats,
@@ -4678,7 +4711,6 @@ impl Default for Program {
             },
             channels: Channels {
                 debug_channel: Arc::new(Mutex::new(std::sync::mpsc::channel::<DebugMessage>())),
-                logging_channel: Arc::new(Mutex::new(std::sync::mpsc::channel::<Log>())),
             },
             user_information: UserInformation {
                 chat_history: Arc::new(Mutex::new(current_chat)),
@@ -4692,13 +4724,15 @@ impl Default for Program {
                 max_response_tokens,
                 context_tokens,
                 temperature: 7.0,
-                text_size: 24.0,
+                text_size,
+                font_family,
                 ip_address: HostLocation {
                     ip: "127.0.0.1".to_string(),
                     port: "11434".to_string(),
                 },
                 language,
             },
+            show_info_popup: info_popup,
             prompt: Prompt {
                 prompt: String::new(),
                 editor: iced::widget::text_editor::Content::new(),
@@ -4711,8 +4745,6 @@ impl Default for Program {
                 } else {
                     GUIState::Main
                 },
-                logs: history,
-                logging,
                 ollama_state: Arc::new(Mutex::new("Offline".to_string())),
                 bots_list: Arc::new(Mutex::new(vec![])),
             },
@@ -4786,15 +4818,16 @@ mod tests {
     use iced_widget::markdown;
 
     use super::{
-        ActivePrompt, Correspondence, CurrentChat, LEGACY_PROFILE_ID, Message, ModelCapabilities,
-        Point, Profile, ProfileRegistry, Program, SavedChat, SettingsFeedbackTarget, Size,
-        ThinkingLevel, ToolLoopProgress, UiResizeTarget, UserInformation, WebSearchSettings,
-        WebSearchState, app_data_dir, assign_legacy_profile_ids, canonical_code_language,
-        censor_text, chat_profile_id, compare_versions, conversation_context_prompt,
-        decode_generation_line, disabled_web_tool_message, ensure_legacy_profile,
-        generated_image_payload, model_capabilities, normalize_code_fence_languages,
-        parse_markdown_items, read_json_with_backup, remote_image_url_is_safe, sidecar_path,
-        split_thinking_text, tokens_per_second, write_json_safely,
+        ActivePrompt, Correspondence, CurrentChat, FontFamily, GUIState, LEGACY_PROFILE_ID,
+        Message, ModelCapabilities, Point, Profile, ProfileRegistry, Program, SavedChat,
+        SettingsFeedbackTarget, Size, ThinkingLevel, ToolLoopProgress, UiResizeTarget,
+        UserInformation, WebSearchSettings, WebSearchState, app_data_dir,
+        assign_legacy_profile_ids, canonical_code_language, censor_text, chat_profile_id,
+        compare_versions, conversation_context_prompt, decode_generation_line,
+        disabled_web_tool_message, ensure_legacy_profile, generated_image_payload,
+        model_capabilities, normalize_code_fence_languages, parse_markdown_items,
+        read_json_with_backup, remote_image_url_is_safe, sidecar_path, split_thinking_text,
+        tokens_per_second, write_json_safely,
     };
 
     fn test_active_prompt(
@@ -4958,6 +4991,40 @@ mod tests {
             program.settings_feedback,
             Some((SettingsFeedbackTarget::ApplyContextWindow, _))
         ));
+    }
+
+    #[test]
+    fn chat_appearance_changes_are_bounded_and_queued_for_persistence() {
+        let mut program = Program::default();
+
+        let _ = program.update(Message::UpdateTextSize(99.0));
+        let _ = program.update(Message::FontFamilyChange(FontFamily::Serif));
+
+        assert_eq!(program.user_information.text_size, 40.0);
+        assert_eq!(program.user_information.font_family, FontFamily::Serif);
+        assert_eq!(
+            program.pending_settings.get("text_size"),
+            Some(&serde_json::json!(40.0))
+        );
+        assert_eq!(
+            program.pending_settings.get("font_family"),
+            Some(&serde_json::json!("serif"))
+        );
+    }
+
+    #[test]
+    fn opening_info_manually_does_not_change_the_startup_preference() {
+        let mut program = Program {
+            show_info_popup: false,
+            ..Program::default()
+        };
+        program.app_state.gui_state = GUIState::Main;
+
+        let _ = program.update(Message::ToggleInfoPopup);
+
+        assert!(program.app_state.gui_state == GUIState::InfoPopup);
+        assert!(!program.show_info_popup);
+        assert!(!program.pending_settings.contains_key("info_popup"));
     }
 
     #[test]
@@ -5449,7 +5516,11 @@ mod tests {
 
     #[test]
     fn profiled_chats_keep_their_profile_during_migration() {
-        let mut chats = vec![test_saved_chat("chat-1", "profile-9", "2026-01-01T00:00:00Z")];
+        let mut chats = vec![test_saved_chat(
+            "chat-1",
+            "profile-9",
+            "2026-01-01T00:00:00Z",
+        )];
 
         let changed = assign_legacy_profile_ids(&mut chats);
 
@@ -5558,10 +5629,12 @@ mod tests {
         drop(program.update(Message::SelectProfile("profile-1".into())));
 
         assert_eq!(program.active_profile_id, "profile-1");
-        assert!(program
-            .saved_chats
-            .iter()
-            .all(|chat| chat.id != program.current_chat_id));
+        assert!(
+            program
+                .saved_chats
+                .iter()
+                .all(|chat| chat.id != program.current_chat_id)
+        );
         assert!(!program.temporary_chat);
         assert!(program.chat_messages_cache.is_empty());
     }
@@ -5584,26 +5657,39 @@ mod tests {
                 },
             ],
             active_profile_id: LEGACY_PROFILE_ID.to_string(),
-            saved_chats: vec![test_saved_chat("chat-1", "profile-1", "2026-01-01T00:00:00Z")],
+            saved_chats: vec![test_saved_chat(
+                "chat-1",
+                "profile-1",
+                "2026-01-01T00:00:00Z",
+            )],
             ..Program::default()
         };
 
         drop(program.update(Message::DeleteProfile("profile-1".into())));
-        assert!(program.profiles.iter().any(|profile| profile.id == "profile-1"));
+        assert!(
+            program
+                .profiles
+                .iter()
+                .any(|profile| profile.id == "profile-1")
+        );
 
         // The active profile is protected as well.
         drop(program.update(Message::DeleteProfile(LEGACY_PROFILE_ID.into())));
-        assert!(program
-            .profiles
-            .iter()
-            .any(|profile| profile.id == LEGACY_PROFILE_ID));
+        assert!(
+            program
+                .profiles
+                .iter()
+                .any(|profile| profile.id == LEGACY_PROFILE_ID)
+        );
 
         program.saved_chats.clear();
         drop(program.update(Message::DeleteProfile("profile-1".into())));
-        assert!(program
-            .profiles
-            .iter()
-            .all(|profile| profile.id != "profile-1"));
+        assert!(
+            program
+                .profiles
+                .iter()
+                .all(|profile| profile.id != "profile-1")
+        );
     }
 
     #[test]
@@ -5719,21 +5805,18 @@ mod tests {
             &instructions,
         );
 
-        assert!(prompt.contains(
-            "The user's name is Logan. Use this name when addressing the user."
-        ));
+        assert!(
+            prompt.contains("The user's name is Logan. Use this name when addressing the user.")
+        );
     }
 
     #[test]
     fn conversation_context_names_the_user_the_profile_provides() {
-        let prompt = conversation_context_prompt(
-            "User: Hello there",
-            "Logan",
-            "What is my name?",
-        );
+        let prompt = conversation_context_prompt("User: Hello there", "Logan", "What is my name?");
 
-        assert!(prompt
-            .contains("a conversation between an AI language model and Logan. You are the AI language model:"));
+        assert!(prompt.contains(
+            "a conversation between an AI language model and Logan. You are the AI language model:"
+        ));
         assert!(prompt.contains("User: Hello there"));
         assert!(prompt.contains("What is my name?"));
     }
@@ -5742,8 +5825,9 @@ mod tests {
     fn conversation_context_falls_back_to_anonymous_user_without_a_name() {
         let prompt = conversation_context_prompt("User: Hello there", "   ", "Hi");
 
-        assert!(prompt
-            .contains("a conversation between an AI language model and a User. You are the AI language model:"));
+        assert!(prompt.contains(
+            "a conversation between an AI language model and a User. You are the AI language model:"
+        ));
     }
 
     #[test]
@@ -5766,7 +5850,11 @@ mod tests {
 
         drop(program.update(Message::ToggleChatPin("chat-c".into())));
 
-        let ids: Vec<&str> = program.saved_chats.iter().map(|chat| chat.id.as_str()).collect();
+        let ids: Vec<&str> = program
+            .saved_chats
+            .iter()
+            .map(|chat| chat.id.as_str())
+            .collect();
         assert_eq!(ids, vec!["chat-c", "chat-a", "chat-b"]);
         assert!(program.saved_chats[0].pinned);
     }
@@ -5794,7 +5882,11 @@ mod tests {
         // updated_at (2026-01-02) between chat-a (01-03) and chat-c (01-01).
         drop(program.update(Message::ToggleChatPin("chat-b".into())));
 
-        let ids: Vec<&str> = program.saved_chats.iter().map(|chat| chat.id.as_str()).collect();
+        let ids: Vec<&str> = program
+            .saved_chats
+            .iter()
+            .map(|chat| chat.id.as_str())
+            .collect();
         assert_eq!(ids, vec!["chat-a", "chat-b", "chat-c"]);
         assert!(program.saved_chats.iter().all(|chat| !chat.pinned));
     }

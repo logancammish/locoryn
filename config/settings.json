@@ -1,7 +1,8 @@
 {
     "filtering": false,
-    "logging": false,
     "dark_mode": true,
+    "text_size": 15.0,
+    "font_family": "sans-serif",
     "current_chat_history_enabled": true,
     "info_popup": true,
     "fast_streaming": true,

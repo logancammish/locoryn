@@ -26,7 +26,7 @@
 Locoryn is a fork of [ollama-gui-interface](https://github.com/logancammish/ollama-gui-interface).
 
 > [!NOTE]
-> This README describes the current `main` branch (`1.0.1`). Packaged releases
+> This README describes the current `main` branch (`1.0.2`). Packaged releases
 > may trail the source branch; check the release notes for the exact feature set
 > in a download.
 
@@ -63,7 +63,7 @@ ollama serve
 Open the [latest release](https://github.com/logancammish/locoryn/releases/latest)
 and choose the asset for your operating system.
 
-- **Windows 11:** use `locoryn-1.0.1-windows-11-x64-setup.exe` for the standard per-user
+- **Windows 11:** use `locoryn-1.0.2-windows-11-x64-setup.exe` for the standard per-user
   installation. It does not require administrator privileges.
 - **Linux:** clone or download this repository, then run `./install-linux.sh`.
   It detects x86_64 or ARM64, lets you override the result, offers the main or
@@ -104,7 +104,7 @@ Most controls live in **Settings**:
 | Application updates | Current version, latest stable release, and a trusted download link |
 | Chat storage | The folder containing saved conversations |
 | Model conversation context | Whether earlier messages are included in the next request |
-| Interface | Language, theme, and text size |
+| Interface | Language, theme, text size, and chat font |
 
 **Advanced settings** contains model installation, custom Ollama connection
 details, streaming/batching controls, content filtering, and the local code
@@ -206,14 +206,15 @@ path is always visible under **Settings → Chat storage**, and it can be change
 from there. The application can also detect conversations from the legacy
 `output/chats.json` location.
 
-Generated images are stored in `generated`, while user settings and diagnostics
-use `settings.json` and `history.json` in the application-data folder.
+Generated images are stored in `generated`, while user preferences use
+`settings.json` in the application-data folder.
 
 ## Platform support
 
 | Platform | Status |
 |---|---|
 | Windows x64 | Officially supported; per-user installer available |
+| Windows ARM64 | Native portable build available |
 | Linux x86_64 and ARM64 | Officially supported; desktop installer available |
 | macOS Apple Silicon (ARM64) | Build supported; automated native build available |
 
@@ -238,6 +239,16 @@ natively with:
 ```bash
 cargo build --release --target aarch64-apple-darwin
 ```
+
+On Linux, build Linux x86_64/ARM64 and Windows x86_64/ARM64 together with all
+available CPU cores by running:
+
+```bash
+./linux-installations/build-locally.sh --install-tools
+```
+
+See [the Linux build documentation](linux_installations/README.md#build-every-desktop-target-locally)
+for prerequisites and output locations.
 
 The macOS ARM64 binary is then
 `target/aarch64-apple-darwin/release/locoryn`.

@@ -20,9 +20,9 @@ For an unattended installation:
 ./install-linux.sh --arch arm64 --channel beta --yes
 ```
 
-You can also pin a release with `--tag v1.0.1`. The installer expects release
+You can also pin a release with `--tag v1.0.2`. The installer expects release
 assets to use the repository's standard names, for example
-`locoryn-1.0.1-linux-x86_64.tar.gz`.
+`locoryn-1.0.2-linux-x86_64.tar.gz`.
 
 Files are installed to these per-user locations:
 
@@ -38,4 +38,37 @@ To uninstall the application while retaining chats and settings:
 
 ```sh
 ./linux_installations/uninstall-linux.sh
+```
+
+## Build every desktop target locally
+
+From any Linux host, the local builder can produce Linux x86_64, Linux ARM64,
+Windows x86_64, and Windows ARM64 packages in one invocation:
+
+```sh
+./linux-installations/build-locally.sh --install-tools
+```
+
+The `--install-tools` flag installs `cross` and `cargo-xwin` with Cargo when
+they are missing. Later builds can omit it. The host must also have:
+
+- Rust installed through `rustup`;
+- a running Docker or Podman engine;
+- LLVM/Clang tools (`clang-cl`, `lld-link`, and `llvm-rc`); and
+- `zip`, `tar`, and `sha256sum`.
+
+For example, the system packages are commonly named `clang`, `lld`, `llvm`,
+`zip`, and either `docker` or `podman`. Package-manager commands differ between
+Linux distributions, so the script checks these tools and identifies anything
+missing without trying to modify the operating system.
+
+By default, every online CPU core is divided across four concurrent Cargo
+builds. Override the total CPU budget with `--cores NUMBER` or the
+`LOCORYN_BUILD_CORES` environment variable.
+
+Completed archives, local Linux installers, checksums, and an instruction file
+are placed under the conspicuous repository-root directory:
+
+```text
+LOCAL-BUILDS/locoryn-VERSION-TIMESTAMP/READY-TO-INSTALL/
 ```

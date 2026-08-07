@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use crate::{GUIState, Program, web_search::WebSource};
+use crate::{GUIState, Program, tools::web_search::WebSource};
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 
@@ -208,7 +208,7 @@ mod saved_chat_tests {
                     model: Some("model-a".into()),
                     thinking_seconds: Some(30),
                     tokens_per_second: Some(18.75),
-                    sources: vec![crate::web_search::WebSource {
+                    sources: vec![crate::tools::web_search::WebSource {
                         title: "Example".into(),
                         url: "https://example.com".into(),
                     }],
@@ -288,52 +288,6 @@ pub struct DebugMessage {
     pub is_error: bool,
 }
 
-// log struct allows for easy JSON creation
-#[derive(Deserialize, Serialize, Clone)]
-pub struct Log {
-    pub filtering: bool,
-    pub time: String,
-    pub prompt: String,
-    pub response: Vec<String>,
-    pub model: Option<String>,
-    pub systemprompt: Option<String>,
-}
-
-impl Log {
-    // this function will create a new Log with the information specified on the current time
-    pub fn create_with_current_time(
-        filtering: bool,
-        model: Option<String>,
-        response: Vec<String>,
-        systemprompt: Option<String>,
-        prompt: String,
-    ) -> Self {
-        Log {
-            filtering,
-            time: Local::now().to_rfc3339(),
-            prompt,
-            response,
-            model,
-            systemprompt,
-        }
-    }
-}
-
-// History struct allows for easy JSON creation
-#[derive(Deserialize, Serialize, Clone)]
-pub struct History {
-    pub began_logging: String,
-    pub version: String,
-    pub filtering: bool,
-    pub logs: Vec<Log>,
-}
-impl History {
-    // will push a Log to the History.logs
-    pub fn push_log(&mut self, log: Log) {
-        self.logs.push(log);
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct CurrentChat {
     pub chats: Vec<String>,
@@ -367,8 +321,6 @@ impl CurrentChat {
 pub struct AppState {
     pub filtering: bool,
     pub dark_mode: bool,
-    pub logs: History,
-    pub logging: bool,
     pub ollama_state: Arc<Mutex<String>>,
     pub bots_list: Arc<Mutex<Vec<String>>>,
     pub gui_state: GUIState,
@@ -513,10 +465,35 @@ pub struct UserInformation {
     pub context_tokens: u32,
     pub temperature: f32,
     pub text_size: f32,
+    pub font_family: FontFamily,
     pub chat_history: Arc<Mutex<CurrentChat>>,
     pub current_chat_history_enabled: bool,
     pub ip_address: HostLocation,
     pub language: Language,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum FontFamily {
+    #[default]
+    #[serde(alias = "sansserif")]
+    SansSerif,
+    Serif,
+    Monospace,
+}
+
+impl FontFamily {
+    pub const ALL: [Self; 3] = [Self::SansSerif, Self::Serif, Self::Monospace];
+}
+
+impl fmt::Display for FontFamily {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::SansSerif => "Sans-serif",
+            Self::Serif => "Serif",
+            Self::Monospace => "Monospace",
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -607,7 +584,6 @@ impl fmt::Display for ThinkingLevel {
 /// Channels
 /// These mpsc channels provide communication between runtimes.
 /// debug_channel: mpsc channel for sending debug information to GUI
-/// logging_channel: mpsc channel for communication with the logging feature of the program
 
 #[derive(Clone)]
 pub struct Channels {
@@ -617,7 +593,6 @@ pub struct Channels {
             std::sync::mpsc::Receiver<DebugMessage>,
         )>,
     >,
-    pub logging_channel: Arc<Mutex<(std::sync::mpsc::Sender<Log>, std::sync::mpsc::Receiver<Log>)>>,
 }
 
 impl Channels {
