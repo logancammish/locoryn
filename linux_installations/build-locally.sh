@@ -12,7 +12,7 @@ usage() {
     cat <<'EOF'
 Build every supported Locoryn Linux and Windows architecture from Linux.
 
-Usage: ./linux-installations/build-locally.sh [options]
+Usage: ./linux_installations/build-locally.sh [options]
 
 Options:
   --cores NUMBER       Total CPU cores shared between the four builds.

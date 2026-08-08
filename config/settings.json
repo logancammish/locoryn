@@ -9,6 +9,13 @@
     "max_response_tokens": 32768,
     "context_tokens": 131072,
     "code_checking_enabled": false,
+    "tools": {
+        "enabled": true,
+        "web_search": true,
+        "fetch_webpage": true,
+        "conversation_search": true,
+        "code_checking": false
+    },
     "ui_layout": {
         "sidebar_width": 278,
         "composer_height": 142

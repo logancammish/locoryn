@@ -133,10 +133,9 @@ pub(super) fn detect_charset(content_type: &str, bytes: &[u8]) -> &'static encod
         key.trim()
             .eq_ignore_ascii_case("charset")
             .then(|| value.trim().trim_matches('"').trim_matches('\''))
-    }) {
-        if let Some(encoding) = encoding_rs::Encoding::for_label(charset.as_bytes()) {
-            return encoding;
-        }
+    }) && let Some(encoding) = encoding_rs::Encoding::for_label(charset.as_bytes())
+    {
+        return encoding;
     }
 
     // 2. Look for <meta charset> or <meta http-equiv> in the first 4 KiB
@@ -155,10 +154,10 @@ pub(super) fn detect_charset(content_type: &str, bytes: &[u8]) -> &'static encod
             })
             .next()
             .unwrap_or("");
-        if !charset.is_empty() {
-            if let Some(encoding) = encoding_rs::Encoding::for_label(charset.as_bytes()) {
-                return encoding;
-            }
+        if !charset.is_empty()
+            && let Some(encoding) = encoding_rs::Encoding::for_label(charset.as_bytes())
+        {
+            return encoding;
         }
     }
 
@@ -353,15 +352,13 @@ pub(super) fn html_to_text(html: &str) -> String {
 
         // Strip known non-content block elements
         for (open, close) in block_tags {
-            if let Some(start) = remaining_lower.find(open) {
-                if let Some(end) = lowercase[cursor + start..]
+            if let Some(start) = remaining_lower.find(open)
+                && let Some(end) = lowercase[cursor + start..]
                     .find(close)
                     .map(|pos| cursor + start + pos + close.len())
-                {
-                    if earliest.is_none() || start < earliest.unwrap().0 {
-                        earliest = Some((start, end));
-                    }
-                }
+                && earliest.is_none_or(|(earliest_start, _)| start < earliest_start)
+            {
+                earliest = Some((start, end));
             }
         }
 

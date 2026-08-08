@@ -462,17 +462,33 @@ fn exhausted_tools_are_not_offered_to_the_model_again() {
     };
 
     assert_eq!(
-        names(available_tool_definitions(&settings, &tool_settings, &budget)),
-        vec!["web_search", "fetch_webpage", "search_locoryn_conversations"]
+        names(available_tool_definitions(
+            &settings,
+            &tool_settings,
+            &budget
+        )),
+        vec![
+            "web_search",
+            "fetch_webpage",
+            "search_locoryn_conversations"
+        ]
     );
     assert!(budget.take_search());
     assert_eq!(
-        names(available_tool_definitions(&settings, &tool_settings, &budget)),
+        names(available_tool_definitions(
+            &settings,
+            &tool_settings,
+            &budget
+        )),
         vec!["fetch_webpage", "search_locoryn_conversations"]
     );
     assert!(budget.take_page());
     assert_eq!(
-        names(available_tool_definitions(&settings, &tool_settings, &budget)),
+        names(available_tool_definitions(
+            &settings,
+            &tool_settings,
+            &budget
+        )),
         vec!["search_locoryn_conversations"]
     );
 }
@@ -505,6 +521,21 @@ fn search_calls_can_choose_bounded_breadth_and_freshness() {
         WebSearchFreshness::from_tool_value(Some(&serde_json::json!(7))),
         Err(WebSearchError::InvalidToolCall)
     ));
+}
+
+#[test]
+fn malformed_tool_calls_are_returned_as_recoverable_feedback() {
+    let message = invalid_tool_message(
+        "search_locoryn_conversations",
+        "search_locoryn_conversations requires a non-empty string query.",
+    );
+
+    assert_eq!(message["role"], "tool");
+    assert_eq!(message["tool_name"], "search_locoryn_conversations");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(message["content"].as_str().unwrap()).unwrap()["error"],
+        "invalid tool call"
+    );
 }
 
 #[test]
@@ -1322,7 +1353,6 @@ fn provider_settings_are_normalized_on_creation() {
         minimum_independent_pages: 0,
         tool_iteration_limit: 0,
         custom_research_instructions: String::new(),
-        ..WebSearchSettings::default()
     };
     let provider = create_search_provider(&settings);
     // The provider should be created successfully with normalized settings

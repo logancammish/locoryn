@@ -13,6 +13,9 @@ pub struct ToolLoopRequest {
     pub thinking: serde_json::Value,
     pub settings: WebSearchSettings,
     pub tool_settings: crate::tools::ToolSettings,
+    /// Separate advanced-settings consent required before a model may invoke a
+    /// local compiler/interpreter through the code-checking tool.
+    pub code_checking_enabled: bool,
     pub provider: Option<Arc<dyn WebSearchProvider>>,
     pub state_sender: Sender<WebSearchState>,
     pub progress_sender: tokio::sync::watch::Sender<ToolLoopProgress>,
@@ -48,6 +51,8 @@ pub(super) struct ToolBudget {
     search_limit: usize,
     pub(super) pages: usize,
     page_limit: usize,
+    code_checks: usize,
+    code_check_limit: usize,
 }
 
 impl ToolBudget {
@@ -74,6 +79,8 @@ impl ToolBudget {
             search_limit,
             pages: 0,
             page_limit,
+            code_checks: 0,
+            code_check_limit: 3,
         }
     }
 
@@ -128,18 +135,35 @@ impl ToolBudget {
         self.pages < self.page_limit
     }
 
+    pub(super) fn take_code_check(&mut self) -> bool {
+        if self.code_checks >= self.code_check_limit {
+            false
+        } else {
+            self.code_checks += 1;
+            true
+        }
+    }
+
+    pub(super) fn has_code_check_capacity(&self) -> bool {
+        self.code_checks < self.code_check_limit
+    }
+
     pub(super) fn has_tool_capacity(&self) -> bool {
-        self.has_search_capacity() || self.has_page_capacity()
+        self.has_search_capacity() || self.has_page_capacity() || self.has_code_check_capacity()
     }
 }
 
 pub(super) fn tool_loop_guidance(
     settings: &WebSearchSettings,
     tool_settings: &crate::tools::ToolSettings,
+    code_checking_enabled: bool,
     current_date: &str,
 ) -> String {
     let mut guidance = format!(
-        "The current local date is {current_date}. You have the following tools available:",
+        "The current local date is {current_date}. You have the following tools available. \
+         When a tool is needed, invoke its native function call with an arguments object that \
+         matches its schema; do not print a JSON tool call in your answer. After receiving a \
+         tool result, use that result to continue or answer the user directly:",
     );
 
     if tool_settings.conversation_search {
@@ -157,14 +181,18 @@ pub(super) fn tool_loop_guidance(
         );
     }
     if tool_settings.fetch_webpage {
+        guidance.push_str("\n- fetch_webpage: Read the full content of a webpage found by search.");
+    }
+    if tool_settings.code_checking && code_checking_enabled {
         guidance.push_str(
-            "\n- fetch_webpage: Read the full content of a webpage found by search.",
+            "\n- check_code: Check a self-contained code snippet for compile or syntax errors before presenting it. Use this only when compiler feedback is useful; it never runs the snippet.",
         );
     }
 
     if tool_settings.web_search || tool_settings.fetch_webpage {
         if settings.allow_multiple_searches {
-            let page_guidance = if !tool_settings.fetch_webpage || settings.maximum_page_fetches == 0
+            let page_guidance = if !tool_settings.fetch_webpage
+                || settings.maximum_page_fetches == 0
             {
                 "Full webpage fetching is disabled for this request.".to_string()
             } else if settings.minimum_independent_pages == 0 {
@@ -751,11 +779,11 @@ pub(super) async fn finish_after_tool_limit(
     messages.push(serde_json::json!({
         "role": "system",
         "content": format!(
-            "The configured web-tool budget is now exhausted after {} search request(s) and {} \
-             page fetch(es). Do not request or describe another tool call. Produce the best complete \
+            "The configured tool budget is now exhausted after {} search request(s), {} \
+             page fetch(es), and {} code check(s). Do not request or describe another tool call. Produce the best complete \
              final answer now using the evidence already present in this conversation. Be explicit \
              about any remaining uncertainty and cite the supplied numbered sources.",
-            budget.searches, budget.pages,
+            budget.searches, budget.pages, budget.code_checks,
         ),
     }));
     set_state(
@@ -864,7 +892,12 @@ pub async fn run_tool_loop(request: ToolLoopRequest) -> Result<ToolLoopResponse,
             "{}{}{}",
             request.system_prompt,
             web_trust_warning,
-            tool_loop_guidance(&settings, &tool_settings, &current_date),
+            tool_loop_guidance(
+                &settings,
+                &tool_settings,
+                request.code_checking_enabled,
+                &current_date,
+            ),
         )}),
         user_message(request.prompt.clone(), request.images.clone()),
     ];
@@ -911,7 +944,12 @@ pub async fn run_tool_loop(request: ToolLoopRequest) -> Result<ToolLoopResponse,
             accumulated_thinking.clone(),
             accumulated_answer.clone(),
         );
-        let tools = available_tool_definitions(&settings, &request.tool_settings, &budget);
+        let tools = available_tool_definitions(
+            &settings,
+            &request.tool_settings,
+            request.code_checking_enabled,
+            &budget,
+        );
         if tools
             .as_array()
             .map(|definitions| definitions.is_empty())
@@ -1015,20 +1053,49 @@ pub async fn run_tool_loop(request: ToolLoopRequest) -> Result<ToolLoopResponse,
 
         for call in tool_calls {
             check_cancelled(&request)?;
-            let function = call
-                .get("function")
-                .ok_or(WebSearchError::InvalidToolCall)?;
-            let name = function
-                .get("name")
-                .and_then(serde_json::Value::as_str)
-                .ok_or(WebSearchError::InvalidToolCall)?;
-            let arguments = parse_tool_arguments(function.get("arguments"))?;
+            let Some(function) = call.get("function") else {
+                messages.push(invalid_tool_message(
+                    "unknown",
+                    "The call must contain a function name and an arguments object.",
+                ));
+                continue;
+            };
+            let Some(name) = function.get("name").and_then(serde_json::Value::as_str) else {
+                messages.push(invalid_tool_message(
+                    "unknown",
+                    "The call must contain a function name and an arguments object.",
+                ));
+                continue;
+            };
+            let arguments = match parse_tool_arguments(function.get("arguments")) {
+                Ok(arguments) => arguments,
+                Err(_) => {
+                    messages.push(invalid_tool_message(
+                        name,
+                        "Arguments must be one JSON object matching this tool's schema. Correct the call and try again.",
+                    ));
+                    continue;
+                }
+            };
             let result = match name {
                 "web_search" => {
-                    let query = required_string(&arguments, "query")?;
-                    let result_count = requested_result_count(&arguments, settings.result_limit)?;
-                    let freshness =
-                        WebSearchFreshness::from_tool_value(arguments.get("freshness"))?;
+                    let search_arguments = (|| {
+                        Ok::<_, WebSearchError>((
+                            required_string(&arguments, "query")?,
+                            requested_result_count(&arguments, settings.result_limit)?,
+                            WebSearchFreshness::from_tool_value(arguments.get("freshness"))?,
+                        ))
+                    })();
+                    let (query, result_count, freshness) = match search_arguments {
+                        Ok(arguments) => arguments,
+                        Err(_) => {
+                            messages.push(invalid_tool_message(
+                                name,
+                                "web_search requires a non-empty string query. result_count must be within the advertised limit and freshness must be any, day, week, month, or year.",
+                            ));
+                            continue;
+                        }
+                    };
                     let normalized_query = normalize_search_query(&query);
                     if used_queries.contains(&normalized_query) {
                         serde_json::json!({
@@ -1147,13 +1214,22 @@ pub async fn run_tool_loop(request: ToolLoopRequest) -> Result<ToolLoopResponse,
                     }
                 }
                 "fetch_webpage" => {
+                    let url = match required_string(&arguments, "url") {
+                        Ok(url) => url,
+                        Err(_) => {
+                            messages.push(invalid_tool_message(
+                                name,
+                                "fetch_webpage requires a non-empty public HTTP(S) URL in url.",
+                            ));
+                            continue;
+                        }
+                    };
                     if !budget.take_page() {
                         serde_json::json!({
                             "error": "page fetch limit reached",
                             "max_page_fetches": budget.page_limit(),
                         })
                     } else {
-                        let url = required_string(&arguments, "url")?;
                         set_state(
                             &request.state_sender,
                             WebSearchState::Fetching {
@@ -1225,11 +1301,23 @@ pub async fn run_tool_loop(request: ToolLoopRequest) -> Result<ToolLoopResponse,
                     }
                 }
                 "search_locoryn_conversations" => {
-                    let query = required_string(&arguments, "query")?;
+                    let query = match required_string(&arguments, "query") {
+                        Ok(query) => query,
+                        Err(_) => {
+                            messages.push(invalid_tool_message(
+                                name,
+                                "search_locoryn_conversations requires a non-empty string query. limit is optional and must be between 1 and 20.",
+                            ));
+                            continue;
+                        }
+                    };
                     let limit = crate::tools::search_locoryn_conversations::parse_limit(&arguments);
                     match &request.chat_storage_dir {
                         Some(dir) => {
-                            let results = crate::tools::search_locoryn_conversations::search_conversations(dir, &query, limit);
+                            let results =
+                                crate::tools::search_locoryn_conversations::search_conversations(
+                                    dir, &query, limit,
+                                );
                             serde_json::json!({
                                 "query": query,
                                 "results": results,
@@ -1239,6 +1327,60 @@ pub async fn run_tool_loop(request: ToolLoopRequest) -> Result<ToolLoopResponse,
                             serde_json::json!({
                                 "error": "conversation storage directory is not available",
                             })
+                        }
+                    }
+                }
+                "check_code" => {
+                    let code_arguments = (|| {
+                        Ok::<_, WebSearchError>(
+                            (
+                                required_string(&arguments, "language")?,
+                                required_string(&arguments, "code")?,
+                            ),
+                        )
+                    })();
+                    let (language, code) = match code_arguments {
+                        Ok(arguments) => arguments,
+                        Err(_) => {
+                            messages.push(invalid_tool_message(
+                                name,
+                                "check_code requires non-empty string language and code fields.",
+                            ));
+                            continue;
+                        }
+                    };
+                    if !request.tool_settings.enabled
+                        || !request.tool_settings.code_checking
+                        || !request.code_checking_enabled
+                    {
+                        serde_json::json!({
+                            "error": "code checking is disabled; enable it in both Tools and Advanced settings",
+                        })
+                    } else if !budget.take_code_check() {
+                        serde_json::json!({
+                            "error": "code check limit reached",
+                            "max_code_checks": budget.code_check_limit,
+                        })
+                    } else {
+                        let checked_language = language.clone();
+                        let checked_code = code.clone();
+                        let check = tokio::task::spawn_blocking(move || {
+                            crate::tools::code_checking::check_code(&checked_language, &checked_code)
+                        });
+                        match check.await {
+                            Ok(Ok(message)) => serde_json::json!({
+                                "language": language,
+                                "status": "passed",
+                                "message": message,
+                            }),
+                            Ok(Err(message)) => serde_json::json!({
+                                "language": language,
+                                "status": "failed",
+                                "message": message,
+                            }),
+                            Err(error) => serde_json::json!({
+                                "error": format!("code checker could not complete: {error}"),
+                            }),
                         }
                     }
                 }
@@ -1373,12 +1515,14 @@ pub(super) fn tool_definitions(settings: &WebSearchSettings) -> serde_json::Valu
         }));
     }
     definitions.push(crate::tools::search_locoryn_conversations::tool_definition());
+    definitions.push(crate::tools::code_checking::tool_definition());
     serde_json::Value::Array(definitions)
 }
 
 pub(super) fn available_tool_definitions(
     settings: &WebSearchSettings,
     tool_settings: &crate::tools::ToolSettings,
+    code_checking_enabled: bool,
     budget: &ToolBudget,
 ) -> serde_json::Value {
     let mut definitions = tool_definitions(settings)
@@ -1386,18 +1530,22 @@ pub(super) fn available_tool_definitions(
         .cloned()
         .unwrap_or_default();
     definitions.retain(|definition| {
+        if !tool_settings.enabled {
+            return false;
+        }
         match definition
             .get("function")
             .and_then(|function| function.get("name"))
             .and_then(serde_json::Value::as_str)
         {
-            Some("web_search") => {
-                tool_settings.web_search && budget.has_search_capacity()
-            }
-            Some("fetch_webpage") => {
-                tool_settings.fetch_webpage && budget.has_page_capacity()
-            }
+            Some("web_search") => tool_settings.web_search && budget.has_search_capacity(),
+            Some("fetch_webpage") => tool_settings.fetch_webpage && budget.has_page_capacity(),
             Some("search_locoryn_conversations") => tool_settings.conversation_search,
+            Some("check_code") => {
+                tool_settings.code_checking
+                    && code_checking_enabled
+                    && budget.has_code_check_capacity()
+            }
             _ => false,
         }
     });
@@ -1414,6 +1562,21 @@ pub(super) fn parse_tool_arguments(
         }
         _ => Err(WebSearchError::InvalidToolCall),
     }
+}
+
+/// A malformed model call is returned to the model as tool feedback instead
+/// of aborting the whole user response. Some Ollama models need one schema
+/// correction before they emit a valid native tool call.
+pub(super) fn invalid_tool_message(tool_name: &str, instruction: &str) -> serde_json::Value {
+    serde_json::json!({
+        "role": "tool",
+        "tool_name": tool_name,
+        "content": serde_json::json!({
+            "error": "invalid tool call",
+            "instruction": instruction,
+        })
+        .to_string(),
+    })
 }
 
 pub(super) fn required_string(

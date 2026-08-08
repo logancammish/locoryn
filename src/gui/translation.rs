@@ -144,6 +144,10 @@ pub(super) fn tr(language: Language, english: &'static str) -> &'static str {
         "Copied ✓" => "Copiado ✓",
         "Copy code" => "Copiar código",
         "Check code" => "Comprobar código",
+        "Code Checking" => "Comprobación de código",
+        "Code Checking also requires Local code checking in Advanced settings." => {
+            "La comprobación de código también requiere activar la comprobación local de código en la configuración avanzada."
+        }
         "You" => "Tú",
         "▾ Hide thinking" => "▾ Ocultar razonamiento",
         "▸ Show thinking" => "▸ Mostrar razonamiento",
@@ -296,8 +300,8 @@ pub(super) fn tr(language: Language, english: &'static str) -> &'static str {
             "Muestra la descripción informativa cuando se inicia la app. Puedes abrirla en cualquier momento desde el botón de información."
         }
         "Ollama address" => "Dirección de Ollama",
-        "Change the IP address and port used to connect to Ollama." => {
-            "Cambia la dirección IP y el puerto usados para conectar con Ollama."
+        "Choose HTTP or HTTPS, then enter the hostname or IP address and port used to connect to Ollama." => {
+            "Elige HTTP o HTTPS e introduce el nombre de host o la dirección IP y el puerto para conectar con Ollama."
         }
         "Fastest · no extra reasoning" => "Más rápido · sin razonamiento adicional",
         "Use this model's standard reasoning mode" => {

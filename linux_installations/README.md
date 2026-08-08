@@ -20,9 +20,9 @@ For an unattended installation:
 ./install-linux.sh --arch arm64 --channel beta --yes
 ```
 
-You can also pin a release with `--tag v1.0.2`. The installer expects release
+You can also pin a release with `--tag v1.1.0`. The installer expects release
 assets to use the repository's standard names, for example
-`locoryn-1.0.2-linux-x86_64.tar.gz`.
+`locoryn-1.1.0-linux-x86_64.tar.gz`.
 
 Files are installed to these per-user locations:
 
@@ -46,7 +46,7 @@ From any Linux host, the local builder can produce Linux x86_64, Linux ARM64,
 Windows x86_64, and Windows ARM64 packages in one invocation:
 
 ```sh
-./linux-installations/build-locally.sh --install-tools
+./linux_installations/build-locally.sh --install-tools
 ```
 
 The `--install-tools` flag installs `cross` and `cargo-xwin` with Cargo when

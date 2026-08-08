@@ -26,7 +26,7 @@
 Locoryn is a fork of [ollama-gui-interface](https://github.com/logancammish/ollama-gui-interface).
 
 > [!NOTE]
-> This README describes the current `main` branch (`1.0.2`). Packaged releases
+> This README describes the current `main` branch (`1.1.0`). Packaged releases
 > may trail the source branch; check the release notes for the exact feature set
 > in a download.
 
@@ -60,21 +60,29 @@ ollama serve
 
 ### 2. Install Locoryn
 
-Open the [latest release](https://github.com/logancammish/locoryn/releases/latest)
-and choose the asset for your operating system.
+- **Windows:** download and run
+  `locoryn-1.1.0-windows-11-x64-setup.exe` from the
+  [latest release](https://github.com/logancammish/locoryn/releases/latest).
+  It installs for the current user and does not require administrator access.
+- **Linux:** run these commands in a terminal. The installer downloads the
+  right published package, installs it for the current user, and adds it to
+  your desktop launcher. It does not use `sudo`.
 
-- **Windows 11:** use `locoryn-1.0.2-windows-11-x64-setup.exe` for the standard per-user
-  installation. It does not require administrator privileges.
-- **Linux:** clone or download this repository, then run `./install-linux.sh`.
-  It detects x86_64 or ARM64, lets you override the result, offers the main or
-  beta release channel, and registers Locoryn with your desktop launcher.
+  ```sh
+  git clone --depth 1 https://github.com/logancammish/locoryn.git
+  cd locoryn
+  sh install-linux.sh
+  ```
 
-### 3. Choose a model and chat
+  To choose a beta build or architecture manually, see the
+  [Linux installer options](linux_installations/README.md).
 
-The model picker automatically lists models available from the connected Ollama
-server. If the list is empty, open **Settings → Advanced settings**, enter a
-model name under **Install model**, and press Enter. Find model names in the
-[Ollama library](https://ollama.com/search).
+### 3. Open Locoryn
+
+Launch Locoryn from the Start menu or application launcher. The model picker
+lists models available from the connected Ollama server. If it is empty, open
+**Settings → Advanced settings**, enter a model name under **Install model**,
+and press Enter. Find model names in the [Ollama library](https://ollama.com/search).
 
 ### Prefer the simpler classic version?
 
@@ -112,15 +120,17 @@ checker.
 
 ### Local code checking
 
-Code checking is disabled by default. Read the warning and explicitly enable it
-under **Settings → Advanced settings → Local code checking**. Supported fenced
-code blocks then show a **Check code** button. The app uses `python3 -m
+Code checking is disabled by default. To let a tool-capable model check its own
+snippets, enable both **Settings → Tools → Code Checking** and **Settings →
+Advanced settings → Local code checking**. The advanced setting also enables
+the manual **Check code** button on supported fenced code blocks. The app uses `python3 -m
 py_compile`, `rustc`, `cc`, `c++`, or `csc` in a temporary folder and reports
 the first errors without running the compiled program.
 
 Generated code is untrusted input. Compiler and interpreter checks can fail,
 consume resources, or have unintended effects, so enable this only when you
-consent and have reviewed the code.
+consent and have reviewed the code. Checks are bounded and only accept
+self-contained snippets; they do not run the program.
 
 ### Custom system prompts
 
@@ -140,11 +150,23 @@ Keep the file as valid JSON. When using an installed build, edit the copy in the
 
 ### Remote Ollama servers
 
-Open **Settings → Advanced settings → Ollama address** and enter the server host
-or IP plus its port. The default is `127.0.0.1:11434`.
+Open **Settings → Advanced settings → Ollama address** and choose the protocol,
+then enter the server hostname or IP address and port. The protocol field
+accepts `http`, `http://`, `https`, or `https://`; the default local endpoint
+is `http://127.0.0.1:11434`. HTTP and HTTPS are supported. Other URL schemes
+are rejected because Ollama’s API and the client transport use HTTP(S).
 
-The application currently connects over HTTP, so only use a trusted network or
-put appropriate transport security in front of a remote Ollama instance.
+Use `https://` for any Ollama server reached over a network you do not fully
+control. Plain `http://` does not encrypt requests: prompts, model replies,
+attached images, and API responses can be read or changed by someone able to
+observe the connection. HTTP also does not authenticate the server, so it is
+vulnerable to impersonation on an untrusted network.
+
+Do not expose Ollama directly to the public internet. Put a remote service
+behind a correctly configured TLS reverse proxy or VPN, restrict who can reach
+it, and use a certificate trusted by the computer running Locoryn. Locoryn does
+not add authentication headers to Ollama requests; if your deployment requires
+authentication, enforce it at the network or proxy layer.
 
 ### Web search setup
 
@@ -244,7 +266,7 @@ On Linux, build Linux x86_64/ARM64 and Windows x86_64/ARM64 together with all
 available CPU cores by running:
 
 ```bash
-./linux-installations/build-locally.sh --install-tools
+./linux_installations/build-locally.sh --install-tools
 ```
 
 See [the Linux build documentation](linux_installations/README.md#build-every-desktop-target-locally)

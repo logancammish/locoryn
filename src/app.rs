@@ -444,6 +444,8 @@ impl SystemPrompt {
 
 #[derive(Clone, Debug)]
 pub struct HostLocation {
+    /// URL scheme used for Ollama. Only HTTP and HTTPS are accepted.
+    pub protocol: String,
     pub ip: String,
     pub port: String,
 }

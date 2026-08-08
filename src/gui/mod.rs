@@ -1999,7 +1999,17 @@ impl Program {
                                         )
                                         .label(tr(language, "Past Chats"))
                                         .on_toggle(|_| Message::ToggleConversationSearchTool),
+                                        Space::new().width(Length::Fixed(16.0)),
+                                        widget::checkbox(
+                                            self.tool_settings.code_checking
+                                        )
+                                        .label(tr(language, "Code Checking"))
+                                        .on_toggle(|_| Message::ToggleCodeCheckingTool),
                                     ],
+                                    Space::new().height(Length::Fixed(8.0)),
+                                    widget::text(tr(language, "Code Checking also requires Local code checking in Advanced settings."))
+                                        .size(12)
+                                        .color(text_muted()),
                                 ]
                             )
                             .padding(20)
@@ -2401,6 +2411,15 @@ impl Program {
                     .on_input(Message::ChangeIp)
                     .style(text_input_style);
 
+                let change_protocol =
+                    iced::widget::TextInput::<Message>::new("https", &ip.protocol)
+                        .padding(12)
+                        .size(15)
+                        .width(Length::Fixed(88.0))
+                        .on_submit(Message::ChangeProtocol(ip.protocol.clone()))
+                        .on_input(Message::ChangeProtocol)
+                        .style(text_input_style);
+
                 let change_port =
                     iced::widget::TextInput::<Message>::new(ip.port.as_str(), &ip.port)
                         .padding(12)
@@ -2570,10 +2589,12 @@ impl Program {
                         container(widget::column![
                             setting_label(
                                 tr(language, "Ollama address"),
-                                tr(language, "Change the IP address and port used to connect to Ollama.")
+                                tr(language, "Choose HTTP or HTTPS, then enter the hostname or IP address and port used to connect to Ollama.")
                             ),
                             Space::new().height(Length::Fixed(12.0)),
                             widget::row![
+                                change_protocol,
+                                widget::text("://").size(20).color(text_muted()),
                                 change_ip,
                                 Space::new().width(Length::Fixed(8.0)),
                                 widget::text(":").size(20).color(text_muted()),
@@ -2584,13 +2605,15 @@ impl Program {
                             container(
                                 widget::text(if language == Language::Spanish {
                                     format!(
-                                        "Dirección actual: {}:{}",
+                                        "Dirección actual: {}://{}:{}",
+                                        user_information.ip_address.protocol,
                                         user_information.ip_address.ip,
                                         user_information.ip_address.port
                                     )
                                 } else {
                                     format!(
-                                        "Current address: {}:{}",
+                                        "Current address: {}://{}:{}",
+                                        user_information.ip_address.protocol,
                                         user_information.ip_address.ip,
                                         user_information.ip_address.port
                                     )

@@ -1,6 +1,7 @@
 use std::path::Path;
 
 const CONVERSATION_EXCERPT_CHARS: usize = 300;
+const MAX_EXCERPTS_PER_CONVERSATION: usize = 3;
 const DEFAULT_LIMIT: usize = 5;
 const MAX_LIMIT: usize = 20;
 
@@ -88,6 +89,7 @@ pub fn search_conversations(
             None => continue,
         };
 
+        let title_matched = title.to_lowercase().contains(&query_lower);
         let mut matched_excerpts = Vec::new();
         for message in messages {
             let text = match message.get("text").and_then(serde_json::Value::as_str) {
@@ -99,21 +101,23 @@ pub fn search_conversations(
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("unknown");
 
-            if text.to_lowercase().contains(&query_lower)
-                || title.to_lowercase().contains(&query_lower)
-            {
+            if text.to_lowercase().contains(&query_lower) {
                 let excerpt = build_excerpt(text, &query_lower, CONVERSATION_EXCERPT_CHARS);
                 matched_excerpts.push(serde_json::json!({
                     "role": role,
                     "excerpt": excerpt,
                 }));
+                if matched_excerpts.len() == MAX_EXCERPTS_PER_CONVERSATION {
+                    break;
+                }
             }
         }
 
-        if !matched_excerpts.is_empty() {
+        if title_matched || !matched_excerpts.is_empty() {
             matches.push(serde_json::json!({
                 "title": title,
                 "updated_at": updated_at,
+                "title_matched": title_matched,
                 "matching_messages": matched_excerpts,
             }));
         }
@@ -297,6 +301,71 @@ mod tests {
         let result = search_conversations(&dir, "topic", 2);
         assert_eq!(result["matches"], 3);
         assert_eq!(result["returned"], 2);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn title_matches_do_not_dump_every_message() {
+        let dir = std::env::temp_dir().join("locoryn-test-title-search");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let chats = serde_json::json!([{
+            "id": "1",
+            "title": "Project lighthouse",
+            "updated_at": "2025-01-01T00:00:00Z",
+            "messages": [
+                {"role": "user", "text": "first unrelated message"},
+                {"role": "bot", "text": "second unrelated message"},
+                {"role": "user", "text": "third unrelated message"},
+                {"role": "bot", "text": "fourth unrelated message"}
+            ]
+        }]);
+        fs::write(dir.join("chats.json"), chats.to_string()).unwrap();
+
+        let result = search_conversations(&dir, "lighthouse", 5);
+        assert_eq!(result["matches"], 1);
+        assert_eq!(result["conversations"][0]["title_matched"], true);
+        assert_eq!(
+            result["conversations"][0]["matching_messages"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn matching_messages_are_bounded_per_conversation() {
+        let dir = std::env::temp_dir().join("locoryn-test-excerpt-bound");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let messages = (0..MAX_EXCERPTS_PER_CONVERSATION + 2)
+            .map(|index| {
+                serde_json::json!({
+                    "role": "user",
+                    "text": format!("matching message {index}"),
+                })
+            })
+            .collect::<Vec<_>>();
+        let chats = serde_json::json!([{
+            "id": "1",
+            "title": "A chat",
+            "updated_at": "2025-01-01T00:00:00Z",
+            "messages": messages,
+        }]);
+        fs::write(dir.join("chats.json"), chats.to_string()).unwrap();
+
+        let result = search_conversations(&dir, "matching", 5);
+        assert_eq!(
+            result["conversations"][0]["matching_messages"]
+                .as_array()
+                .unwrap()
+                .len(),
+            MAX_EXCERPTS_PER_CONVERSATION
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

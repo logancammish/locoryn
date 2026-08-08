@@ -6,7 +6,6 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Cursor, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -153,6 +152,7 @@ enum Message {
     ToggleWebSearchTool,
     ToggleFetchWebpageTool,
     ToggleConversationSearchTool,
+    ToggleCodeCheckingTool,
     ToggleDeepResearchControls,
     ToggleChatWebSearch,
     WebSearchProviderChange(WebSearchProviderKind),
@@ -255,6 +255,7 @@ enum Message {
     ToggleInfoPopupSetting,
     WipeChatHistory,
     ToggleAdvancedSettings,
+    ChangeProtocol(String),
     ChangeIp(String),
     ChangePort(String),
 }
@@ -934,100 +935,11 @@ fn load_settings_text() -> Option<String> {
 }
 
 fn canonical_code_language(language: &str) -> Option<&'static str> {
-    match language.trim().to_ascii_lowercase().as_str() {
-        "python" | "py" | "python3" => Some("Python"),
-        "rust" | "rs" => Some("Rust"),
-        "c" => Some("C"),
-        "cpp" | "c++" | "cxx" | "cplusplus" => Some("C++"),
-        "cs" | "c#" | "csharp" | "c-sharp" => Some("C#"),
-        _ => None,
-    }
+    crate::tools::code_checking::canonical_language(language)
 }
 
 fn check_code(language: String, code: String) -> Result<String, String> {
-    let Some(language) = canonical_code_language(&language) else {
-        return Err("Code checking supports Python, Rust, C, C++, and C#.".into());
-    };
-    let directory = std::env::temp_dir().join(format!(
-        "locoryn-code-check-{}-{}",
-        std::process::id(),
-        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-    ));
-    fs::create_dir_all(&directory)
-        .map_err(|error| format!("Could not create a temporary check folder: {error}"))?;
-
-    let (file_name, mut command, arguments): (&str, Command, Vec<&str>) = match language {
-        "Python" => (
-            "snippet.py",
-            Command::new("python3"),
-            vec!["-m", "py_compile", "snippet.py"],
-        ),
-        "Rust" => (
-            "snippet.rs",
-            Command::new("rustc"),
-            vec![
-                "--crate-type",
-                "lib",
-                "--emit",
-                "metadata",
-                "snippet.rs",
-                "-o",
-                "snippet.rmeta",
-            ],
-        ),
-        "C" => (
-            "snippet.c",
-            Command::new("cc"),
-            vec!["-fsyntax-only", "snippet.c"],
-        ),
-        "C++" => (
-            "snippet.cpp",
-            Command::new("c++"),
-            vec!["-fsyntax-only", "snippet.cpp"],
-        ),
-        "C#" => (
-            "snippet.cs",
-            Command::new("csc"),
-            vec!["/nologo", "/target:library", "snippet.cs"],
-        ),
-        _ => unreachable!(),
-    };
-
-    let result = (|| {
-        fs::write(directory.join(file_name), code)
-            .map_err(|error| format!("Could not prepare the code check: {error}"))?;
-        let output = command
-            .args(arguments)
-            .current_dir(&directory)
-            .output()
-            .map_err(|error| {
-                format!(
-                    "{language} checker is unavailable. Install its compiler/interpreter and try again: {error}"
-                )
-            })?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let details = format!("{stdout}{stderr}")
-            .trim()
-            .chars()
-            .take(4_000)
-            .collect::<String>();
-        if output.status.success() {
-            Ok(if details.is_empty() {
-                format!("{language} check passed with no errors.")
-            } else {
-                format!("{language} check passed:\n{details}")
-            })
-        } else {
-            Err(format!(
-                "{language} check found errors{}{}",
-                if details.is_empty() { "." } else { ":\n" },
-                details
-            ))
-        }
-    })();
-    let _ = fs::remove_dir_all(&directory);
-    result
+    crate::tools::code_checking::check_code(&language, &code)
 }
 
 fn censor_text(input: &str) -> String {
@@ -1329,14 +1241,45 @@ async fn load_markdown_image(url: String) -> Result<iced::widget::image::Handle,
     decoded_image_handle(&bytes)
 }
 
-fn convert_port_to_u16(port: String) -> u16 {
-    match port.parse::<u16>() {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("Invalid port number: {}", port);
-            11434
-        }
+fn ollama_base_url(location: &HostLocation) -> Result<url::Url, String> {
+    let scheme = location
+        .protocol
+        .trim()
+        .trim_end_matches("://")
+        .to_ascii_lowercase();
+    if !matches!(scheme.as_str(), "http" | "https") {
+        return Err("Ollama protocol must be http or https.".to_string());
     }
+
+    let host = location.ip.trim();
+    if host.is_empty() {
+        return Err("Enter an Ollama hostname or IP address.".to_string());
+    }
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    let port = location
+        .port
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| "Ollama port must be a number from 1 to 65535.".to_string())?;
+    if port == 0 {
+        return Err("Ollama port must be a number from 1 to 65535.".to_string());
+    }
+
+    let mut url = url::Url::parse(&format!("{scheme}://{host}"))
+        .map_err(|_| "Enter a valid Ollama hostname or IP address.".to_string())?;
+    url.set_port(Some(port))
+        .map_err(|_| "Enter a valid Ollama hostname or IP address.".to_string())?;
+    Ok(url)
+}
+
+fn ollama_api_url(location: &HostLocation, path: &str) -> Result<String, String> {
+    let mut url = ollama_base_url(location)?;
+    url.set_path(path);
+    Ok(url.into())
 }
 
 fn load_chat_image(path: &Path) -> Result<ChatImage, String> {
@@ -2078,6 +2021,7 @@ impl Program {
 
     fn drain_live_updates(&mut self) -> bool {
         let filtering = self.app_state.filtering;
+        let code_checking_enabled = self.code_checking_enabled;
         let current_chat_id = self.current_chat_id.clone();
         let mut changed = false;
         for (chat_id, job) in self.active_prompts.iter_mut() {
@@ -2346,6 +2290,28 @@ impl Program {
             return Task::none();
         }
 
+        let ollama_chat_url = match ollama_api_url(&self.user_information.ip_address, "/api/chat") {
+            Ok(url) => url,
+            Err(message) => {
+                self.set_debug_message(DebugMessage {
+                    message,
+                    is_error: true,
+                });
+                return Task::none();
+            }
+        };
+        let ollama_generate_url =
+            match ollama_api_url(&self.user_information.ip_address, "/api/generate") {
+                Ok(url) => url,
+                Err(message) => {
+                    self.set_debug_message(DebugMessage {
+                        message,
+                        is_error: true,
+                    });
+                    return Task::none();
+                }
+            };
+
         // Clone the attachment into the request/chat first. The composer owns its
         // copy until the submission has been accepted, avoiding a transient blank
         // preview while the async request is being prepared.
@@ -2356,8 +2322,13 @@ impl Program {
         let web_search_enabled = self.web_search_for_chat;
         let mut web_search_settings = self.web_search_settings.clone();
         web_search_settings.enabled = web_search_enabled;
-        let mut tool_settings = self.tool_settings.clone();
-        tool_settings.enabled = web_search_enabled;
+        // The per-chat Web switch scopes only network tools.  It must not
+        // disable the local Past Chats tool, nor override the global Enable
+        // Tools preference from Settings.
+        let mut tool_settings = self
+            .tool_settings
+            .clone()
+            .for_chat_web_enabled(web_search_enabled);
         let (web_search_state_sender, web_search_state_receiver) = crossbeam_channel::unbounded();
         let (web_progress_sender, web_progress_receiver) =
             tokio::sync::watch::channel(ToolLoopProgress::default());
@@ -2416,7 +2387,6 @@ impl Program {
                 println!("Received prompt: {}", prompt.clone());
 
                 let system_prompt: String = system_prompt.unwrap();
-                let ip = user_info.ip_address.clone();
                 let to_send_prompt: String = if user_info.current_chat_history_enabled {
                     conversation_context_prompt(
                         &user_info.chat_history.lock().unwrap().unravel(),
@@ -2434,36 +2404,30 @@ impl Program {
                             Err(error) => {
                                 let api_key = web_search_settings.resolved_api_key();
                                 let message = error.detailed_user_message(api_key.as_deref());
-                                let _ = web_search_state_sender.send(WebSearchState::Failed {
-                                    message: message.clone(),
-                                });
                                 send_chat_notice(
                                     &chat_notice_sender,
                                     &notice_chat_id,
                                     DebugMessage {
-                                        message: message.clone(),
+                                        message: format!(
+                                            "Web search is unavailable for this response: {message}. The model can still use other enabled tools."
+                                        ),
                                         is_error: true,
                                     },
                                 );
-                                user_info.chat_history.lock().unwrap().push_message(
-                                    Correspondence::Bot {
-                                        text: format!("Web search could not start: {message}"),
-                                        model: user_info.model.clone(),
-                                        thinking_seconds: None,
-                                        tokens_per_second: None,
-                                        sources: Vec::new(),
-                                        web_search_used: true,
-                                    },
-                                );
-                                user_info.chat_history.lock().unwrap().bot_responding = false;
-                                return;
+                                // Do not make an optional provider setup error abort a
+                                // local tool call (notably Past Chats) or the reply.
+                                // Removing these definitions also prevents the model
+                                // from repeatedly requesting a tool that cannot run.
+                                tool_settings.web_search = false;
+                                tool_settings.fetch_webpage = false;
+                                None
                             }
                         }
                     } else {
                         None
                     };
                     let result = run_tool_loop(ToolLoopRequest {
-                        ollama_url: format!("http://{}:{}/api/chat", ip.ip, ip.port),
+                        ollama_url: ollama_chat_url,
                         model: user_info.model.clone().unwrap(),
                         prompt: to_send_prompt,
                         system_prompt: system_prompt.clone(),
@@ -2477,6 +2441,7 @@ impl Program {
                         thinking: user_info.thinking_level.api_value(),
                         settings: web_search_settings.clone(),
                         tool_settings: tool_settings.clone(),
+                        code_checking_enabled,
                         provider,
                         state_sender: web_search_state_sender.clone(),
                         progress_sender: web_progress_sender,
@@ -2614,10 +2579,14 @@ impl Program {
                     );
                 }
 
-                let url = format!("http://{}:{}/api/generate", ip.ip, ip.port);
                 let client = reqwest::Client::new();
-                let response =
-                    send_ollama_request_with_retry(&client, &url, &request_body, &cancel).await;
+                let response = send_ollama_request_with_retry(
+                    &client,
+                    &ollama_generate_url,
+                    &request_body,
+                    &cancel,
+                )
+                .await;
                 let response = match response {
                     Ok(Some(response)) => Ok(response),
                     Ok(None) => {
@@ -3054,10 +3023,17 @@ impl Program {
                     return Task::none();
                 }
                 self.is_generating_image = true;
-                let host = format!(
-                    "http://{}:{}",
-                    self.user_information.ip_address.ip, self.user_information.ip_address.port
-                );
+                let host = match ollama_base_url(&self.user_information.ip_address) {
+                    Ok(url) => url.as_str().trim_end_matches('/').to_string(),
+                    Err(error) => {
+                        self.is_generating_image = false;
+                        self.set_debug_message(DebugMessage {
+                            message: error,
+                            is_error: true,
+                        });
+                        return Task::none();
+                    }
+                };
                 Task::perform(
                     generate_image_via_ollama(host, model, prompt),
                     Message::ImageGenerated,
@@ -3193,6 +3169,12 @@ impl Program {
 
             Message::ToggleConversationSearchTool => {
                 self.tool_settings.conversation_search = !self.tool_settings.conversation_search;
+                self.persist_tool_settings();
+                Task::none()
+            }
+
+            Message::ToggleCodeCheckingTool => {
+                self.tool_settings.code_checking = !self.tool_settings.code_checking;
                 self.persist_tool_settings();
                 Task::none()
             }
@@ -3567,7 +3549,14 @@ impl Program {
                         async move {
                             println!("Checking Ollama version...");
                             let ip = user_info.ip_address;
-                            let url = format!("http://{}:{}/api/version", ip.ip, ip.port);
+                            let url = match ollama_api_url(&ip, "/api/version") {
+                                Ok(url) => url,
+                                Err(error) => {
+                                    println!("Invalid Ollama address: {error}");
+                                    *ollama_state.lock().unwrap() = "Offline".to_string();
+                                    return;
+                                }
+                            };
 
                             match reqwest::get(url).await {
                                 Ok(response) => {
@@ -3605,10 +3594,17 @@ impl Program {
                     );
                 } else if self.current_tick == BOT_LIST_TICK {
                     let ip = self.user_information.ip_address.clone();
-                    let ollama = Ollama::builder()
-                        .host(format!("http://{}", ip.ip))
-                        .port(convert_port_to_u16(ip.port))
-                        .build();
+                    let base_url = match ollama_base_url(&ip) {
+                        Ok(url) => url,
+                        Err(message) => {
+                            self.set_debug_message(DebugMessage {
+                                message,
+                                is_error: true,
+                            });
+                            return Task::none();
+                        }
+                    };
+                    let ollama = Ollama::builder().url(base_url).build();
                     let bots_list = Arc::clone(&self.app_state.bots_list);
                     let channels = self.channels.clone();
 
@@ -3658,6 +3654,12 @@ impl Program {
 
             Message::ChangeIp(ip) => {
                 self.user_information.ip_address.ip = ip;
+                Task::none()
+            }
+
+            Message::ChangeProtocol(protocol) => {
+                self.user_information.ip_address.protocol =
+                    protocol.trim().trim_end_matches("://").to_ascii_lowercase();
                 Task::none()
             }
 
@@ -4134,6 +4136,16 @@ impl Program {
             }
 
             Message::InstallModel(model_install) => {
+                let base_url = match ollama_base_url(&self.user_information.ip_address) {
+                    Ok(url) => url,
+                    Err(message) => {
+                        self.set_debug_message(DebugMessage {
+                            message,
+                            is_error: true,
+                        });
+                        return Task::none();
+                    }
+                };
                 Channels::send_request_to_channel(
                     Arc::clone(&self.channels.debug_channel),
                     DebugMessage {
@@ -4142,11 +4154,7 @@ impl Program {
                     },
                 );
 
-                let ip = self.user_information.ip_address.clone();
-                let ollama = Ollama::builder()
-                    .host(format!("http://{}", ip.ip))
-                    .port(convert_port_to_u16(ip.port))
-                    .build();
+                let ollama = Ollama::builder().url(base_url).build();
                 let channels = self.channels.clone();
 
                 Task::perform(
@@ -4202,13 +4210,15 @@ impl Program {
                 let ip = self.user_information.ip_address.clone();
                 Task::perform(
                     async move {
-                        let url = format!("http://{}:{}/api/show", ip.ip, ip.port);
-                        let result = reqwest::Client::new()
-                            .post(url)
-                            .json(&serde_json::json!({ "model": model }))
-                            .send()
-                            .await
-                            .ok();
+                        let result = match ollama_api_url(&ip, "/api/show") {
+                            Ok(url) => reqwest::Client::new()
+                                .post(url)
+                                .json(&serde_json::json!({ "model": model }))
+                                .send()
+                                .await
+                                .ok(),
+                            Err(_) => None,
+                        };
                         let capabilities = match result {
                             Some(response) if response.status().is_success() => response
                                 .json::<serde_json::Value>()
@@ -4727,6 +4737,7 @@ impl Default for Program {
                 text_size,
                 font_family,
                 ip_address: HostLocation {
+                    protocol: "http".to_string(),
                     ip: "127.0.0.1".to_string(),
                     port: "11434".to_string(),
                 },
@@ -4818,16 +4829,16 @@ mod tests {
     use iced_widget::markdown;
 
     use super::{
-        ActivePrompt, Correspondence, CurrentChat, FontFamily, GUIState, LEGACY_PROFILE_ID,
-        Message, ModelCapabilities, Point, Profile, ProfileRegistry, Program, SavedChat,
-        SettingsFeedbackTarget, Size, ThinkingLevel, ToolLoopProgress, UiResizeTarget,
+        ActivePrompt, Correspondence, CurrentChat, FontFamily, GUIState, HostLocation,
+        LEGACY_PROFILE_ID, Message, ModelCapabilities, Point, Profile, ProfileRegistry, Program,
+        SavedChat, SettingsFeedbackTarget, Size, ThinkingLevel, ToolLoopProgress, UiResizeTarget,
         UserInformation, WebSearchSettings, WebSearchState, app_data_dir,
         assign_legacy_profile_ids, canonical_code_language, censor_text, chat_profile_id,
         compare_versions, conversation_context_prompt, decode_generation_line,
         disabled_web_tool_message, ensure_legacy_profile, generated_image_payload,
-        model_capabilities, normalize_code_fence_languages, parse_markdown_items,
-        read_json_with_backup, remote_image_url_is_safe, sidecar_path, split_thinking_text,
-        tokens_per_second, write_json_safely,
+        model_capabilities, normalize_code_fence_languages, ollama_api_url, ollama_base_url,
+        parse_markdown_items, read_json_with_backup, remote_image_url_is_safe, sidecar_path,
+        split_thinking_text, tokens_per_second, write_json_safely,
     };
 
     fn test_active_prompt(
@@ -4882,6 +4893,46 @@ mod tests {
     #[test]
     fn content_filter_replaces_entire_inappropriate_words_with_hashes() {
         assert_eq!(censor_text("hello crap"), "hello ####");
+    }
+
+    #[test]
+    fn ollama_address_supports_http_https_and_ipv6() {
+        let https = HostLocation {
+            protocol: "https://".into(),
+            ip: "ollama.example.com".into(),
+            port: "443".into(),
+        };
+        assert_eq!(
+            ollama_api_url(&https, "/api/chat").unwrap(),
+            "https://ollama.example.com/api/chat"
+        );
+
+        let ipv6 = HostLocation {
+            protocol: "http".into(),
+            ip: "::1".into(),
+            port: "11434".into(),
+        };
+        assert_eq!(
+            ollama_base_url(&ipv6).unwrap().as_str(),
+            "http://[::1]:11434/"
+        );
+    }
+
+    #[test]
+    fn ollama_address_rejects_unsupported_schemes_and_bad_ports() {
+        let invalid_scheme = HostLocation {
+            protocol: "ftp".into(),
+            ip: "ollama.example.com".into(),
+            port: "21".into(),
+        };
+        assert!(ollama_base_url(&invalid_scheme).is_err());
+
+        let invalid_port = HostLocation {
+            protocol: "https".into(),
+            ip: "ollama.example.com".into(),
+            port: "invalid".into(),
+        };
+        assert!(ollama_base_url(&invalid_port).is_err());
     }
 
     #[test]
