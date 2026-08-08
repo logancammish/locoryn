@@ -7,7 +7,7 @@ use std::fs;
 use std::io::{self, Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -45,10 +45,11 @@ const TICK_MS: u64 = 200;
 /// animation speed.
 const UI_FRAME_MS: u64 = 16;
 const LIVE_RENDER_MS: u128 = 16;
+const LARGE_CODE_UI_BYTES: usize = 4 * 1024;
 /// Re-parsing a growing Markdown document becomes expensive once it includes
 /// a large code block. Keep the UI responsive by publishing those snapshots
 /// less frequently; the final complete snapshot is still always sent.
-const LARGE_LIVE_RENDER_BYTES: usize = 12 * 1024;
+const LARGE_LIVE_RENDER_BYTES: usize = LARGE_CODE_UI_BYTES;
 const LARGE_LIVE_RENDER_MS: u128 = 500;
 const MAX_MARKDOWN_IMAGE_BYTES: usize = 12 * 1024 * 1024;
 const MAX_MARKDOWN_IMAGE_PIXELS: u64 = 32_000_000;
@@ -964,7 +965,214 @@ fn normalize_code_fence_languages(input: &str) -> String {
 
 fn parse_markdown_items(input: &str) -> Vec<markdown::Item> {
     let normalized = normalize_code_fence_languages(input);
-    markdown::parse(&normalized).collect()
+    let items = markdown::parse(&normalized).collect::<Vec<_>>();
+    // Populate character counts while parsing runs off the UI thread for live
+    // responses. The preview can then report an exact omission count without
+    // rescanning a large snippet during every view rebuild.
+    for item in &items {
+        if let markdown::Item::CodeBlock { code, .. } = item
+            && code.len() > LARGE_CODE_UI_BYTES
+        {
+            let _ = cached_character_count(code);
+            let mut preview_end = code.len().min(8 * 1024);
+            while !code.is_char_boundary(preview_end) {
+                preview_end -= 1;
+            }
+            let _ = cached_character_count(&code[..preview_end]);
+        }
+    }
+    items
+}
+
+/// Parse a streamed Markdown snapshot without feeding the contents of fenced
+/// code blocks through Iced's syntax highlighter. `markdown::parse` highlights
+/// while it parses (not while the code-block widget is built), so merely using
+/// a monospace widget for live code does not avoid repeatedly highlighting the
+/// complete, growing snippet.
+///
+/// Each fenced block is replaced by a private image placeholder for the live
+/// parse, then restored as a code-block item with empty highlighted lines. This
+/// prevents even syntax-highlighter initialization on each snapshot while
+/// retaining the block's position, language, and exact source. Completed
+/// messages still go through `parse_markdown_items` and receive normal syntax
+/// highlighting once.
+fn parse_live_markdown_items(input: &str) -> Vec<markdown::Item> {
+    let normalized = normalize_code_fence_languages(input);
+    let (masked, code_blocks) = mask_live_code_blocks(&normalized);
+    let mut items = markdown::parse(&masked).collect::<Vec<_>>();
+    let mut code_blocks = code_blocks.into_iter().map(Some).collect::<Vec<_>>();
+    restore_live_code_blocks(&mut items, &mut code_blocks);
+    items
+}
+
+const LIVE_CODE_PLACEHOLDER: &str = "locoryn-live-code:";
+
+struct LiveCodeBlock {
+    language: Option<String>,
+    code: String,
+}
+
+fn mask_live_code_blocks(input: &str) -> (String, Vec<LiveCodeBlock>) {
+    struct OpenFence {
+        marker: u8,
+        length: usize,
+        indentation: usize,
+        block: LiveCodeBlock,
+    }
+
+    fn fence(line: &str) -> Option<(u8, usize, usize)> {
+        let body = line.trim_end_matches(['\r', '\n']);
+        let trimmed = body.trim_start();
+        let indentation = body.len() - trimmed.len();
+        // CommonMark only recognizes fences indented by at most three spaces.
+        if indentation > 3 {
+            return None;
+        }
+        let marker = trimmed.as_bytes().first().copied()?;
+        if !matches!(marker, b'`' | b'~') {
+            return None;
+        }
+        let length = trimmed
+            .as_bytes()
+            .iter()
+            .take_while(|character| **character == marker)
+            .count();
+        (length >= 3).then_some((marker, length, indentation))
+    }
+
+    let mut masked = String::with_capacity(input.len().min(16 * 1024));
+    let mut code_blocks = Vec::new();
+    let mut open: Option<OpenFence> = None;
+
+    for segment in input.split_inclusive('\n') {
+        if let Some(active) = &mut open {
+            let closing = fence(segment).is_some_and(|(marker, length, _)| {
+                marker == active.marker
+                    && length >= active.length
+                    && segment.trim_end_matches(['\r', '\n']).trim_start()[length..]
+                        .trim()
+                        .is_empty()
+            });
+            if closing {
+                let body_length = segment.trim_end_matches(['\r', '\n']).len();
+                masked.push_str(&segment[body_length..]);
+                code_blocks.push(open.take().unwrap().block);
+            } else {
+                let body_length = segment.trim_end_matches(['\r', '\n']).len();
+                let (body, line_ending) = segment.split_at(body_length);
+                let removable_indent = body
+                    .as_bytes()
+                    .iter()
+                    .take(active.indentation)
+                    .take_while(|character| **character == b' ')
+                    .count();
+                active.block.code.push_str(&body[removable_indent..]);
+                active.block.code.push_str(line_ending);
+            }
+            continue;
+        }
+
+        let Some((marker, length, indentation)) = fence(segment) else {
+            masked.push_str(segment);
+            continue;
+        };
+        let body = segment.trim_end_matches(['\r', '\n']);
+        let info = &body[indentation + length..];
+        // Backticks are forbidden in the info string of a backtick fence.
+        if marker == b'`' && info.contains('`') {
+            masked.push_str(segment);
+            continue;
+        }
+
+        for _ in 0..indentation {
+            masked.push(' ');
+        }
+        masked.push_str("![locoryn live code](");
+        masked.push_str(LIVE_CODE_PLACEHOLDER);
+        masked.push_str(&code_blocks.len().to_string());
+        masked.push(')');
+        let body_length = segment.trim_end_matches(['\r', '\n']).len();
+        masked.push_str(&segment[body_length..]);
+        open = Some(OpenFence {
+            marker,
+            length,
+            indentation,
+            block: LiveCodeBlock {
+                language: (!info.trim().is_empty()).then(|| info.trim().to_string()),
+                code: String::new(),
+            },
+        });
+    }
+
+    if let Some(active) = open {
+        code_blocks.push(active.block);
+    }
+    (masked, code_blocks)
+}
+
+fn restore_live_code_blocks(
+    items: &mut [markdown::Item],
+    code_blocks: &mut [Option<LiveCodeBlock>],
+) {
+    for item in items {
+        let placeholder_index = match item {
+            markdown::Item::Image { url, .. } => url
+                .strip_prefix(LIVE_CODE_PLACEHOLDER)
+                .and_then(|index| index.parse::<usize>().ok()),
+            _ => None,
+        };
+        if let Some(index) = placeholder_index
+            && let Some(block) = code_blocks.get_mut(index).and_then(Option::take)
+        {
+            *item = markdown::Item::CodeBlock {
+                language: block.language,
+                code: block.code,
+                lines: Vec::new(),
+            };
+            continue;
+        }
+
+        match item {
+            markdown::Item::Quote(items) => restore_live_code_blocks(items, code_blocks),
+            markdown::Item::List { bullets, .. } => {
+                for bullet in bullets {
+                    let items = match bullet {
+                        markdown::Bullet::Point { items }
+                        | markdown::Bullet::Task { items, .. } => items,
+                    };
+                    restore_live_code_blocks(items, code_blocks);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn character_count_cache() -> &'static Mutex<HashMap<(usize, usize), usize>> {
+    static CACHE: OnceLock<Mutex<HashMap<(usize, usize), usize>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Count Unicode scalar values once per parsed code buffer. The pointer and
+/// length identify the immutable Markdown-owned string while it is displayed.
+pub(crate) fn cached_character_count(text: &str) -> usize {
+    let key = (text.as_ptr() as usize, text.len());
+    if let Ok(cache) = character_count_cache().lock()
+        && let Some(count) = cache.get(&key)
+    {
+        return *count;
+    }
+
+    let count = text.chars().count();
+    if let Ok(mut cache) = character_count_cache().lock() {
+        // This is only presentation metadata. Bound it so old streamed
+        // snapshots cannot retain a process-long cache of pointer entries.
+        if cache.len() >= 256 {
+            cache.clear();
+        }
+        cache.insert(key, count);
+    }
+    count
 }
 
 fn decode_generation_line(
@@ -1941,7 +2149,7 @@ impl Program {
                 } else {
                     format!("<think>{}</think>{}", job.thinking_text, progress.answer)
                 };
-                job.parsed_markdown = parse_markdown_items(&progress.answer);
+                job.parsed_markdown = parse_live_markdown_items(&progress.answer);
                 changed = true;
             }
             if !had_thinking && !job.thinking_text.is_empty() && chat_id == &current_chat_id {
@@ -2143,7 +2351,7 @@ impl Program {
         let (render_sender, render_receiver) = crossbeam_channel::bounded(1);
         let render_receiver_for_renderer = render_receiver.clone();
 
-        // Backpressure bounds token memory if highlighting a large response is
+        // Backpressure bounds token memory if preparing a large response is
         // temporarily slower than Ollama's stream.
         let (tx, mut rx) = tokio::sync::mpsc::channel::<GenerationResponse>(64);
         let batch_tokens = self.batch_tokens;
@@ -2158,7 +2366,7 @@ impl Program {
                 let render = LiveRender {
                     text: buffer.to_string(),
                     thinking,
-                    markdown: parse_markdown_items(&visible),
+                    markdown: parse_live_markdown_items(&visible),
                 };
                 while render_receiver.try_recv().is_ok() {}
                 // A disconnected receiver means the completed job has already
@@ -4705,10 +4913,11 @@ mod tests {
         UserInformation, WebSearchSettings, WebSearchState, app_data_dir,
         assign_legacy_profile_ids, canonical_code_language, censor_text, chat_profile_id,
         compare_versions, conversation_context_prompt, decode_generation_line,
-        disabled_web_tool_message, ensure_legacy_profile, model_capabilities,
-        normalize_code_fence_languages, ollama_api_url, ollama_base_url, parse_markdown_items,
-        read_json_with_backup, remote_image_url_is_safe, sidecar_path, split_thinking_text,
-        tokens_per_second, write_json_safely,
+        disabled_web_tool_message, ensure_legacy_profile, mask_live_code_blocks,
+        model_capabilities, normalize_code_fence_languages, ollama_api_url, ollama_base_url,
+        parse_live_markdown_items, parse_markdown_items, read_json_with_backup,
+        remote_image_url_is_safe, sidecar_path, split_thinking_text, tokens_per_second,
+        write_json_safely,
     };
 
     fn test_active_prompt(
@@ -5396,6 +5605,44 @@ mod tests {
                 language: Some(language),
                 ..
             } if language == "cs"
+        ));
+    }
+
+    #[test]
+    fn live_markdown_skips_code_highlighting_but_preserves_the_complete_code() {
+        let input = "Before\n\n```rust\nfn main() {\n    println!(\"hello\");\n}\n```\n\nAfter";
+        let (masked, _) = mask_live_code_blocks(input);
+        assert!(!masked.contains("```"));
+        assert!(
+            !markdown::parse(&masked).any(|item| matches!(item, markdown::Item::CodeBlock { .. }))
+        );
+
+        let expected_code = parse_markdown_items(input)
+            .into_iter()
+            .find_map(|item| match item {
+                markdown::Item::CodeBlock { code, .. } => Some(code),
+                _ => None,
+            })
+            .unwrap();
+        let live = parse_live_markdown_items(input);
+
+        assert!(matches!(&live[0], markdown::Item::Paragraph(_)));
+        assert!(matches!(live.last(), Some(markdown::Item::Paragraph(_))));
+        assert!(live.iter().any(|item| matches!(
+            item,
+            markdown::Item::CodeBlock { code, lines, language: Some(language) }
+                if code == &expected_code && lines.is_empty() && language == "rust"
+        )));
+    }
+
+    #[test]
+    fn live_markdown_preserves_an_unclosed_streaming_code_fence() {
+        let live = parse_live_markdown_items("```csharp\nConsole.WriteLine(\"still streaming\");");
+
+        assert!(matches!(
+            live.as_slice(),
+            [markdown::Item::CodeBlock { code, lines, language: Some(language) }]
+                if code == "Console.WriteLine(\"still streaming\");" && lines.is_empty() && language == "cs"
         ));
     }
 

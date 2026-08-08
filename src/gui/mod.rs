@@ -16,7 +16,7 @@ use std::{
 use crate::{
     AppUpdateState, ChatImage, CodeCopyScope, Correspondence, FontFamily, GUIState, Language,
     MarkdownImageState, Message, Program, SettingsFeedbackTarget, ThinkingLevel,
-    split_thinking_text,
+    cached_character_count, split_thinking_text,
     tools::web_search::{WebSearchState, WebSource},
 };
 
@@ -445,6 +445,7 @@ impl Program {
                             markdown_with_code_copy(
                                 &active_prompt.parsed_markdown,
                                 CodeCopyScope::ActiveResponse,
+                                false,
                                 user_information.text_size,
                                 user_information.font_family,
                                 copied_text.as_ref(),
@@ -1650,6 +1651,7 @@ impl Program {
                         markdown_with_code_copy(
                             markdown,
                             CodeCopyScope::VisionResponse,
+                            !vision_is_live,
                             self.user_information.text_size,
                             self.user_information.font_family,
                             self.last_copied_text.as_ref(),

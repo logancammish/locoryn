@@ -505,6 +505,7 @@ pub(super) fn web_search_activity_visible(
 pub(super) fn markdown_with_code_copy<'a>(
     items: &'a [markdown::Item],
     code_copy_scope: CodeCopyScope,
+    highlight_code_blocks: bool,
     text_size: f32,
     font_family: FontFamily,
     copied_text: Option<&String>,
@@ -513,11 +514,12 @@ pub(super) fn markdown_with_code_copy<'a>(
     markdown_images: &'a std::collections::HashMap<String, MarkdownImageState>,
     motion: f32,
 ) -> Element<'a, Message> {
-    // Iced's Markdown code renderer syntax-highlights on the UI thread. Keep
-    // that pleasant presentation for normal snippets, but cap the work for
-    // unusually large generated blocks so a response cannot stall the window.
-    const MAX_HIGHLIGHTED_CODE_BYTES: usize = 12 * 1024;
-    const MAX_CODE_PREVIEW_BYTES: usize = 24 * 1024;
+    // Iced's Markdown parser precomputes highlighted lines. Live snapshots omit
+    // those lines and deliberately use this plain code view; completed messages
+    // are parsed with highlighting once. Very large completed snippets stay
+    // capped too.
+    const MAX_HIGHLIGHTED_CODE_BYTES: usize = 4 * 1024;
+    const MAX_CODE_PREVIEW_BYTES: usize = 8 * 1024;
 
     let mut settings = iced::widget::markdown::Settings::with_text_size(
         text_size,
@@ -597,7 +599,8 @@ pub(super) fn markdown_with_code_copy<'a>(
             ..
         } = item
         {
-            let use_plain_preview = code.len() > MAX_HIGHLIGHTED_CODE_BYTES
+            let use_plain_preview = !highlight_code_blocks
+                || code.len() > MAX_HIGHLIGHTED_CODE_BYTES
                 || highlighted_code_bytes.saturating_add(code.len()) > MAX_HIGHLIGHTED_CODE_BYTES;
             if use_plain_preview {
                 let mut preview_end = code.len().min(MAX_CODE_PREVIEW_BYTES);
@@ -607,8 +610,10 @@ pub(super) fn markdown_with_code_copy<'a>(
                 let preview = if preview_end == code.len() {
                     code.clone()
                 } else {
+                    let omitted = cached_character_count(code)
+                        .saturating_sub(cached_character_count(&code[..preview_end]));
                     format!(
-                        "{}\n\n… The rest of this large snippet is omitted from the preview. Copy code to get the complete snippet.",
+                        "{}\n\n… {omitted} characters omitted from this preview. Copy code to get the complete snippet.",
                         &code[..preview_end]
                     )
                 };
@@ -752,6 +757,7 @@ pub(super) fn message_bubble<'a>(
                 markdown_with_code_copy(
                     parsed,
                     CodeCopyScope::ChatMessage(index),
+                    true,
                     text_size,
                     font_family,
                     copied_text,
