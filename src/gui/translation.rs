@@ -28,8 +28,8 @@ pub(super) fn tr(language: Language, english: &'static str) -> &'static str {
             "Cuando está activado, las conversaciones se guardan localmente. Puedes borrar el contexto actual en Configuración."
         }
         "Files and configuration" => "Archivos y configuración",
-        "User settings, generated images, and chats are stored in your local application-data folder. Installed assets remain read-only." => {
-            "Los ajustes, imágenes generadas y chats se guardan en la carpeta local de datos de la aplicación. Los recursos instalados son de solo lectura."
+        "User settings and chats are stored in your local application-data folder. Installed assets remain read-only." => {
+            "Los ajustes y chats se guardan en la carpeta local de datos de la aplicación. Los recursos instalados son de solo lectura."
         }
         "Back to chat" => "Volver al chat",
         "No model selected" => "Ningún modelo seleccionado",
@@ -62,6 +62,17 @@ pub(super) fn tr(language: Language, english: &'static str) -> &'static str {
         "Unpin" => "Desfijar",
         "Pin" => "Fijar",
         "Chats" => "Chats",
+        "Chat actions" => "Acciones del chat",
+        "Cancel" => "Cancelar",
+        "Delete chat" => "Eliminar chat",
+        "Delete temporary chat" => "Eliminar chat temporal",
+        "Collapse sidebar" => "Contraer barra lateral",
+        "Open sidebar" => "Abrir barra lateral",
+        "New chat" => "Nuevo chat",
+        "Edit profile" => "Editar perfil",
+        "Delete profile" => "Eliminar perfil",
+        "Create profile" => "Crear perfil",
+        "Close" => "Cerrar",
         "Local workspace" => "Espacio local",
         "LOCAL AI WORKSPACE" => "ESPACIO DE IA LOCAL",
         "Online" => "En línea",
@@ -72,6 +83,9 @@ pub(super) fn tr(language: Language, english: &'static str) -> &'static str {
         "＋ Attach" => "＋ Adjuntar",
         "Paste" => "Pegar",
         "Settings" => "Configuración",
+        "Config" => "Configurar",
+        "Context" => "Contexto",
+        "Max response" => "Respuesta máxima",
         "⚙ Settings" => "⚙ Configuración",
         "Enable Web Search" => "Activar búsqueda web",
         "Web search may send search queries and webpage URLs to the selected external provider." => {
@@ -160,22 +174,12 @@ pub(super) fn tr(language: Language, english: &'static str) -> &'static str {
             "Pega desde el portapapeles o elige una imagen local."
         }
         "Choose image" => "Elegir imagen",
-        "Copy image" => "Copiar imagen",
         "Vision model is responding…" => "El modelo de visión está respondiendo…",
         "Vision response" => "Respuesta de visión",
-        "Generate image" => "Generar imagen",
-        "Generating…" => "Generando…",
-        "Describe the image you want to generate…" => "Describe la imagen que quieres generar…",
-        "Use vision models to inspect images or experimental image models to create them." => {
-            "Usa modelos de visión para analizar imágenes o modelos experimentales para crearlas."
-        }
         "Model" => "Modelo",
         "Ask about image" => "Preguntar sobre la imagen",
-        "Generation requires an Ollama image-generation model and supported runtime." => {
-            "La generación requiere un modelo de imágenes de Ollama y un entorno compatible."
-        }
-        "Analyze images with a vision model. Experimental image generation appears only for models that report support." => {
-            "Analiza imágenes con un modelo de visión. La generación experimental solo aparece en modelos compatibles."
+        "Analyze images with a vision-capable model." => {
+            "Analiza imágenes con un modelo compatible con visión."
         }
         "Vision analysis" => "Análisis visual",
         "Attach an image and ask a vision-capable model to describe, classify, read, or reason about it." => {
@@ -184,11 +188,6 @@ pub(super) fn tr(language: Language, english: &'static str) -> &'static str {
         "This model can inspect images." => "Este modelo puede analizar imágenes.",
         "This model does not support image input." => "Este modelo no admite imágenes de entrada.",
         "Checking image capabilities…" => "Comprobando capacidades de imagen…",
-        "Experimental image generation" => "Generación de imágenes experimental",
-        "Ollama reports that this model can generate images. Output is requested through /v1/images/generations at 1024 × 1024." => {
-            "Ollama indica que este modelo puede generar imágenes. Se solicita la salida mediante /v1/images/generations a 1024 × 1024."
-        }
-        "Generated images" => "Imágenes generadas",
         "Tune model behaviour, prompt selection, and chat preferences." => {
             "Ajusta el comportamiento del modelo, las indicaciones y las preferencias del chat."
         }

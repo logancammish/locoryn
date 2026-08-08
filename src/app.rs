@@ -462,7 +462,6 @@ pub struct UserInformation {
     /// `None` means capability detection is still in flight or unavailable.
     pub thinking_supported: Option<bool>,
     pub vision_supported: Option<bool>,
-    pub image_generation_supported: Option<bool>,
     pub max_response_tokens: u32,
     pub context_tokens: u32,
     pub temperature: f32,

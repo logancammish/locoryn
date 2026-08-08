@@ -825,6 +825,11 @@ pub(super) fn message_bubble<'a>(
                         } else {
                             container(widget::text("")).padding(0)
                         },
+                        Space::new().width(Length::Fixed(6.0)),
+                        mini_button(
+                            tr(language, "Copy response"),
+                            Message::CopyPressed(text.clone())
+                        ),
                     ],
                     Space::new().height(Length::Fixed(7.0)),
                     reasoning,

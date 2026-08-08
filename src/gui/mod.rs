@@ -111,7 +111,7 @@ impl Program {
                                             .color(text_main()),
                                         Space::new().height(Length::Fixed(8.0)),
                                         widget::text(
-                                            tr(language, "User settings, generated images, and chats are stored in your local application-data folder. Installed assets remain read-only.")
+                                            tr(language, "User settings and chats are stored in your local application-data folder. Installed assets remain read-only.")
                                         )
                                         .size(14)
                                         .color(text_muted()),
@@ -297,44 +297,51 @@ impl Program {
                     success()
                 };
 
-                let model_selector: Element<Message> = if bots_list.is_empty() {
-                    container(
-                        widget::text(tr(language, "No models installed"))
-                            .size(13)
-                            .color(text_muted()),
-                    )
-                    .padding(10)
-                    .style(chip_style(danger()))
-                    .into()
-                } else {
-                    widget::pick_list(
-                        bots_list.clone(),
-                        selected_model.clone(),
-                        Message::ModelChange,
-                    )
-                    .padding([12, 14])
-                    .text_size(14)
-                    .style(pick_list_style)
-                    .menu_style(pick_list_menu_style)
-                    .width(Length::Fill)
-                    .into()
+                let model_selector = || -> Element<Message> {
+                    if bots_list.is_empty() {
+                        container(
+                            widget::text(tr(language, "No models installed"))
+                                .size(13)
+                                .color(text_muted()),
+                        )
+                        .padding(10)
+                        .style(chip_style(danger()))
+                        .into()
+                    } else {
+                        widget::pick_list(
+                            bots_list.clone(),
+                            selected_model.clone(),
+                            Message::ModelChange,
+                        )
+                        .padding([7, 10])
+                        .text_size(13)
+                        .style(pick_list_style)
+                        .menu_style(pick_list_menu_style)
+                        .width(Length::Fill)
+                        .into()
+                    }
                 };
 
-                let thinking_selector: Element<Message> = widget::pick_list(
-                    ThinkingChoice::from_levels(&self.user_information.thinking_levels, language),
-                    Some(ThinkingChoice {
-                        level: self.user_information.thinking_level,
-                        language,
-                    }),
-                    |choice| Message::ThinkingLevelChange(choice.level),
-                )
-                .placeholder(tr(language, "Thinking"))
-                .padding([12, 14])
-                .text_size(14)
-                .style(pick_list_style)
-                .menu_style(pick_list_menu_style)
-                .width(Length::Fixed(132.0))
-                .into();
+                let thinking_selector = || -> Element<Message> {
+                    widget::pick_list(
+                        ThinkingChoice::from_levels(
+                            &self.user_information.thinking_levels,
+                            language,
+                        ),
+                        Some(ThinkingChoice {
+                            level: self.user_information.thinking_level,
+                            language,
+                        }),
+                        |choice| Message::ThinkingLevelChange(choice.level),
+                    )
+                    .placeholder(tr(language, "Thinking"))
+                    .padding([7, 10])
+                    .text_size(13)
+                    .style(pick_list_style)
+                    .menu_style(pick_list_menu_style)
+                    .width(Length::Fixed(126.0))
+                    .into()
+                };
 
                 let live_response: Element<Message> = if let Some(active_prompt) = active_prompt {
                     let response_model_name = active_prompt.model_name.clone();
@@ -630,6 +637,7 @@ impl Program {
                                 .on_press(Message::OpenChat(chat_id.clone()))
                                 .style(chat_title_button_style)
                                 .clip(true)
+                                .height(Length::Fixed(44.0))
                                 .width(Length::Fill),
                                 widget::progress_bar(0.0..=1.0, self.prompt_progress())
                                     .length(Length::Fixed(42.0))
@@ -668,8 +676,13 @@ impl Program {
                                 .on_press(Message::OpenChat(chat_id.clone()))
                                 .style(chat_title_button_style)
                                 .clip(true)
+                                .height(Length::Fixed(44.0))
                                 .width(Length::Fill),
-                                mini_button("×", Message::DeleteTemporaryChat(chat_id.clone())),
+                                icon_button(
+                                    "×",
+                                    tr(language, "Delete temporary chat"),
+                                    Message::DeleteTemporaryChat(chat_id.clone())
+                                ),
                             ])
                             .padding(4)
                             .width(Length::Fill)
@@ -692,7 +705,9 @@ impl Program {
                         .filter(|chat| crate::chat_profile_id(chat) == self.active_profile_id)
                     {
                         let selected = saved.id == self.current_chat_id;
-                        let title = ellipsize_chat_title(&saved.title, 20);
+                        // Chat titles may contain pasted line breaks. Keep the label to one
+                        // visual line while retaining the complete title for dynamic clipping.
+                        let title = saved.title.split_whitespace().collect::<Vec<_>>().join(" ");
                         let working = self.active_prompts.contains_key(&saved.id);
                         let working_progress: Element<Message> = if working {
                             widget::progress_bar(0.0..=1.0, self.prompt_progress())
@@ -702,26 +717,95 @@ impl Program {
                         } else {
                             widget::column![].into()
                         };
-                        entries.push(
-                            container(widget::row![
-                                widget::button(
-                                    widget::text(title).size(13).wrapping(Wrapping::None)
+                        let row_menu_open =
+                            self.chat_row_menu.as_deref() == Some(saved.id.as_str());
+                        // Reserve the exact ⋯ footprint while the overlay is open. Keeping
+                        // the old button beneath Cancel created a doubled border/shadow that
+                        // made two equal compact controls look like different sizes.
+                        let action_slot: Element<Message> = if row_menu_open {
+                            Space::new()
+                                .width(Length::Fixed(36.0))
+                                .height(Length::Fixed(36.0))
+                                .into()
+                        } else {
+                            compact_icon_button(
+                                "⋯",
+                                tr(language, "Chat actions"),
+                                Message::ToggleChatRowMenu(saved.id.clone()),
+                            )
+                        };
+                        let title_button: Element<Message> = widget::stack![
+                            widget::button(
+                                container(
+                                    widget::text(title)
+                                        .size(13)
+                                        .wrapping(Wrapping::None)
+                                        .width(Length::Fill)
                                 )
-                                .on_press(Message::OpenChat(saved.id.clone()))
-                                .style(chat_title_button_style)
-                                .clip(true)
-                                .width(Length::Fill),
-                                working_progress,
-                                mini_button(
-                                    tr(language, if saved.pinned { "Unpin" } else { "Pin" }),
-                                    Message::ToggleChatPin(saved.id.clone()),
-                                ),
-                                mini_button("×", Message::DeleteChat(saved.id.clone())),
-                            ])
-                            .padding(4)
+                                .width(Length::Fill)
+                                .height(Length::Fill)
+                                .center_y(Length::Fill)
+                            )
+                            .on_press(Message::OpenChat(saved.id.clone()))
+                            .style(chat_title_button_style)
+                            .clip(true)
+                            .height(Length::Fixed(44.0))
+                            .width(Length::Fill),
+                            container(
+                                container(Space::new())
+                                    .width(Length::Fixed(24.0))
+                                    .height(Length::Fill)
+                                    .style(chat_title_fade_style(selected))
+                            )
                             .width(Length::Fill)
-                            .style(chat_entry_style(selected))
-                            .into(),
+                            .height(Length::Fill)
+                            .align_x(iced::Alignment::End),
+                        ]
+                        .width(Length::Fill)
+                        .height(Length::Fixed(44.0))
+                        .into();
+                        let base_row: Element<Message> =
+                            widget::row![title_button, working_progress, action_slot,]
+                                .width(Length::Fill)
+                                .height(Length::Fixed(44.0))
+                                .into();
+                        let chat_row: Element<Message> = if row_menu_open {
+                            // Cancel replaces ⋯ in the exact same place. The other
+                            // actions overlay to its left, without changing row layout.
+                            widget::stack![
+                                base_row,
+                                container(widget::row![
+                                    mini_danger_button(
+                                        tr(language, "Delete chat"),
+                                        Message::DeleteChat(saved.id.clone()),
+                                    ),
+                                    Space::new().width(Length::Fixed(4.0)),
+                                    mini_button(
+                                        tr(language, if saved.pinned { "Unpin" } else { "Pin" }),
+                                        Message::ToggleChatPin(saved.id.clone()),
+                                    ),
+                                    Space::new().width(Length::Fixed(4.0)),
+                                    compact_icon_button(
+                                        "×",
+                                        tr(language, "Cancel"),
+                                        Message::ToggleChatRowMenu(saved.id.clone()),
+                                    ),
+                                ])
+                                .width(Length::Fill)
+                                .height(Length::Fill)
+                                .align_x(iced::Alignment::End)
+                                .align_y(iced::Alignment::Center),
+                            ]
+                            .into()
+                        } else {
+                            base_row
+                        };
+                        entries.push(
+                            container(chat_row)
+                                .padding(4)
+                                .width(Length::Fill)
+                                .style(chat_entry_style(selected))
+                                .into(),
                         );
                     }
                     container(widget::column![
@@ -740,14 +824,13 @@ impl Program {
                             .height(Length::Fixed(35.0))
                             .style(status_brand_style(status_color)),
                             Space::new().width(Length::Fixed(9.0)),
-                            widget::column![
-                                widget::text("LOCORYN").size(10).color(accent_2()),
-                                widget::text(tr(language, "Chats"))
-                                    .size(17)
-                                    .color(text_main()),
-                            ],
+                            widget::text("Locoryn").size(18).color(text_main()),
                             Space::new().width(Length::Fill),
-                            mini_button("«", Message::ToggleChatMenu),
+                            icon_button(
+                                "«",
+                                tr(language, "Collapse sidebar"),
+                                Message::ToggleChatMenu
+                            ),
                         ],
                         Space::new().height(Length::Fixed(18.0)),
                         widget::scrollable(
@@ -757,21 +840,22 @@ impl Program {
                         // the bottom-left corner.
                         Space::new().height(Length::Fixed(46.0)),
                     ])
-                    .padding(12)
+                    .padding(10)
                     .width(Length::Fixed(sidebar_width))
                     .height(Length::Fill)
                     .style(sidebar_style)
                     .into()
                 } else {
                     let mut compact_entries: Vec<Element<Message>> = vec![
-                        mini_button("☰", Message::ToggleChatMenu),
-                        mini_button("＋", Message::NewChat),
-                        mini_button(
+                        icon_button("☰", tr(language, "Open sidebar"), Message::ToggleChatMenu),
+                        icon_button("＋", tr(language, "New chat"), Message::NewChat),
+                        icon_button(
                             if self.temporary_chat {
                                 "◌ ✓"
                             } else {
                                 "◌"
                             },
+                            tr(language, "Temporary chat"),
                             Message::ToggleTemporaryChat,
                         ),
                         Space::new().height(Length::Fixed(4.0)).into(),
@@ -882,7 +966,9 @@ impl Program {
                 let active_profile_name = self.active_profile_name();
                 let profile_chip_label: Element<Message> = if show_sidebar_details {
                     widget::row![
-                        widget::text("👤").size(13),
+                        // Use a basic Latin marker rather than a colour emoji: Iced does
+                        // not reliably load system emoji fonts on every platform.
+                        widget::text("P").size(13).color(accent_2()),
                         widget::text(ellipsize_chat_title(&active_profile_name, 18))
                             .size(14)
                             .wrapping(Wrapping::None),
@@ -893,7 +979,7 @@ impl Program {
                     .spacing(7)
                     .into()
                 } else {
-                    widget::text("👤").size(14).into()
+                    widget::text("P").size(14).color(accent_2()).into()
                 };
                 let profile_chip: Element<Message> = widget::button(profile_chip_label)
                     .on_press(Message::ToggleProfileMenu)
@@ -930,11 +1016,16 @@ impl Program {
                                 .clip(true)
                                 .width(Length::Fill),
                                 active_marker,
-                                mini_button(
+                                icon_button(
                                     if is_editing { "▾" } else { "✎" },
+                                    tr(language, "Edit profile"),
                                     Message::StartEditProfile(profile.id.clone())
                                 ),
-                                mini_button("×", Message::DeleteProfile(profile.id.clone())),
+                                icon_button(
+                                    "×",
+                                    tr(language, "Delete profile"),
+                                    Message::DeleteProfile(profile.id.clone())
+                                ),
                             ]
                             .spacing(5)
                             .into(),
@@ -1011,7 +1102,11 @@ impl Program {
                                 .padding(9)
                                 .width(Length::Fill)
                                 .style(text_input_style),
-                                mini_button("＋", Message::CreateProfile),
+                                icon_button(
+                                    "＋",
+                                    tr(language, "Create profile"),
+                                    Message::CreateProfile
+                                ),
                             ]
                             .spacing(5),
                         ]
@@ -1040,19 +1135,9 @@ impl Program {
                 ]
                 .into();
 
-                let copy_response_action: Element<Message> = if chat_is_empty {
-                    widget::column![].into()
-                } else {
-                    mini_button(tr(language, "Copy response"), Message::CopyLatestResponse)
-                };
                 let composer_active =
                     !self.prompt.prompt.trim().is_empty() || !self.pending_images.is_empty();
-                let prompt_input: Element<Message> = container(prompt)
-                    .padding(3)
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .style(input_shell_style(composer_active, pulse))
-                    .into();
+                let prompt_input: Element<Message> = prompt.into();
                 let composer_input: Element<Message> = if self.pending_images.is_empty() {
                     prompt_input
                 } else {
@@ -1066,70 +1151,222 @@ impl Program {
                     .into()
                 };
 
+                let system_prompt_selector = || {
+                    widget::pick_list(
+                        self.system_prompt
+                            .system_prompts_as_vec
+                            .lock()
+                            .unwrap()
+                            .clone(),
+                        self.system_prompt.system_prompt.clone(),
+                        Message::SystemPromptChange,
+                    )
+                    .placeholder(tr(language, "System prompt"))
+                    .padding([7, 10])
+                    .text_size(13)
+                    .style(pick_list_style)
+                    .menu_style(pick_list_menu_style)
+                    .width(Length::Fill)
+                };
+
+                let wide_config_row = self.window_size.width >= 1_000.0;
+                let token_control_width = if wide_config_row {
+                    Length::FillPortion(1)
+                } else {
+                    Length::Fixed(120.0)
+                };
+
+                let context_tokens_control = || {
+                    widget::column![
+                        widget::text(tr(language, "Context"))
+                            .size(11)
+                            .color(text_muted()),
+                        iced::widget::TextInput::<Message>::new(
+                            "tokens",
+                            &self.context_tokens_input,
+                        )
+                        .on_input(Message::EditContextTokens)
+                        .on_submit(Message::ApplyContextTokens)
+                        .padding([6, 9])
+                        .size(13)
+                        .width(token_control_width)
+                        .style(feedback_text_input_style(
+                            self.settings_feedback(SettingsFeedbackTarget::ContextWindow),
+                        )),
+                    ]
+                    .spacing(iced::Pixels(3.0))
+                    .width(token_control_width)
+                };
+
+                let max_response_control = || {
+                    widget::column![
+                        widget::text(tr(language, "Max response"))
+                            .size(11)
+                            .color(text_muted()),
+                        iced::widget::TextInput::<Message>::new(
+                            "tokens",
+                            &self.max_response_tokens_input,
+                        )
+                        .on_input(Message::EditMaxResponseTokens)
+                        .on_submit(Message::ApplyMaxResponseTokens)
+                        .padding([6, 9])
+                        .size(13)
+                        .width(token_control_width)
+                        .style(feedback_text_input_style(
+                            self.settings_feedback(SettingsFeedbackTarget::MaxResponse),
+                        )),
+                    ]
+                    .spacing(iced::Pixels(3.0))
+                    .width(token_control_width)
+                };
+
+                let config_drawer: Element<Message> = if self.config_drawer_open {
+                    let prompt_control = widget::column![
+                        widget::text(tr(language, "System prompt"))
+                            .size(11)
+                            .color(text_muted()),
+                        system_prompt_selector(),
+                    ]
+                    .spacing(iced::Pixels(3.0))
+                    // Keep the prompt selector prominent without letting it dwarf the
+                    // two token controls. All three fields scale with the desktop row.
+                    .width(if wide_config_row {
+                        Length::FillPortion(2)
+                    } else {
+                        Length::Fill
+                    });
+
+                    // These controls intentionally leave the same label line as the token
+                    // fields above them, then line up with the text inputs themselves.
+                    let actions = widget::column![
+                        Space::new().height(Length::Fixed(15.0)),
+                        toolbar_button("⚙", tr(language, "Settings"), Message::ToggleSettings,),
+                    ];
+
+                    let drawer_content: Element<Message> = if wide_config_row {
+                        widget::row![
+                            prompt_control,
+                            Space::new().width(Length::Fixed(10.0)),
+                            context_tokens_control(),
+                            Space::new().width(Length::Fixed(8.0)),
+                            max_response_control(),
+                            Space::new().width(Length::Fixed(10.0)),
+                            actions,
+                        ]
+                        .align_y(iced::Alignment::End)
+                        .into()
+                    } else if self.window_size.width >= 760.0 {
+                        widget::column![
+                            prompt_control,
+                            widget::row![
+                                context_tokens_control(),
+                                Space::new().width(Length::Fixed(8.0)),
+                                max_response_control(),
+                                Space::new().width(Length::Fill),
+                                actions,
+                            ]
+                            .align_y(iced::Alignment::End),
+                        ]
+                        .spacing(iced::Pixels(8.0))
+                        .into()
+                    } else {
+                        widget::column![
+                            prompt_control,
+                            widget::row![
+                                context_tokens_control(),
+                                Space::new().width(Length::Fixed(8.0)),
+                                max_response_control(),
+                            ],
+                            actions,
+                        ]
+                        .spacing(iced::Pixels(8.0))
+                        .into()
+                    };
+
+                    container(drawer_content)
+                        .padding([5, 10])
+                        .width(Length::Fill)
+                        .style(config_drawer_style)
+                        .into()
+                } else {
+                    widget::column![].into()
+                };
+
+                let header_controls: Element<Message> = if self.window_size.width < 980.0 {
+                    widget::column![
+                        container(
+                            widget::text(current_chat_title)
+                                .size(18)
+                                .color(text_main())
+                                .wrapping(Wrapping::None),
+                        )
+                        .clip(true)
+                        .width(Length::Fill),
+                        widget::row![
+                            container(model_selector()).width(Length::Fill),
+                            Space::new().width(Length::Fixed(8.0)),
+                            thinking_selector(),
+                            Space::new().width(Length::Fixed(6.0)),
+                            compact_icon_button(
+                                "▣",
+                                tr(language, "Images"),
+                                Message::ToggleImages,
+                            ),
+                            Space::new().width(Length::Fixed(8.0)),
+                            toolbar_button(
+                                if self.config_drawer_open {
+                                    "▾"
+                                } else {
+                                    "▸"
+                                },
+                                tr(language, "Config"),
+                                Message::ToggleConfigDrawer
+                            ),
+                        ]
+                        .align_y(iced::Alignment::Center),
+                    ]
+                    .spacing(iced::Pixels(7.0))
+                    .into()
+                } else {
+                    widget::row![
+                        container(
+                            widget::text(current_chat_title)
+                                .size(18)
+                                .color(text_main())
+                                .wrapping(Wrapping::None),
+                        )
+                        .clip(true)
+                        .width(Length::FillPortion(3)),
+                        Space::new().width(Length::Fixed(12.0)),
+                        container(model_selector()).width(Length::FillPortion(4)),
+                        Space::new().width(Length::Fixed(8.0)),
+                        thinking_selector(),
+                        Space::new().width(Length::Fixed(6.0)),
+                        compact_icon_button("▣", tr(language, "Images"), Message::ToggleImages,),
+                        Space::new().width(Length::Fixed(8.0)),
+                        toolbar_button(
+                            if self.config_drawer_open {
+                                "▾"
+                            } else {
+                                "▸"
+                            },
+                            tr(language, "Config"),
+                            Message::ToggleConfigDrawer
+                        ),
+                    ]
+                    .align_y(iced::Alignment::Center)
+                    .into()
+                };
+
                 let content = widget::column![
                     Space::new().height(Length::Fixed((1.0 - eased(self.page_reveal)) * 4.0)),
-                    container(widget::column![
-                        widget::row![
-                            widget::column![
-                                widget::text(tr(language, "LOCAL AI WORKSPACE"))
-                                    .size(10)
-                                    .color(accent_2()),
-                                Space::new().height(Length::Fixed(3.0)),
-                                widget::text(current_chat_title).size(20).color(text_main()),
-                            ],
-                            Space::new().width(Length::Fill),
-                            toolbar_button("▣", tr(language, "Images"), Message::ToggleImages),
-                            Space::new().width(Length::Fixed(6.0)),
-                            toolbar_button("⚙", tr(language, "Settings"), Message::ToggleSettings),
-                        ],
-                        Space::new().height(Length::Fixed(16.0)),
-                        widget::row![
-                            widget::column![
-                                widget::text(tr(language, "MODEL"))
-                                    .size(10)
-                                    .color(text_faint()),
-                                Space::new().height(Length::Fixed(5.0)),
-                                container(model_selector).width(Length::Fill),
-                            ]
-                            .width(Length::FillPortion(5)),
-                            Space::new().width(Length::Fixed(10.0)),
-                            widget::column![
-                                widget::text(tr(language, "SYSTEM PROMPT"))
-                                    .size(10)
-                                    .color(text_faint()),
-                                Space::new().height(Length::Fixed(5.0)),
-                                widget::pick_list(
-                                    self.system_prompt
-                                        .system_prompts_as_vec
-                                        .lock()
-                                        .unwrap()
-                                        .clone(),
-                                    self.system_prompt.system_prompt.clone(),
-                                    Message::SystemPromptChange,
-                                )
-                                .placeholder(tr(language, "System prompt"))
-                                .padding([12, 14])
-                                .text_size(14)
-                                .style(pick_list_style)
-                                .menu_style(pick_list_menu_style)
-                                .width(Length::Fill),
-                            ]
-                            .width(Length::FillPortion(3)),
-                            Space::new().width(Length::Fixed(10.0)),
-                            widget::column![
-                                widget::text(tr(language, "REASONING"))
-                                    .size(10)
-                                    .color(text_faint()),
-                                Space::new().height(Length::Fixed(5.0)),
-                                thinking_selector,
-                            ]
-                            .width(Length::Fixed(150.0)),
-                        ],
-                    ])
-                    .padding(16)
+                    container(
+                        widget::column![header_controls, config_drawer].spacing(iced::Pixels(4.0))
+                    )
+                    .padding([7, 12])
                     .width(Length::Fill)
                     .style(top_bar_style),
-                    Space::new().height(Length::Fixed(10.0)),
+                    Space::new().height(Length::Fixed(6.0)),
                     container(
                         widget::scrollable(
                             widget::column![
@@ -1143,7 +1380,7 @@ impl Program {
                         .height(Length::Fill)
                         .anchor_bottom()
                     )
-                    .padding([20, 18])
+                    .padding([14, 12])
                     .width(Length::Fill)
                     .height(Length::Fill)
                     .style(conversation_style),
@@ -1163,8 +1400,6 @@ impl Program {
                                     .size(11)
                                     .color(text_faint()),
                                 Space::new().width(Length::Fixed(8.0)),
-                                copy_response_action,
-                                Space::new().width(Length::Fixed(6.0)),
                                 if is_processing {
                                     danger_button(tr(language, "■ Stop"), Message::StopResponse)
                                 } else {
@@ -1177,15 +1412,10 @@ impl Program {
                             ],
                             offline_hint,
                             missing_bots_hint,
-                            widget::row![
-                                widget::text(visible_debug.message)
-                                    .size(13)
-                                    .color(debug_color),
-                            ],
                         ]
                         .height(Length::Fill)
                     )
-                    .padding(12)
+                    .padding([10, 12])
                     .width(Length::Fill)
                     .height(Length::Fixed(self.ui_layout.composer_height))
                     .style(composer_style(composer_active, pulse)),
@@ -1200,16 +1430,21 @@ impl Program {
                     };
                 let workspace: Element<Message> =
                     widget::row![chat_sidebar, sidebar_handle, content].into();
-                let workspace: Element<Message> =
-                    if let Some(result) = self.code_check_result.as_ref() {
-                        let result_color = if result.is_error { danger() } else { success() };
-                        let code_check_card: Element<Message> = container(widget::column![
+                let mut floating_notices: Vec<Element<Message>> = Vec::new();
+                if let Some(result) = self.code_check_result.as_ref() {
+                    let result_color = if result.is_error { danger() } else { success() };
+                    floating_notices.push(
+                        container(widget::column![
                             widget::row![
                                 widget::text(tr(language, "Code check"))
                                     .size(14)
                                     .color(result_color),
                                 Space::new().width(Length::Fill),
-                                mini_button("×", Message::DismissCodeCheckResult),
+                                compact_icon_button(
+                                    "×",
+                                    tr(language, "Close"),
+                                    Message::DismissCodeCheckResult
+                                ),
                             ],
                             Space::new().height(Length::Fixed(8.0)),
                             widget::scrollable(
@@ -1224,22 +1459,49 @@ impl Program {
                         .width(Length::Fixed(420.0))
                         .height(Length::Fixed(184.0))
                         .style(flat_card_style)
-                        .into();
-                        widget::stack![
-                            workspace,
-                            container(code_check_card)
-                                .width(Length::Fill)
-                                .height(Length::Fill)
-                                .align_x(iced::Alignment::End)
-                                .align_y(iced::Alignment::Start)
-                                .padding([22, 26]),
-                        ]
-                        .into()
-                    } else {
-                        workspace
-                    };
+                        .into(),
+                    );
+                }
+                if !visible_debug.message.trim().is_empty() {
+                    floating_notices.push(
+                        container(
+                            widget::text(visible_debug.message)
+                                .size(13)
+                                .color(debug_color)
+                                .wrapping(Wrapping::WordOrGlyph),
+                        )
+                        .padding([8, 10])
+                        .max_width(360.0)
+                        .style(flat_card_style)
+                        .into(),
+                    );
+                }
+                let workspace: Element<Message> = if floating_notices.is_empty() {
+                    workspace
+                } else {
+                    let notices =
+                        widget::Column::with_children(floating_notices).spacing(iced::Pixels(8.0));
+                    widget::stack![
+                        workspace,
+                        container(notices)
+                            .width(Length::Fill)
+                            .height(Length::Fill)
+                            .align_x(iced::Alignment::End)
+                            .align_y(iced::Alignment::End)
+                            // Keep short-lived feedback clear of the header and
+                            // composer controls. It only temporarily overlays the
+                            // lower conversation area, where it cannot block input.
+                            .padding(iced::Padding {
+                                top: 12.0,
+                                right: 20.0,
+                                bottom: self.ui_layout.composer_height + 18.0,
+                                left: 20.0,
+                            }),
+                    ]
+                    .into()
+                };
                 container(workspace)
-                    .padding(10)
+                    .padding(6)
                     .width(Length::Fill)
                     .height(Length::Fill)
                     .style(app_background_style)
@@ -1402,117 +1664,6 @@ impl Program {
                     widget::column![].into()
                 };
 
-                let generated_cards: Vec<Element<Message>> = self
-                    .generated_images
-                    .iter()
-                    .rev()
-                    .map(|path| {
-                        container(widget::column![
-                            widget::image(iced::widget::image::Handle::from_path(path))
-                                .height(Length::Fixed(280.0))
-                                .width(Length::Fill)
-                                .content_fit(iced::ContentFit::Contain)
-                                .border_radius(12.0)
-                                .opacity(eased(self.page_reveal))
-                                .scale(0.99 + eased(self.page_reveal) * 0.01),
-                            Space::new().height(Length::Fixed(8.0)),
-                            widget::row![
-                                widget::text(path.clone())
-                                    .size(11)
-                                    .color(text_muted())
-                                    .wrapping(Wrapping::WordOrGlyph)
-                                    .width(Length::Fill),
-                                mini_button(
-                                    tr(language, "Copy image"),
-                                    Message::CopyImage(path.clone())
-                                ),
-                            ],
-                        ])
-                        .padding(12)
-                        .width(Length::Fill)
-                        .style(flat_card_style)
-                        .into()
-                    })
-                    .collect();
-
-                let generation_progress: Element<Message> = if self.is_generating_image {
-                    widget::progress_bar(0.0..=1.0, 0.08 + pulse * 0.84)
-                        .girth(Length::Fixed(4.0))
-                        .into()
-                } else {
-                    Space::new().height(Length::Fixed(0.0)).into()
-                };
-
-                let generation_panel: Element<Message> = if self
-                    .user_information
-                    .image_generation_supported
-                    == Some(true)
-                {
-                    let generation_prompt = widget::text_editor(&self.prompt.editor)
-                        .placeholder(tr(language, "Describe the image you want to generate…"))
-                        .padding(14)
-                        .size(16)
-                        .font(chat_font(self.user_information.font_family))
-                        .min_height(72)
-                        .max_height(180)
-                        .on_action(Message::EditPrompt)
-                        .key_binding(|key_press| {
-                            if matches!(
-                                key_press.key.as_ref(),
-                                iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter)
-                            ) && !key_press.modifiers.shift()
-                            {
-                                Some(widget::text_editor::Binding::Custom(Message::GenerateImage))
-                            } else {
-                                widget::text_editor::Binding::from_key_press(key_press)
-                            }
-                        })
-                        .style(text_editor_style);
-                    container(widget::column![
-                            setting_label(
-                                tr(language, "Experimental image generation"),
-                                tr(language, "Ollama reports that this model can generate images. Output is requested through /v1/images/generations at 1024 × 1024.")
-                            ),
-                            Space::new().height(Length::Fixed(12.0)),
-                            generation_prompt,
-                            Space::new().height(Length::Fixed(10.0)),
-                            primary_button(
-                                tr(
-                                    language,
-                                    if self.is_generating_image {
-                                        "Generating…"
-                                    } else {
-                                        "Generate image"
-                                    }
-                                ),
-                                Message::GenerateImage
-                            ),
-                            generation_progress,
-                        ])
-                        .padding(18)
-                        .width(Length::Fill)
-                        .style(conversation_style)
-                        .into()
-                } else {
-                    widget::column![].into()
-                };
-
-                let generated_gallery: Element<Message> = if generated_cards.is_empty() {
-                    widget::column![].into()
-                } else {
-                    container(widget::column![
-                        widget::text(tr(language, "Generated images"))
-                            .size(18)
-                            .color(text_main()),
-                        Space::new().height(Length::Fixed(10.0)),
-                        widget::Column::with_children(generated_cards).spacing(iced::Pixels(12.0)),
-                    ])
-                    .padding(14)
-                    .width(Length::Fill)
-                    .style(conversation_style)
-                    .into()
-                };
-
                 let content = widget::column![
                     Space::new().height(Length::Fixed(
                         (1.0 - eased(self.page_reveal)) * 4.0
@@ -1520,7 +1671,7 @@ impl Program {
                     container(widget::row![
                         section_title(
                             tr(language, "Images"),
-                            tr(language, "Analyze images with a vision model. Experimental image generation appears only for models that report support.")
+                            tr(language, "Analyze images with a vision-capable model.")
                         ),
                         Space::new().width(Length::Fill),
                         secondary_button(tr(language, "Back to chat"), Message::ToggleImages),
@@ -1548,10 +1699,6 @@ impl Program {
                     ]).padding(18).width(Length::Fill).style(conversation_style),
                     Space::new().height(Length::Fixed(14.0)),
                     vision_response,
-                    Space::new().height(Length::Fixed(14.0)),
-                    generation_panel,
-                    Space::new().height(Length::Fixed(14.0)),
-                    generated_gallery,
                     widget::text(visible_debug.message)
                         .size(13)
                         .color(if visible_debug.is_error { danger() } else { success() }),
@@ -2023,31 +2170,47 @@ impl Program {
                                         tr(language, "Choose which tools the model can use when tools are enabled.")
                                     ),
                                     Space::new().height(Length::Fixed(8.0)),
-                                    widget::row![
-                                        widget::checkbox(
-                                            self.tool_settings.web_search
-                                        )
-                                        .label(tr(language, "Web Search"))
-                                        .on_toggle(|_| Message::ToggleWebSearchTool),
-                                        Space::new().width(Length::Fixed(16.0)),
-                                        widget::checkbox(
-                                            self.tool_settings.fetch_webpage
-                                        )
-                                        .label(tr(language, "Page Fetch"))
-                                        .on_toggle(|_| Message::ToggleFetchWebpageTool),
-                                        Space::new().width(Length::Fixed(16.0)),
-                                        widget::checkbox(
-                                            self.tool_settings.conversation_search
-                                        )
-                                        .label(tr(language, "Past Chats"))
-                                        .on_toggle(|_| Message::ToggleConversationSearchTool),
-                                        Space::new().width(Length::Fixed(16.0)),
-                                        widget::checkbox(
-                                            self.tool_settings.code_checking
-                                        )
-                                        .label(tr(language, "Code Checking"))
-                                        .on_toggle(|_| Message::ToggleCodeCheckingTool),
-                                    ],
+                                    // A two-column grid keeps every label on one line at
+                                    // ordinary window widths. The old single row let the last
+                                    // checkbox wrap and extend beyond the settings card.
+                                    widget::column![
+                                        widget::row![
+                                            widget::checkbox(
+                                                self.tool_settings.web_search
+                                            )
+                                            .label(tr(language, "Web Search"))
+                                            .text_wrapping(Wrapping::None)
+                                            .width(Length::Fill)
+                                            .on_toggle(|_| Message::ToggleWebSearchTool),
+                                            Space::new().width(Length::Fixed(16.0)),
+                                            widget::checkbox(
+                                                self.tool_settings.fetch_webpage
+                                            )
+                                            .label(tr(language, "Page Fetch"))
+                                            .text_wrapping(Wrapping::None)
+                                            .width(Length::Fill)
+                                            .on_toggle(|_| Message::ToggleFetchWebpageTool),
+                                        ],
+                                        Space::new().height(Length::Fixed(8.0)),
+                                        widget::row![
+                                            widget::checkbox(
+                                                self.tool_settings.conversation_search
+                                            )
+                                            .label(tr(language, "Past Chats"))
+                                            .text_wrapping(Wrapping::None)
+                                            .width(Length::Fill)
+                                            .on_toggle(|_| Message::ToggleConversationSearchTool),
+                                            Space::new().width(Length::Fixed(16.0)),
+                                            widget::checkbox(
+                                                self.tool_settings.code_checking
+                                            )
+                                            .label(tr(language, "Code Checking"))
+                                            .text_wrapping(Wrapping::None)
+                                            .width(Length::Fill)
+                                            .on_toggle(|_| Message::ToggleCodeCheckingTool),
+                                        ],
+                                    ]
+                                    .spacing(iced::Pixels(0.0)),
                                     Space::new().height(Length::Fixed(8.0)),
                                     widget::text(tr(language, "Code Checking also requires Local code checking in Advanced settings."))
                                         .size(12)

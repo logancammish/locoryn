@@ -46,7 +46,6 @@ const TICK_MS: u64 = 200;
 const UI_FRAME_MS: u64 = 16;
 const LIVE_RENDER_MS: u128 = 16;
 const MAX_MARKDOWN_IMAGE_BYTES: usize = 12 * 1024 * 1024;
-const MAX_IMAGE_RESPONSE_BYTES: usize = MAX_MARKDOWN_IMAGE_BYTES * 2;
 const MAX_MARKDOWN_IMAGE_PIXELS: u64 = 32_000_000;
 const SETTINGS_SAVE_DEBOUNCE_MS: u64 = 450;
 const SETTINGS_FEEDBACK_DURATION_MS: u64 = 420;
@@ -59,9 +58,9 @@ const MAX_CONTEXT_TOKENS: u32 = 4_194_304;
 const DEFAULT_TEXT_SIZE: f32 = 15.0;
 const MIN_TEXT_SIZE: f32 = 1.0;
 const MAX_TEXT_SIZE: f32 = 40.0;
-const DEFAULT_SIDEBAR_WIDTH: f32 = 278.0;
-const MIN_SIDEBAR_WIDTH: f32 = 210.0;
-const MAX_SIDEBAR_WIDTH: f32 = 460.0;
+const DEFAULT_SIDEBAR_WIDTH: f32 = 248.0;
+const MIN_SIDEBAR_WIDTH: f32 = 196.0;
+const MAX_SIDEBAR_WIDTH: f32 = 420.0;
 const DEFAULT_COMPOSER_HEIGHT: f32 = 142.0;
 const MIN_COMPOSER_HEIGHT: f32 = 118.0;
 const MAX_COMPOSER_HEIGHT: f32 = 320.0;
@@ -138,7 +137,6 @@ impl UiLayoutSettings {
 struct ModelCapabilities {
     thinking_levels: Vec<ThinkingLevel>,
     vision: bool,
-    image_generation: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -146,6 +144,8 @@ enum Message {
     ChangeBatchTokens(i32),
     ToggleFastStreaming,
     ToggleChatMenu,
+    ToggleConfigDrawer,
+    ToggleChatRowMenu(String),
     ToggleWebSearch,
     ToggleTools,
     ToggleMultipleWebSearches,
@@ -193,9 +193,6 @@ enum Message {
         result: Result<iced::widget::image::Handle, String>,
     },
     RemoveImage(usize),
-    GenerateImage,
-    ImageGenerated(Result<String, String>),
-    CopyImage(String),
     ModelCapabilitiesKnown(String, Option<ModelCapabilities>),
     ToggleSettings,
     SystemPromptChange(String),
@@ -213,7 +210,6 @@ enum Message {
     FrameTick,
     Tick,
     CopyPressed(String),
-    CopyLatestResponse,
     ToggleThinking(usize),
     ToggleSources(usize),
     UpdateTextSize(f32),
@@ -366,8 +362,6 @@ struct Program {
     last_copied_at: Option<Instant>,
 
     pending_images: Vec<ChatImage>,
-    generated_images: Vec<String>,
-    is_generating_image: bool,
     vision_responses: HashMap<String, VisionResponse>,
     markdown_images: HashMap<String, MarkdownImageState>,
 
@@ -390,6 +384,8 @@ struct Program {
     /// Persisted setting that shows the generation speed under each reply.
     show_tokens_per_second: bool,
     chat_menu_open: bool,
+    config_drawer_open: bool,
+    chat_row_menu: Option<String>,
     /// Normalized sidebar reveal progress. This is animated instead of
     /// switching between two hard-coded widths in a single frame.
     sidebar_animation: f32,
@@ -631,10 +627,6 @@ fn conversation_context_prompt(context: &str, user_name: &str, prompt: &str) -> 
     )
 }
 
-fn generated_images_dir() -> PathBuf {
-    app_data_dir().join("generated")
-}
-
 /// Tokens per second straight from Ollama's final stream statistics. Because
 /// the numbers come from the server's own counters they are unaffected by the
 /// client-side render batching that groups tokens while streaming.
@@ -645,28 +637,6 @@ fn tokens_per_second(eval_count: Option<u64>, eval_duration: Option<u64>) -> Opt
         return None;
     }
     Some((tokens / (duration_ns / 1_000_000_000.0)) as f32)
-}
-
-fn load_generated_images() -> Vec<String> {
-    let mut images = fs::read_dir(generated_images_dir())
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            matches!(
-                path.extension()
-                    .and_then(|extension| extension.to_str())
-                    .map(str::to_ascii_lowercase)
-                    .as_deref(),
-                Some("png" | "jpg" | "jpeg" | "webp")
-            )
-        })
-        .map(|path| path.to_string_lossy().to_string())
-        .collect::<Vec<_>>();
-    images.sort();
-    images
 }
 
 fn collect_reported_thinking_levels(value: &serde_json::Value, levels: &mut Vec<ThinkingLevel>) {
@@ -792,86 +762,7 @@ fn model_capabilities(json: &serde_json::Value) -> Option<ModelCapabilities> {
     Some(ModelCapabilities {
         thinking_levels: sorted_thinking_levels(thinking_levels),
         vision: has("vision"),
-        image_generation: has("image"),
     })
-}
-
-fn generated_image_payload(body: &serde_json::Value) -> Option<&str> {
-    body.get("data")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|images| images.first())
-        .and_then(|image| image.get("b64_json"))
-        .and_then(serde_json::Value::as_str)
-        // Keep compatibility with early experimental Ollama builds.
-        .or_else(|| body.get("image").and_then(serde_json::Value::as_str))
-}
-
-async fn generate_image_via_ollama(
-    host: String,
-    model: String,
-    prompt: String,
-) -> Result<String, String> {
-    let response = reqwest::Client::new()
-        .post(format!("{host}/v1/images/generations"))
-        .json(&serde_json::json!({
-            "model": model,
-            "prompt": prompt,
-            "size": "1024x1024",
-            "response_format": "b64_json"
-        }))
-        .send()
-        .await
-        .map_err(|error| format!("Could not reach Ollama: {error}"))?;
-
-    let status = response.status();
-    if !status.is_success() {
-        let detail = read_response_limited(response, 64 * 1024)
-            .await
-            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-            .unwrap_or_default();
-        return Err(format!(
-            "Ollama image generation failed ({status}): {}",
-            detail.trim()
-        ));
-    }
-
-    let response_bytes = read_response_limited(response, MAX_IMAGE_RESPONSE_BYTES)
-        .await
-        .map_err(|error| format!("Could not read Ollama's image response: {error}"))?;
-    let response_text = String::from_utf8(response_bytes)
-        .map_err(|_| "Ollama returned a non-text image response.".to_string())?;
-    let body = serde_json::from_str::<serde_json::Value>(&response_text)
-        .ok()
-        .or_else(|| {
-            response_text
-                .lines()
-                .rev()
-                .filter(|line| !line.trim().is_empty())
-                .find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        })
-        .ok_or_else(|| "Ollama returned an invalid image response.".to_string())?;
-    let encoded = generated_image_payload(&body).ok_or_else(|| {
-            "The selected model returned no image data. Update Ollama and choose a model with the `image` capability.".to_string()
-        })?;
-    let encoded = encoded.rsplit_once(',').map_or(encoded, |(_, data)| data);
-    let bytes = BASE64
-        .decode(encoded)
-        .map_err(|error| format!("Could not decode Ollama's generated image: {error}"))?;
-    validate_image_dimensions(&bytes)?;
-    let decoded = image::load_from_memory(&bytes)
-        .map_err(|error| format!("Ollama returned unsupported image data: {error}"))?;
-
-    let output_directory = generated_images_dir();
-    fs::create_dir_all(&output_directory)
-        .map_err(|error| format!("Could not create image output folder: {error}"))?;
-    let output_path = output_directory.join(format!(
-        "locoryn-image-{}.png",
-        chrono::Utc::now().timestamp_millis()
-    ));
-    decoded
-        .save(&output_path)
-        .map_err(|error| format!("Could not save generated image: {error}"))?;
-    Ok(output_path.to_string_lossy().to_string())
 }
 
 /// Installed assets are read-only. Resolve them beside the executable so
@@ -1344,22 +1235,6 @@ fn paste_chat_image() -> Result<ChatImage, String> {
     })
 }
 
-fn copy_image_file(path: &str) -> Result<(), String> {
-    let decoded = image::open(path)
-        .map_err(|error| format!("Could not open image: {error}"))?
-        .into_rgba8();
-    let (width, height) = decoded.dimensions();
-    let mut clipboard =
-        arboard::Clipboard::new().map_err(|error| format!("Could not open clipboard: {error}"))?;
-    clipboard
-        .set_image(arboard::ImageData {
-            width: width as usize,
-            height: height as usize,
-            bytes: std::borrow::Cow::Owned(decoded.into_raw()),
-        })
-        .map_err(|error| format!("Could not copy image: {error}"))
-}
-
 fn version_components(version: &str) -> Option<Vec<u64>> {
     let version = version.trim().trim_start_matches(['v', 'V']);
     let stable = version.split(['-', '+']).next()?;
@@ -1605,7 +1480,6 @@ impl Program {
     fn needs_frame_updates(&self) -> bool {
         let sidebar_target = if self.chat_menu_open { 1.0 } else { 0.0 };
         !self.active_prompts.is_empty()
-            || self.is_generating_image
             || self.page_reveal < 1.0
             || self.settings_feedback.is_some_and(|(_, started_at)| {
                 started_at.elapsed() < Duration::from_millis(SETTINGS_FEEDBACK_DURATION_MS)
@@ -2987,92 +2861,6 @@ impl Program {
                 Task::none()
             }
 
-            Message::CopyImage(path) => {
-                Task::perform(async move { copy_image_file(&path) }, |result| {
-                    Message::ImageGenerated(result.map(|_| "__copied__".to_string()))
-                })
-            }
-
-            Message::GenerateImage => {
-                if self.is_generating_image {
-                    return Task::none();
-                }
-                match self.user_information.image_generation_supported {
-                    Some(true) => {}
-                    Some(false) => {
-                        self.set_debug_message(DebugMessage {
-                            message:
-                                "Choose a model with Ollama's experimental `image` capability."
-                                    .to_string(),
-                            is_error: true,
-                        });
-                        return Task::none();
-                    }
-                    None => {
-                        self.set_debug_message(DebugMessage {
-                            message: "Waiting for Ollama to report this model's capabilities."
-                                .to_string(),
-                            is_error: true,
-                        });
-                        return Task::none();
-                    }
-                }
-                let Some(model) = self.user_information.model.clone() else {
-                    self.set_debug_message(DebugMessage {
-                        message: "Select an image-generation model first.".to_string(),
-                        is_error: true,
-                    });
-                    return Task::none();
-                };
-                let prompt = self.prompt.prompt.trim().to_string();
-                if prompt.is_empty() {
-                    self.set_debug_message(DebugMessage {
-                        message: "Describe the image you want to generate.".to_string(),
-                        is_error: true,
-                    });
-                    return Task::none();
-                }
-                self.is_generating_image = true;
-                let host = match ollama_base_url(&self.user_information.ip_address) {
-                    Ok(url) => url.as_str().trim_end_matches('/').to_string(),
-                    Err(error) => {
-                        self.is_generating_image = false;
-                        self.set_debug_message(DebugMessage {
-                            message: error,
-                            is_error: true,
-                        });
-                        return Task::none();
-                    }
-                };
-                Task::perform(
-                    generate_image_via_ollama(host, model, prompt),
-                    Message::ImageGenerated,
-                )
-            }
-
-            Message::ImageGenerated(result) => {
-                self.is_generating_image = false;
-                match result {
-                    Ok(marker) if marker == "__copied__" => self.set_debug_message(DebugMessage {
-                        message: "Image copied to clipboard.".to_string(),
-                        is_error: false,
-                    }),
-                    Ok(path) => {
-                        self.generated_images.push(path);
-                        self.begin_page_transition();
-                        self.set_debug_message(DebugMessage {
-                            message: "Image generated locally.".to_string(),
-                            is_error: false,
-                        });
-                    }
-                    Err(error) => self.set_debug_message(DebugMessage {
-                        message: error,
-                        is_error: true,
-                    }),
-                }
-                Task::none()
-            }
-
             Message::ChangeBatchTokens(new_batch_tokens) => {
                 self.batch_tokens = new_batch_tokens;
                 self.trigger_settings_feedback(SettingsFeedbackTarget::BatchTokens);
@@ -3087,6 +2875,20 @@ impl Program {
 
             Message::ToggleChatMenu => {
                 self.chat_menu_open = !self.chat_menu_open;
+                Task::none()
+            }
+
+            Message::ToggleConfigDrawer => {
+                self.config_drawer_open = !self.config_drawer_open;
+                Task::none()
+            }
+
+            Message::ToggleChatRowMenu(id) => {
+                self.chat_row_menu = if self.chat_row_menu.as_deref() == Some(id.as_str()) {
+                    None
+                } else {
+                    Some(id)
+                };
                 Task::none()
             }
 
@@ -3362,6 +3164,7 @@ impl Program {
 
             Message::NewChat => {
                 self.save_open_chat();
+                self.chat_row_menu = None;
                 self.current_chat_id = Self::new_chat_id();
                 self.temporary_chat = false;
                 self.web_search_for_chat = self.new_chat_web_search;
@@ -3370,9 +3173,13 @@ impl Program {
                 Task::none()
             }
 
-            Message::OpenChat(id) => self.open_chat(id),
+            Message::OpenChat(id) => {
+                self.chat_row_menu = None;
+                self.open_chat(id)
+            }
 
             Message::DeleteChat(id) => {
+                self.chat_row_menu = None;
                 if self.active_prompts.contains_key(&id) {
                     self.set_debug_message(DebugMessage {
                         message: "Stop that chat's response before deleting it.".to_string(),
@@ -3408,6 +3215,7 @@ impl Program {
             }
 
             Message::ToggleChatPin(id) => {
+                self.chat_row_menu = None;
                 if let Some(index) = self.saved_chats.iter().position(|chat| chat.id == id) {
                     let mut chat = self.saved_chats.remove(index);
                     chat.pinned = !chat.pinned;
@@ -4132,8 +3940,6 @@ impl Program {
                         .any(|level| *level != ThinkingLevel::Off);
                     self.user_information.thinking_supported = Some(thinking);
                     self.user_information.vision_supported = Some(capabilities.vision);
-                    self.user_information.image_generation_supported =
-                        Some(capabilities.image_generation);
                     self.user_information.thinking_levels = capabilities.thinking_levels;
                     if !self
                         .user_information
@@ -4223,7 +4029,6 @@ impl Program {
                 self.user_information.model = Some(model.clone());
                 self.user_information.thinking_supported = None;
                 self.user_information.vision_supported = None;
-                self.user_information.image_generation_supported = None;
                 self.user_information.thinking_levels = vec![ThinkingLevel::Off];
                 // Reasoning support and accepted effort values vary by model. Do not carry an
                 // effort setting across models while capability detection is still in flight.
@@ -4275,42 +4080,6 @@ impl Program {
                         is_error: false,
                     });
 
-                    clipboard::write::<Message>(input)
-                }
-            }
-
-            Message::CopyLatestResponse => {
-                let input = self
-                    .current_active_prompt()
-                    .filter(|job| !job.response_text.trim().is_empty())
-                    .map(|job| split_thinking_text(&job.response_text).1)
-                    .or_else(|| {
-                        self.chat_messages_cache.iter().enumerate().rev().find_map(
-                            |(index, message)| {
-                                matches!(message, Correspondence::Bot { .. }).then(|| {
-                                    self.chat_visible_text_cache
-                                        .get(index)
-                                        .cloned()
-                                        .unwrap_or_default()
-                                })
-                            },
-                        )
-                    })
-                    .unwrap_or_default();
-
-                if input.trim().is_empty() {
-                    self.set_debug_message(DebugMessage {
-                        message: "Nothing to copy yet.".to_string(),
-                        is_error: true,
-                    });
-                    Task::none()
-                } else {
-                    self.last_copied_text = Some(input.clone());
-                    self.last_copied_at = Some(Instant::now());
-                    self.set_debug_message(DebugMessage {
-                        message: "Copied to clipboard.".to_string(),
-                        is_error: false,
-                    });
                     clipboard::write::<Message>(input)
                 }
             }
@@ -4668,6 +4437,8 @@ impl Default for Program {
             fast_streaming,
             show_tokens_per_second,
             chat_menu_open: true,
+            config_drawer_open: false,
+            chat_row_menu: None,
             sidebar_animation: 1.0,
             ui_motion: 0.0,
             page_reveal: 0.0,
@@ -4724,8 +4495,6 @@ impl Default for Program {
             last_copied_text: None,
             last_copied_at: None,
             pending_images: Vec::new(),
-            generated_images: load_generated_images(),
-            is_generating_image: false,
             vision_responses: HashMap::new(),
             markdown_images: HashMap::new(),
             expanded_thinking: HashSet::new(),
@@ -4752,7 +4521,6 @@ impl Default for Program {
                 thinking_levels: vec![ThinkingLevel::Off],
                 thinking_supported: None,
                 vision_supported: None,
-                image_generation_supported: None,
                 max_response_tokens,
                 context_tokens,
                 temperature: 7.0,
@@ -4824,6 +4592,7 @@ pub fn main() -> iced::Result {
     };
 
     let application = iced::application(Program::boot, Program::update, Program::view)
+        .title("Locoryn")
         .subscription(Program::subscription)
         .theme(|program: &Program| {
             if program.app_state.dark_mode {
@@ -4857,10 +4626,10 @@ mod tests {
         UserInformation, WebSearchSettings, WebSearchState, app_data_dir,
         assign_legacy_profile_ids, canonical_code_language, censor_text, chat_profile_id,
         compare_versions, conversation_context_prompt, decode_generation_line,
-        disabled_web_tool_message, ensure_legacy_profile, generated_image_payload,
-        model_capabilities, normalize_code_fence_languages, ollama_api_url, ollama_base_url,
-        parse_markdown_items, read_json_with_backup, remote_image_url_is_safe, sidecar_path,
-        split_thinking_text, tokens_per_second, write_json_safely,
+        disabled_web_tool_message, ensure_legacy_profile, model_capabilities,
+        normalize_code_fence_languages, ollama_api_url, ollama_base_url, parse_markdown_items,
+        read_json_with_backup, remote_image_url_is_safe, sidecar_path, split_thinking_text,
+        tokens_per_second, write_json_safely,
     };
 
     fn test_active_prompt(
@@ -5110,6 +4879,15 @@ mod tests {
     }
 
     #[test]
+    fn compact_config_drawer_is_collapsed_by_default() {
+        let mut program = Program::default();
+        assert!(!program.config_drawer_open);
+
+        drop(program.update(Message::ToggleConfigDrawer));
+        assert!(program.config_drawer_open);
+    }
+
+    #[test]
     fn safe_json_writes_retain_a_parseable_backup() {
         let directory = std::env::temp_dir().join(format!(
             "locoryn-safe-write-test-{}-{}",
@@ -5251,7 +5029,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_distinct_ollama_image_capabilities() {
+    fn reads_vision_capabilities() {
         let details = serde_json::json!({
             "capabilities": ["completion", "thinking", "vision"]
         });
@@ -5260,17 +5038,6 @@ mod tests {
             Some(ModelCapabilities {
                 thinking_levels: vec![ThinkingLevel::Off, ThinkingLevel::On],
                 vision: true,
-                image_generation: false,
-            })
-        );
-
-        let generator = serde_json::json!({ "capabilities": ["image"] });
-        assert_eq!(
-            model_capabilities(&generator),
-            Some(ModelCapabilities {
-                thinking_levels: vec![ThinkingLevel::Off],
-                vision: false,
-                image_generation: true,
             })
         );
     }
@@ -5535,18 +5302,6 @@ mod tests {
                 ..
             } if language == "cs"
         ));
-    }
-
-    #[test]
-    fn reads_current_and_legacy_generated_image_payloads() {
-        let current = serde_json::json!({
-            "data": [{ "b64_json": "current-image" }]
-        });
-        let legacy = serde_json::json!({ "image": "legacy-image" });
-
-        assert_eq!(generated_image_payload(&current), Some("current-image"));
-        assert_eq!(generated_image_payload(&legacy), Some("legacy-image"));
-        assert_eq!(generated_image_payload(&serde_json::json!({})), None);
     }
 
     #[test]

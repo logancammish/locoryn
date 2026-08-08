@@ -43,7 +43,7 @@ It is a particularly good fit if you want to:
 - connect to Ollama on another computer instead of only `localhost`;
 - choose exactly how much supported models reason;
 - separate disposable chats from conversations worth keeping;
-- inspect images or experiment with Ollama image-generation models;
+- inspect images with vision-capable models;
 - give tool-capable models optional, source-linked access to the web; or
 - tune generation and rendering without building your own Ollama client.
 
@@ -215,7 +215,7 @@ and are not printed in logs.
 
 ## Local data and privacy
 
-Chats, settings, diagnostics, and generated images are stored on your machine.
+Chats, settings, and diagnostics are stored on your machine.
 Temporary chats are not added to `chats.json`.
 
 | Platform | Default application-data folder |
@@ -228,8 +228,7 @@ path is always visible under **Settings → Chat storage**, and it can be change
 from there. The application can also detect conversations from the legacy
 `output/chats.json` location.
 
-Generated images are stored in `generated`, while user preferences use
-`settings.json` in the application-data folder.
+User preferences use `settings.json` in the application-data folder.
 
 ## Platform support
 

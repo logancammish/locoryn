@@ -102,9 +102,10 @@ pub(super) fn text_muted() -> Color {
 
 pub(super) fn text_faint() -> Color {
     if is_dark_mode() {
-        rgb(111, 117, 134)
+        // 6.1:1 against the dark application background for small metadata.
+        rgb(146, 152, 169)
     } else {
-        rgb(119, 123, 139)
+        rgb(82, 87, 103)
     }
 }
 
@@ -181,15 +182,11 @@ pub(super) fn sidebar_style(_theme: &Theme) -> Style {
             rgb(251, 251, 253)
         })),
         border: Border {
-            color: border_soft(),
-            width: 1.0,
-            radius: Radius::from(20.0),
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: Radius::from(14.0),
         },
-        shadow: Shadow {
-            color: shadow_color(),
-            offset: Vector::from([0.0, 8.0]),
-            blur_radius: 26.0,
-        },
+        shadow: Shadow::default(),
     }
 }
 
@@ -199,18 +196,32 @@ pub(super) fn top_bar_style(_theme: &Theme) -> Style {
         text_color: Some(text_main()),
         background: Some(Background::Color(panel())),
         border: Border {
-            color: border_soft(),
-            width: 1.0,
-            radius: Radius::from(18.0),
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: Radius::from(14.0),
         },
         shadow: Shadow {
             color: Color {
                 a: if is_dark_mode() { 0.18 } else { 0.06 },
                 ..rgb(0, 0, 0)
             },
-            offset: Vector::from([0.0, 4.0]),
-            blur_radius: 16.0,
+            offset: Vector::from([0.0, 2.0]),
+            blur_radius: 10.0,
         },
+    }
+}
+
+pub(super) fn config_drawer_style(_theme: &Theme) -> Style {
+    Style {
+        snap: true,
+        text_color: Some(text_main()),
+        background: Some(Background::Color(panel_soft())),
+        border: Border {
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: Radius::from(10.0),
+        },
+        shadow: Shadow::default(),
     }
 }
 
@@ -224,42 +235,28 @@ pub(super) fn conversation_style(_theme: &Theme) -> Style {
             rgb(252, 252, 254)
         })),
         border: Border {
-            color: if is_dark_mode() {
-                rgb(27, 32, 44)
-            } else {
-                rgb(232, 234, 241)
-            },
-            width: 1.0,
-            radius: Radius::from(20.0),
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: Radius::from(14.0),
         },
         shadow: Shadow::default(),
     }
 }
 
-pub(super) fn composer_style(active: bool, pulse: f32) -> impl Fn(&Theme) -> Style {
+pub(super) fn composer_style(_active: bool, _pulse: f32) -> impl Fn(&Theme) -> Style {
     move |_theme: &Theme| Style {
         snap: true,
         text_color: Some(text_main()),
         background: Some(Background::Color(panel())),
         border: Border {
-            color: if active {
-                mix_color(border_bright(), accent(), 0.42 + pulse * 0.07)
-            } else if is_dark_mode() {
-                rgb(62, 66, 88)
-            } else {
-                rgb(211, 213, 224)
-            },
-            width: if active { 1.4 } else { 1.0 },
-            radius: Radius::from(18.0),
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: Radius::from(16.0),
         },
         shadow: Shadow {
-            color: if active {
-                with_alpha(accent(), 0.09 + pulse * 0.025)
-            } else {
-                shadow_color()
-            },
-            offset: Vector::from([0.0, 8.0 + pulse]),
-            blur_radius: 22.0 + pulse * 3.0,
+            color: with_alpha(shadow_color(), 0.32),
+            offset: Vector::from([0.0, 3.0]),
+            blur_radius: 12.0,
         },
     }
 }
@@ -319,8 +316,8 @@ pub(super) fn flat_card_style(_theme: &Theme) -> Style {
         text_color: Some(text_main()),
         background: Some(Background::Color(panel_lifted())),
         border: Border {
-            color: border_soft(),
-            width: 1.0,
+            color: Color::TRANSPARENT,
+            width: 0.0,
             radius: Radius::from(14.0),
         },
         shadow: Shadow::default(),
@@ -333,26 +330,51 @@ pub(super) fn chat_entry_style(active: bool) -> impl Fn(&Theme) -> Style {
         text_color: Some(text_main()),
         background: Some(Background::Color(if active {
             if is_dark_mode() {
-                rgb(43, 38, 76)
+                rgb(29, 28, 45)
             } else {
-                rgb(239, 236, 253)
+                rgb(243, 241, 250)
             }
         } else {
             Color::TRANSPARENT
         })),
         border: Border {
-            color: if active {
-                Color {
-                    a: 0.72,
-                    ..accent()
-                }
-            } else {
-                Color::TRANSPARENT
-            },
-            width: 1.0,
+            color: Color::TRANSPARENT,
+            width: 0.0,
             radius: Radius::from(12.0),
         },
         shadow: Shadow::default(),
+    }
+}
+
+/// A short, conventional fade for long chat titles at the trailing action edge.
+/// The opaque end matches the entry (or sidebar) background, so the text simply
+/// disappears instead of ending abruptly beneath the overflow button.
+pub(super) fn chat_title_fade_style(active: bool) -> impl Fn(&Theme) -> Style {
+    move |_theme| {
+        let end_color = if active {
+            if is_dark_mode() {
+                rgb(29, 28, 45)
+            } else {
+                rgb(243, 241, 250)
+            }
+        } else if is_dark_mode() {
+            rgb(12, 15, 22)
+        } else {
+            rgb(251, 251, 253)
+        };
+
+        Style {
+            snap: true,
+            text_color: None,
+            background: Some(Background::Gradient(
+                iced::gradient::Linear::new(iced::Degrees(90.0))
+                    .add_stop(0.0, Color::TRANSPARENT)
+                    .add_stop(1.0, end_color)
+                    .into(),
+            )),
+            border: Border::default(),
+            shadow: Shadow::default(),
+        }
     }
 }
 
@@ -377,30 +399,6 @@ pub(super) fn chat_title_button_style(
     }
 }
 
-pub(super) fn input_shell_style(active: bool, pulse: f32) -> impl Fn(&Theme) -> Style {
-    move |_theme: &Theme| Style {
-        snap: true,
-        text_color: Some(text_main()),
-        background: Some(Background::Color(if is_dark_mode() {
-            rgb(18, 22, 31)
-        } else {
-            rgb(248, 249, 252)
-        })),
-        border: Border {
-            color: if active {
-                mix_color(border_bright(), accent(), 0.25 + pulse * 0.05)
-            } else if is_dark_mode() {
-                rgb(49, 55, 73)
-            } else {
-                rgb(222, 224, 232)
-            },
-            width: if active { 1.25 } else { 1.0 },
-            radius: Radius::from(14.0),
-        },
-        shadow: Shadow::default(),
-    }
-}
-
 pub(super) fn user_bubble_style(reveal: f32) -> impl Fn(&Theme) -> Style {
     move |_theme: &Theme| {
         let target = if is_dark_mode() {
@@ -417,8 +415,8 @@ pub(super) fn user_bubble_style(reveal: f32) -> impl Fn(&Theme) -> Style {
             }),
             background: Some(Background::Color(mix_color(app_bg(), target, reveal))),
             border: Border {
-                color: with_alpha(accent(), 0.55 * reveal),
-                width: 1.0,
+                color: Color::TRANSPARENT,
+                width: 0.0,
                 radius: Radius::from(16.0),
             },
             shadow: Shadow {
@@ -442,15 +440,8 @@ pub(super) fn bot_bubble_style(reveal: f32) -> impl Fn(&Theme) -> Style {
             text_color: Some(text_main()),
             background: Some(Background::Color(mix_color(app_bg(), target, reveal))),
             border: Border {
-                color: with_alpha(
-                    if is_dark_mode() {
-                        rgb(35, 41, 54)
-                    } else {
-                        rgb(231, 233, 239)
-                    },
-                    reveal,
-                ),
-                width: 1.0,
+                color: Color::TRANSPARENT,
+                width: 0.0,
                 radius: Radius::from(16.0),
             },
             shadow: Shadow {
@@ -787,6 +778,7 @@ pub(super) fn primary_button<'a>(label: &'a str, message: Message) -> Element<'a
                 status,
             )
         })
+        .height(Length::Fixed(44.0))
         .on_press(message)
         .into()
 }
@@ -794,6 +786,7 @@ pub(super) fn primary_button<'a>(label: &'a str, message: Message) -> Element<'a
 pub(super) fn secondary_button<'a>(label: &'a str, message: Message) -> Element<'a, Message> {
     widget::button(widget::text(label).size(14).align_x(Horizontal::Center))
         .padding([11, 14])
+        .height(Length::Fixed(44.0))
         .style(|_theme, _status| button_visual(panel_soft(), border_soft(), text_main(), _status))
         .on_press(message)
         .into()
@@ -802,6 +795,7 @@ pub(super) fn secondary_button<'a>(label: &'a str, message: Message) -> Element<
 pub(super) fn danger_button<'a>(label: &'a str, message: Message) -> Element<'a, Message> {
     widget::button(widget::text(label).size(14).align_x(Horizontal::Center))
         .padding(12)
+        .height(Length::Fixed(44.0))
         .style(|_theme, _status| {
             button_visual(rgb(104, 38, 55), rgb(185, 76, 99), Color::WHITE, _status)
         })
@@ -811,15 +805,26 @@ pub(super) fn danger_button<'a>(label: &'a str, message: Message) -> Element<'a,
 
 pub(super) fn mini_button<'a>(label: &'a str, message: Message) -> Element<'a, Message> {
     widget::button(widget::text(label).size(12).align_x(Horizontal::Center))
-        .padding([8, 10])
+        .padding([6, 9])
+        .height(Length::Fixed(32.0))
         .style(|_theme, _status| button_visual(panel_soft(), border_soft(), text_muted(), _status))
+        .on_press(message)
+        .into()
+}
+
+pub(super) fn mini_danger_button<'a>(label: &'a str, message: Message) -> Element<'a, Message> {
+    widget::button(widget::text(label).size(12).align_x(Horizontal::Center))
+        .padding([6, 9])
+        .height(Length::Fixed(32.0))
+        .style(|_theme, status| button_visual(panel_soft(), border_soft(), danger(), status))
         .on_press(message)
         .into()
 }
 
 pub(super) fn mini_button_owned(label: String, message: Message) -> Element<'static, Message> {
     widget::button(widget::text(label).size(12).align_x(Horizontal::Center))
-        .padding([8, 10])
+        .padding([6, 9])
+        .height(Length::Fixed(32.0))
         .style(|_theme, _status| button_visual(panel_soft(), border_soft(), text_muted(), _status))
         .on_press(message)
         .into()
@@ -863,9 +868,66 @@ pub(super) fn toolbar_button<'a>(
         ]
         .align_y(iced::Alignment::Center),
     )
-    .padding([10, 13])
+    .padding([8, 10])
+    .height(Length::Fixed(40.0))
     .style(|_theme, status| button_visual(panel_soft(), border_soft(), text_main(), status))
     .on_press(message)
+    .into()
+}
+
+pub(super) fn icon_button<'a>(
+    icon: &'a str,
+    tooltip_label: &'a str,
+    message: Message,
+) -> Element<'a, Message> {
+    let button = widget::button(
+        container(widget::text(icon).size(16).align_x(Horizontal::Center))
+            .center_x(Length::Fill)
+            .center_y(Length::Fill),
+    )
+    .width(Length::Fixed(44.0))
+    .height(Length::Fixed(44.0))
+    .padding(0)
+    .style(|_theme, status| button_visual(panel_soft(), border_soft(), text_main(), status))
+    .on_press(message);
+
+    widget::tooltip(
+        button,
+        container(widget::text(tooltip_label).size(12).color(text_main()))
+            .padding([6, 9])
+            .style(flat_card_style),
+        widget::tooltip::Position::Bottom,
+    )
+    .gap(6)
+    .into()
+}
+
+/// Small, secondary icon action for dense rows such as saved-chat actions.
+/// Primary navigation continues to use `icon_button` for a larger target.
+pub(super) fn compact_icon_button<'a>(
+    icon: &'a str,
+    tooltip_label: &'a str,
+    message: Message,
+) -> Element<'a, Message> {
+    let button = widget::button(
+        container(widget::text(icon).size(15).align_x(Horizontal::Center))
+            .center_x(Length::Fill)
+            .center_y(Length::Fill),
+    )
+    .width(Length::Fixed(36.0))
+    .height(Length::Fixed(36.0))
+    .padding(0)
+    .style(|_theme, status| button_visual(panel_soft(), border_soft(), text_main(), status))
+    .on_press(message);
+
+    widget::tooltip(
+        button,
+        container(widget::text(tooltip_label).size(12).color(text_main()))
+            .padding([6, 9])
+            .style(flat_card_style),
+        widget::tooltip::Position::Bottom,
+    )
+    .gap(6)
     .into()
 }
 
@@ -961,6 +1023,7 @@ pub(super) fn send_button<'a>(label: &'a str, message: Option<Message>) -> Eleme
         .align_y(iced::Alignment::Center),
     )
     .padding([12, 16])
+    .height(Length::Fixed(44.0))
     .style(|_theme, status| {
         button_visual(
             if is_dark_mode() {
