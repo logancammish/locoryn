@@ -232,6 +232,7 @@ enum Message {
     ToggleCodeChecking,
     CheckCode(String, String),
     CodeChecked(Result<String, String>),
+    DismissCodeCheckResult,
     ToggleDynamicDate,
     ToggleDynamicTime,
     DynamicCustomInstructionsChanged(String),
@@ -341,6 +342,9 @@ struct Program {
 
     debug_message: DebugMessage,
     debug_message_set_at: Option<Instant>,
+    /// Manual code-check feedback is shown as a dismissible overlay so large
+    /// compiler diagnostics never shrink the chat composer.
+    code_check_result: Option<DebugMessage>,
 
     /// Parsed markdown cache for finished chat messages.
     /// This is needed because markdown::view borrows parsed markdown items.
@@ -2021,7 +2025,6 @@ impl Program {
 
     fn drain_live_updates(&mut self) -> bool {
         let filtering = self.app_state.filtering;
-        let code_checking_enabled = self.code_checking_enabled;
         let current_chat_id = self.current_chat_id.clone();
         let mut changed = false;
         for (chat_id, job) in self.active_prompts.iter_mut() {
@@ -2318,6 +2321,7 @@ impl Program {
         let attached_images = self.pending_images.clone();
         let had_image = !attached_images.is_empty();
         let filtering = self.app_state.filtering;
+        let code_checking_enabled = self.code_checking_enabled;
         let user_info = self.user_information.clone();
         let web_search_enabled = self.web_search_for_chat;
         let mut web_search_settings = self.web_search_settings.clone();
@@ -2329,6 +2333,12 @@ impl Program {
             .tool_settings
             .clone()
             .for_chat_web_enabled(web_search_enabled);
+        // The per-tool setting records the user's preference, but the native
+        // tool is only exposed for this request after the separate advanced
+        // consent switch has also been enabled.
+        if !code_checking_enabled {
+            tool_settings.code_checking = false;
+        }
         let (web_search_state_sender, web_search_state_receiver) = crossbeam_channel::unbounded();
         let (web_progress_sender, web_progress_receiver) =
             tokio::sync::watch::channel(ToolLoopProgress::default());
@@ -3864,7 +3874,7 @@ impl Program {
 
             Message::CheckCode(language, code) => {
                 if !self.code_checking_enabled {
-                    self.set_debug_message(DebugMessage {
+                    self.code_check_result = Some(DebugMessage {
                         message:
                             "Enable code checking in Advanced settings before running local tools."
                                 .into(),
@@ -3872,18 +3882,24 @@ impl Program {
                     });
                     return Task::none();
                 }
-                self.set_debug_message(DebugMessage {
+                self.code_check_result = Some(DebugMessage {
                     message: format!("Checking {language} code…"),
                     is_error: false,
                 });
                 Task::perform(
-                    async move { check_code(language, code) },
+                    async move {
+                        tokio::task::spawn_blocking(move || check_code(language, code))
+                            .await
+                            .unwrap_or_else(|error| {
+                                Err(format!("Code checker could not complete: {error}"))
+                            })
+                    },
                     Message::CodeChecked,
                 )
             }
 
             Message::CodeChecked(result) => {
-                self.set_debug_message(match result {
+                self.code_check_result = Some(match result {
                     Ok(message) => DebugMessage {
                         message,
                         is_error: false,
@@ -3893,6 +3909,11 @@ impl Program {
                         is_error: true,
                     },
                 });
+                Task::none()
+            }
+
+            Message::DismissCodeCheckResult => {
+                self.code_check_result = None;
                 Task::none()
             }
 
@@ -4694,6 +4715,7 @@ impl Default for Program {
             } else {
                 Some(Instant::now())
             },
+            code_check_result: None,
             chat_markdown_cache: Vec::new(),
             chat_messages_cache: Vec::new(),
             chat_thinking_cache: Vec::new(),

@@ -144,6 +144,7 @@ pub(super) fn tr(language: Language, english: &'static str) -> &'static str {
         "Copied ✓" => "Copiado ✓",
         "Copy code" => "Copiar código",
         "Check code" => "Comprobar código",
+        "Code check" => "Comprobación de código",
         "Code Checking" => "Comprobación de código",
         "Code Checking also requires Local code checking in Advanced settings." => {
             "La comprobación de código también requiere activar la comprobación local de código en la configuración avanzada."

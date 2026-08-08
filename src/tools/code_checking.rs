@@ -1,6 +1,6 @@
 use std::{
     fs::{self, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
@@ -10,7 +10,8 @@ use std::{
 
 const MAX_CODE_BYTES: usize = 512 * 1024;
 const MAX_OUTPUT_CHARS: usize = 4_000;
-const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_CAPTURED_OUTPUT_BYTES: usize = 16 * 1024;
+const CHECK_TIMEOUT: Duration = Duration::from_secs(6);
 static TEMP_DIRECTORY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn canonical_language(language: &str) -> Option<&'static str> {
@@ -98,7 +99,12 @@ fn check_in_directory(language: &str, code: &str, directory: &Path) -> Result<St
         "C#" => (
             "snippet.cs",
             Command::new("csc"),
-            vec!["/nologo", "/target:library", "/out:snippet.dll", "snippet.cs"],
+            vec![
+                "/nologo",
+                "/target:library",
+                "/out:snippet.dll",
+                "snippet.cs",
+            ],
         ),
         _ => unreachable!("canonical_language returned an unsupported value"),
     };
@@ -113,6 +119,11 @@ fn check_in_directory(language: &str, code: &str, directory: &Path) -> Result<St
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Keep executable discovery working after env_clear without restoring any
+    // language-specific compiler/interpreter configuration variables.
+    if let Some(path) = std::env::var_os("PATH") {
+        command.env("PATH", path);
+    }
     let output = run_with_timeout(command, language)?;
     let details = format!(
         "{}{}",
@@ -142,6 +153,8 @@ fn run_with_timeout(mut command: Command, language: &str) -> Result<std::process
     let mut child = command.spawn().map_err(|error| {
         format!("{language} checker is unavailable. Install its compiler/interpreter and try again: {error}")
     })?;
+    let stdout = child.stdout.take().map(capture_output);
+    let stderr = child.stderr.take().map(capture_output);
     let started = Instant::now();
     loop {
         if child
@@ -149,13 +162,16 @@ fn run_with_timeout(mut command: Command, language: &str) -> Result<std::process
             .map_err(|error| format!("Could not wait for the {language} checker: {error}"))?
             .is_some()
         {
-            return child
-                .wait_with_output()
-                .map_err(|error| format!("Could not collect {language} checker output: {error}"));
+            return collect_output(child, stdout, stderr, language);
         }
         if started.elapsed() >= CHECK_TIMEOUT {
             let _ = child.kill();
             let _ = child.wait();
+            // Do not wait on reader threads here: a compiler descendant could
+            // keep an inherited pipe open after the direct child is killed.
+            // Dropping their handles lets this call honour its time bound.
+            drop(stdout);
+            drop(stderr);
             return Err(format!(
                 "{language} check timed out after {} seconds.",
                 CHECK_TIMEOUT.as_secs()
@@ -163,6 +179,46 @@ fn run_with_timeout(mut command: Command, language: &str) -> Result<std::process
         }
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn capture_output<R: Read + Send + 'static>(mut reader: R) -> thread::JoinHandle<Vec<u8>> {
+    thread::spawn(move || {
+        let mut captured = Vec::with_capacity(MAX_CAPTURED_OUTPUT_BYTES);
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    let remaining = MAX_CAPTURED_OUTPUT_BYTES.saturating_sub(captured.len());
+                    captured.extend_from_slice(&buffer[..read.min(remaining)]);
+                }
+            }
+        }
+        captured
+    })
+}
+
+fn collect_output(
+    child: std::process::Child,
+    stdout: Option<thread::JoinHandle<Vec<u8>>>,
+    stderr: Option<thread::JoinHandle<Vec<u8>>>,
+    language: &str,
+) -> Result<std::process::Output, String> {
+    let status = child
+        .wait_with_output()
+        .map_err(|error| format!("Could not collect {language} checker output: {error}"))?
+        .status;
+    Ok(std::process::Output {
+        status,
+        stdout: join_output(stdout),
+        stderr: join_output(stderr),
+    })
+}
+
+fn join_output(handle: Option<thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
+    handle
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default()
 }
 
 fn create_check_directory() -> Result<PathBuf, String> {
@@ -178,7 +234,9 @@ fn create_check_directory() -> Result<PathBuf, String> {
             Ok(()) => return Ok(directory),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
-                return Err(format!("Could not create a temporary check folder: {error}"));
+                return Err(format!(
+                    "Could not create a temporary check folder: {error}"
+                ));
             }
         }
     }
@@ -196,14 +254,41 @@ fn write_new_file(path: &Path, code: &str) -> Result<(), String> {
 }
 
 fn reject_external_source_includes(language: &str, code: &str) -> Result<(), String> {
-    let forbidden = match language {
-        "Rust" => ["include!", "include_str!", "include_bytes!", "#[path"].as_slice(),
-        "C" | "C++" => ["#include \""].as_slice(),
-        "C#" => ["#load"].as_slice(),
-        "Python" => [].as_slice(),
+    let loads_external_source = match language {
+        "Rust" => code.lines().any(|line| {
+            let compact = line
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect::<String>();
+            compact.contains("include!")
+                || compact.contains("include_str!")
+                || compact.contains("include_bytes!")
+                || compact.contains("#[path")
+        }),
+        "C" | "C++" => code.lines().any(|line| {
+            let trimmed = line.trim_start();
+            let Some(after_hash) = trimmed.strip_prefix('#') else {
+                return false;
+            };
+            let Some(after_include) = after_hash.trim_start().strip_prefix("include") else {
+                return false;
+            };
+            // System headers are normal for C/C++ snippets. Quoted and
+            // macro-based includes can resolve to user-controlled files;
+            // absolute and parent-relative angle includes can as well.
+            let header = after_include.trim_start();
+            !header.starts_with('<') || header.starts_with("</") || header.contains("..")
+        }),
+        "C#" => code.lines().any(|line| {
+            line.chars()
+                .filter(|character| !character.is_whitespace())
+                .collect::<String>()
+                .starts_with("#load")
+        }),
+        "Python" => false,
         _ => unreachable!("canonical_language returned an unsupported value"),
     };
-    if forbidden.iter().any(|pattern| code.contains(pattern)) {
+    if loads_external_source {
         return Err(
             "Code checking accepts self-contained snippets only; loading additional local source files is not allowed."
                 .to_string(),
@@ -214,7 +299,8 @@ fn reject_external_source_includes(language: &str, code: &str) -> Result<(), Str
 
 #[cfg(test)]
 mod tests {
-    use super::{canonical_language, reject_external_source_includes, tool_definition};
+    use super::{canonical_language, check_code, reject_external_source_includes, tool_definition};
+    use std::process::Command;
 
     #[test]
     fn accepts_only_supported_languages() {
@@ -231,6 +317,7 @@ mod tests {
         assert!(reject_external_source_includes("C", "#include \"../secret.h\"").is_err());
         assert!(reject_external_source_includes("C#", "#load \"secret.csx\"").is_err());
         assert!(reject_external_source_includes("C++", "#include <vector>").is_ok());
+        assert!(reject_external_source_includes("C", "#include </etc/passwd>").is_err());
     }
 
     #[test]
@@ -241,5 +328,15 @@ mod tests {
             definition["function"]["parameters"]["required"],
             serde_json::json!(["language", "code"])
         );
+    }
+
+    #[test]
+    fn python_check_compiles_without_executing_the_snippet() {
+        if Command::new("python3").arg("--version").output().is_err() {
+            return;
+        }
+
+        let result = check_code("python", "raise RuntimeError('must not run')");
+        assert!(matches!(result, Ok(message) if message.contains("passed")));
     }
 }

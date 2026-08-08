@@ -361,11 +361,13 @@ impl Program {
                         ),
                         64,
                     );
-                    let web_search_activity_visible = !matches!(
-                        &web_search_state,
-                        WebSearchState::Idle | WebSearchState::Completed
+                    let web_search_activity_visible =
+                        web_search_activity_visible(current_web_search_enabled, &web_search_state);
+                    let search_activity = web_search_activity(
+                        web_search_state.clone(),
+                        language,
+                        current_web_search_enabled,
                     );
-                    let search_activity = web_search_activity(web_search_state.clone(), language);
                     let search_gap: Element<Message> = if web_search_activity_visible {
                         Space::new().height(Length::Fixed(8.0)).into()
                     } else {
@@ -1196,7 +1198,47 @@ impl Program {
                     } else {
                         Space::new().width(Length::Fixed(10.0)).into()
                     };
-                container(widget::row![chat_sidebar, sidebar_handle, content])
+                let workspace: Element<Message> =
+                    widget::row![chat_sidebar, sidebar_handle, content].into();
+                let workspace: Element<Message> =
+                    if let Some(result) = self.code_check_result.as_ref() {
+                        let result_color = if result.is_error { danger() } else { success() };
+                        let code_check_card: Element<Message> = container(widget::column![
+                            widget::row![
+                                widget::text(tr(language, "Code check"))
+                                    .size(14)
+                                    .color(result_color),
+                                Space::new().width(Length::Fill),
+                                mini_button("×", Message::DismissCodeCheckResult),
+                            ],
+                            Space::new().height(Length::Fixed(8.0)),
+                            widget::scrollable(
+                                widget::text(result.message.as_str())
+                                    .size(12)
+                                    .color(text_main())
+                                    .wrapping(Wrapping::WordOrGlyph)
+                            )
+                            .height(Length::Fixed(126.0)),
+                        ])
+                        .padding(14)
+                        .width(Length::Fixed(420.0))
+                        .height(Length::Fixed(184.0))
+                        .style(flat_card_style)
+                        .into();
+                        widget::stack![
+                            workspace,
+                            container(code_check_card)
+                                .width(Length::Fill)
+                                .height(Length::Fill)
+                                .align_x(iced::Alignment::End)
+                                .align_y(iced::Alignment::Start)
+                                .padding([22, 26]),
+                        ]
+                        .into()
+                    } else {
+                        workspace
+                    };
+                container(workspace)
                     .padding(10)
                     .width(Length::Fill)
                     .height(Length::Fill)

@@ -79,4 +79,11 @@ mod tests {
         assert!(!settings.any_tool_enabled());
         assert!(!settings.web_tools_enabled());
     }
+
+    #[test]
+    fn code_checking_tool_is_disabled_by_default() {
+        let settings = ToolSettings::default();
+
+        assert!(!settings.code_checking);
+    }
 }

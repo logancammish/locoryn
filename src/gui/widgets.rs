@@ -374,7 +374,13 @@ pub(super) fn website_result_row(
 pub(super) fn web_search_activity<'a>(
     state: WebSearchState,
     language: Language,
+    web_search_enabled: bool,
 ) -> Element<'a, Message> {
+    // This is the final rendering gate. Local tools also use the shared tool
+    // loop and its synthesizing state, but must never present web-source UI.
+    if !web_search_activity_visible(web_search_enabled, &state) {
+        return widget::column![].into();
+    }
     let (status, detail, websites, active_url, status_color) = match state {
         WebSearchState::Searching { query, websites } => (
             tr(language, "Searching the web…"),
@@ -486,6 +492,13 @@ pub(super) fn web_search_activity<'a>(
     };
 
     widget::column![header, results,].into()
+}
+
+pub(super) fn web_search_activity_visible(
+    web_search_enabled: bool,
+    state: &WebSearchState,
+) -> bool {
+    web_search_enabled && !matches!(state, WebSearchState::Idle | WebSearchState::Completed)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -605,6 +618,24 @@ pub(super) fn markdown_with_code_copy<'a>(
     widget::Column::with_children(children)
         .spacing(iced::Pixels(8.0))
         .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::web_search_activity_visible;
+    use crate::tools::web_search::WebSearchState;
+
+    #[test]
+    fn local_tool_synthesis_never_shows_web_search_activity() {
+        let state = WebSearchState::Synthesizing {
+            thinking: "Checking code".to_string(),
+            query: String::new(),
+            websites: Vec::new(),
+        };
+
+        assert!(!web_search_activity_visible(false, &state));
+        assert!(web_search_activity_visible(true, &state));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -368,6 +368,8 @@ fn tool_limits_are_bounded() {
     assert!(!single_search_budget.take_iteration());
     assert!(single_search_budget.take_search());
     assert!(!single_search_budget.take_search());
+    assert!(single_search_budget.take_code_check());
+    assert!(!single_search_budget.take_code_check());
 
     let multiple_settings = WebSearchSettings {
         allow_multiple_searches: true,
@@ -397,8 +399,9 @@ fn tool_guidance_matches_the_repeated_search_setting() {
         ..WebSearchSettings::default()
     };
     let tool_settings = crate::tools::ToolSettings::default();
-    let single_guidance = tool_loop_guidance(&single_settings, &tool_settings, "2026-07-26");
-    let research_guidance = tool_loop_guidance(&research_settings, &tool_settings, "2026-07-26");
+    let single_guidance = tool_loop_guidance(&single_settings, &tool_settings, false, "2026-07-26");
+    let research_guidance =
+        tool_loop_guidance(&research_settings, &tool_settings, false, "2026-07-26");
     assert!(single_guidance.contains("at most once"));
     assert!(single_guidance.contains("2026-07-26"));
     assert!(research_guidance.contains("Run 3 to 6"));
@@ -434,7 +437,7 @@ fn tool_guidance_matches_the_repeated_search_setting() {
         minimum_independent_pages: 0,
         ..WebSearchSettings::default()
     });
-    assert_eq!(search_only_tools.as_array().unwrap().len(), 2);
+    assert_eq!(search_only_tools.as_array().unwrap().len(), 3);
 }
 
 #[test]
@@ -465,6 +468,7 @@ fn exhausted_tools_are_not_offered_to_the_model_again() {
         names(available_tool_definitions(
             &settings,
             &tool_settings,
+            false,
             &budget
         )),
         vec![
@@ -478,6 +482,7 @@ fn exhausted_tools_are_not_offered_to_the_model_again() {
         names(available_tool_definitions(
             &settings,
             &tool_settings,
+            false,
             &budget
         )),
         vec!["fetch_webpage", "search_locoryn_conversations"]
@@ -487,9 +492,56 @@ fn exhausted_tools_are_not_offered_to_the_model_again() {
         names(available_tool_definitions(
             &settings,
             &tool_settings,
+            false,
             &budget
         )),
         vec!["search_locoryn_conversations"]
+    );
+}
+
+#[test]
+fn code_check_tool_requires_both_consent_switches() {
+    let settings = WebSearchSettings::default();
+    let budget = ToolBudget::new(&settings);
+    let names = |definitions: serde_json::Value| {
+        definitions
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|definition| definition["function"]["name"].as_str().map(str::to_string))
+            .collect::<Vec<_>>()
+    };
+    let tools = crate::tools::ToolSettings {
+        web_search: false,
+        fetch_webpage: false,
+        conversation_search: false,
+        code_checking: true,
+        ..crate::tools::ToolSettings::default()
+    };
+
+    assert!(
+        names(available_tool_definitions(
+            &settings, &tools, false, &budget
+        ))
+        .is_empty()
+    );
+    assert_eq!(
+        names(available_tool_definitions(&settings, &tools, true, &budget)),
+        vec!["check_code".to_string()]
+    );
+
+    let disabled_tools = crate::tools::ToolSettings {
+        enabled: false,
+        ..tools
+    };
+    assert!(
+        names(available_tool_definitions(
+            &settings,
+            &disabled_tools,
+            true,
+            &budget
+        ))
+        .is_empty()
     );
 }
 
@@ -630,6 +682,7 @@ fn ollama_inference_does_not_use_the_external_web_timeout() {
         cancel: Arc::new(AtomicBool::new(false)),
         chat_storage_dir: None,
         tool_settings: crate::tools::ToolSettings::default(),
+        code_checking_enabled: false,
     };
 
     let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -803,6 +856,7 @@ fn tool_round_limit_forces_final_synthesis_without_losing_progress() {
         cancel: Arc::new(AtomicBool::new(false)),
         chat_storage_dir: None,
         tool_settings: crate::tools::ToolSettings::default(),
+        code_checking_enabled: false,
     };
 
     let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -898,6 +952,7 @@ fn empty_limit_synthesis_gets_a_clean_no_tools_recovery() {
         cancel: Arc::new(AtomicBool::new(false)),
         chat_storage_dir: None,
         tool_settings: crate::tools::ToolSettings::default(),
+        code_checking_enabled: false,
     };
 
     let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -1069,6 +1124,7 @@ fn follow_up_research_rejects_one_broad_search_and_cross_references_sources() {
         cancel: Arc::new(AtomicBool::new(false)),
         chat_storage_dir: None,
         tool_settings: crate::tools::ToolSettings::default(),
+        code_checking_enabled: false,
     };
 
     let runtime = tokio::runtime::Runtime::new().unwrap();
