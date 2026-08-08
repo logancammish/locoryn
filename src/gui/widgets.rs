@@ -159,9 +159,9 @@ pub(super) fn composer_image_previews<'a>(images: &[ChatImage]) -> Element<'a, M
 }
 
 pub(super) fn copy_code_button<'a>(
-    code: String,
     copied: bool,
     language: Language,
+    message: Message,
 ) -> Element<'a, Message> {
     let label = tr(language, if copied { "Copied ✓" } else { "Copy code" });
 
@@ -174,7 +174,7 @@ pub(super) fn copy_code_button<'a>(
                 button_visual(panel_soft(), border_soft(), text_muted(), status)
             }
         })
-        .on_press(Message::CopyPressed(code))
+        .on_press(message)
         .into()
 }
 
@@ -504,6 +504,7 @@ pub(super) fn web_search_activity_visible(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn markdown_with_code_copy<'a>(
     items: &'a [markdown::Item],
+    code_copy_scope: CodeCopyScope,
     text_size: f32,
     font_family: FontFamily,
     copied_text: Option<&String>,
@@ -512,6 +513,12 @@ pub(super) fn markdown_with_code_copy<'a>(
     markdown_images: &'a std::collections::HashMap<String, MarkdownImageState>,
     motion: f32,
 ) -> Element<'a, Message> {
+    // Iced's Markdown code renderer syntax-highlights on the UI thread. Keep
+    // that pleasant presentation for normal snippets, but cap the work for
+    // unusually large generated blocks so a response cannot stall the window.
+    const MAX_HIGHLIGHTED_CODE_BYTES: usize = 12 * 1024;
+    const MAX_CODE_PREVIEW_BYTES: usize = 24 * 1024;
+
     let mut settings = iced::widget::markdown::Settings::with_text_size(
         text_size,
         if is_dark_mode() {
@@ -523,6 +530,8 @@ pub(super) fn markdown_with_code_copy<'a>(
     settings.style.font = chat_font(font_family);
 
     let mut children: Vec<Element<'a, Message>> = Vec::new();
+    let mut code_block_index = 0;
+    let mut highlighted_code_bytes = 0_usize;
 
     for item in items.iter() {
         if let markdown::Item::Image { url, .. } = item {
@@ -582,14 +591,49 @@ pub(super) fn markdown_with_code_copy<'a>(
             continue;
         }
 
-        children.push(selectable_markdown(std::iter::once(item), settings).map(|_| Message::None));
-
         if let markdown::Item::CodeBlock {
             language: code_language,
             code,
             ..
         } = item
         {
+            let use_plain_preview = code.len() > MAX_HIGHLIGHTED_CODE_BYTES
+                || highlighted_code_bytes.saturating_add(code.len()) > MAX_HIGHLIGHTED_CODE_BYTES;
+            if use_plain_preview {
+                let mut preview_end = code.len().min(MAX_CODE_PREVIEW_BYTES);
+                while !code.is_char_boundary(preview_end) {
+                    preview_end -= 1;
+                }
+                let preview = if preview_end == code.len() {
+                    code.clone()
+                } else {
+                    format!(
+                        "{}\n\n… The rest of this large snippet is omitted from the preview. Copy code to get the complete snippet.",
+                        &code[..preview_end]
+                    )
+                };
+                children.push(
+                    container(
+                        widget::scrollable(
+                            widget::text(preview)
+                                .size(text_size - 1.0)
+                                .font(iced::Font::MONOSPACE)
+                                .wrapping(Wrapping::None),
+                        )
+                        .height(Length::Fixed(320.0)),
+                    )
+                    .padding(12)
+                    .width(Length::Fill)
+                    .style(flat_card_style)
+                    .into(),
+                );
+            } else {
+                highlighted_code_bytes += code.len();
+                children.push(
+                    selectable_markdown(std::iter::once(item), settings).map(|_| Message::None),
+                );
+            }
+
             let copied = copied_text.map(|copied| copied == code).unwrap_or(false);
             let check_button: Element<'a, Message> = code_language
                 .as_deref()
@@ -598,7 +642,11 @@ pub(super) fn markdown_with_code_copy<'a>(
                 .map(|canonical| {
                     mini_button_owned(
                         tr(language, "Check code").to_string(),
-                        Message::CheckCode(canonical.to_string(), code.clone()),
+                        Message::CheckCode(
+                            code_copy_scope,
+                            code_block_index,
+                            canonical.to_string(),
+                        ),
                     )
                 })
                 .unwrap_or_else(|| widget::column![].into());
@@ -608,10 +656,18 @@ pub(super) fn markdown_with_code_copy<'a>(
                     Space::new().width(Length::Fill),
                     check_button,
                     Space::new().width(Length::Fixed(6.0)),
-                    copy_code_button(code.clone(), copied, language),
+                    copy_code_button(
+                        copied,
+                        language,
+                        Message::CopyCode(code_copy_scope, code_block_index),
+                    ),
                 ]
                 .into(),
             );
+            code_block_index += 1;
+        } else {
+            children
+                .push(selectable_markdown(std::iter::once(item), settings).map(|_| Message::None));
         }
     }
 
@@ -695,6 +751,7 @@ pub(super) fn message_bubble<'a>(
             let body: Element<'a, Message> = if let Some(parsed) = parsed_markdown {
                 markdown_with_code_copy(
                     parsed,
+                    CodeCopyScope::ChatMessage(index),
                     text_size,
                     font_family,
                     copied_text,
@@ -818,7 +875,10 @@ pub(super) fn message_bubble<'a>(
                     widget::row![
                         widget::text(model_name).size(12).color(accent_2()),
                         Space::new().width(Length::Fill),
-                        if *web_search_used {
+                        // Older chats may have recorded this flag whenever the tool loop
+                        // ran, including for local-only tools. A source is the evidence that
+                        // a response genuinely relied on the web.
+                        if *web_search_used && !sources.is_empty() {
                             container(widget::text(tr(language, "WEB")).size(10).color(success()))
                                 .padding([4, 7])
                                 .style(chip_style(success()))
@@ -826,10 +886,7 @@ pub(super) fn message_bubble<'a>(
                             container(widget::text("")).padding(0)
                         },
                         Space::new().width(Length::Fixed(6.0)),
-                        mini_button(
-                            tr(language, "Copy response"),
-                            Message::CopyPressed(text.clone())
-                        ),
+                        mini_button(tr(language, "Copy response"), Message::CopyResponse(index)),
                     ],
                     Space::new().height(Length::Fixed(7.0)),
                     reasoning,

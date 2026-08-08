@@ -14,8 +14,9 @@ use std::{
 };
 
 use crate::{
-    AppUpdateState, ChatImage, Correspondence, FontFamily, GUIState, Language, MarkdownImageState,
-    Message, Program, SettingsFeedbackTarget, ThinkingLevel, split_thinking_text,
+    AppUpdateState, ChatImage, CodeCopyScope, Correspondence, FontFamily, GUIState, Language,
+    MarkdownImageState, Message, Program, SettingsFeedbackTarget, ThinkingLevel,
+    split_thinking_text,
     tools::web_search::{WebSearchState, WebSource},
 };
 
@@ -443,6 +444,7 @@ impl Program {
                             live_reasoning,
                             markdown_with_code_copy(
                                 &active_prompt.parsed_markdown,
+                                CodeCopyScope::ActiveResponse,
                                 user_information.text_size,
                                 user_information.font_family,
                                 copied_text.as_ref(),
@@ -1647,6 +1649,7 @@ impl Program {
                         Space::new().height(Length::Fixed(8.0)),
                         markdown_with_code_copy(
                             markdown,
+                            CodeCopyScope::VisionResponse,
                             self.user_information.text_size,
                             self.user_information.font_family,
                             self.last_copied_text.as_ref(),

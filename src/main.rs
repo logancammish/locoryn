@@ -45,6 +45,11 @@ const TICK_MS: u64 = 200;
 /// animation speed.
 const UI_FRAME_MS: u64 = 16;
 const LIVE_RENDER_MS: u128 = 16;
+/// Re-parsing a growing Markdown document becomes expensive once it includes
+/// a large code block. Keep the UI responsive by publishing those snapshots
+/// less frequently; the final complete snapshot is still always sent.
+const LARGE_LIVE_RENDER_BYTES: usize = 12 * 1024;
+const LARGE_LIVE_RENDER_MS: u128 = 500;
 const MAX_MARKDOWN_IMAGE_BYTES: usize = 12 * 1024 * 1024;
 const MAX_MARKDOWN_IMAGE_PIXELS: u64 = 32_000_000;
 const SETTINGS_SAVE_DEBOUNCE_MS: u64 = 450;
@@ -139,6 +144,16 @@ struct ModelCapabilities {
     vision: bool,
 }
 
+/// Identifies the Markdown collection that owns a code block. Passing this
+/// small handle through a button avoids cloning a potentially multi-megabyte
+/// snippet whenever Iced rebuilds the view.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum CodeCopyScope {
+    ChatMessage(usize),
+    ActiveResponse,
+    VisionResponse,
+}
+
 #[derive(Debug, Clone)]
 enum Message {
     ChangeBatchTokens(i32),
@@ -209,7 +224,8 @@ enum Message {
     WindowResized(Size),
     FrameTick,
     Tick,
-    CopyPressed(String),
+    CopyResponse(usize),
+    CopyCode(CodeCopyScope, usize),
     ToggleThinking(usize),
     ToggleSources(usize),
     UpdateTextSize(f32),
@@ -226,7 +242,7 @@ enum Message {
     EditContextTokens(String),
     ApplyContextTokens,
     ToggleCodeChecking,
-    CheckCode(String, String),
+    CheckCode(CodeCopyScope, usize, String),
     CodeChecked(Result<String, String>),
     DismissCodeCheckResult,
     ToggleDynamicDate,
@@ -1948,6 +1964,59 @@ impl Program {
         }
     }
 
+    fn code_block_text(items: &[markdown::Item], code_block_index: usize) -> Option<String> {
+        items
+            .iter()
+            .filter_map(|item| match item {
+                markdown::Item::CodeBlock { code, .. } => Some(code.clone()),
+                _ => None,
+            })
+            .nth(code_block_index)
+    }
+
+    fn copy_text(&mut self, input: Option<String>) -> Task<Message> {
+        let Some(input) = input.filter(|input| !input.trim().is_empty()) else {
+            self.set_debug_message(DebugMessage {
+                message: "Nothing to copy yet.".to_string(),
+                is_error: true,
+            });
+            return Task::none();
+        };
+
+        self.last_copied_text = Some(input.clone());
+        self.last_copied_at = Some(Instant::now());
+        self.set_debug_message(DebugMessage {
+            message: "Copied to clipboard.".to_string(),
+            is_error: false,
+        });
+        clipboard::write::<Message>(input)
+    }
+
+    fn code_block_for_scope(
+        &self,
+        scope: CodeCopyScope,
+        code_block_index: usize,
+    ) -> Option<String> {
+        match scope {
+            CodeCopyScope::ChatMessage(message_index) => self
+                .chat_markdown_cache
+                .get(message_index)
+                .and_then(|items| Self::code_block_text(items, code_block_index)),
+            CodeCopyScope::ActiveResponse => self
+                .active_prompts
+                .get(&self.current_chat_id)
+                .and_then(|job| Self::code_block_text(&job.parsed_markdown, code_block_index)),
+            CodeCopyScope::VisionResponse => self
+                .vision_responses
+                .get(&self.current_chat_id)
+                .and_then(|response| Self::code_block_text(&response.markdown, code_block_index)),
+        }
+    }
+
+    fn copy_code_block(&mut self, scope: CodeCopyScope, code_block_index: usize) -> Task<Message> {
+        self.copy_text(self.code_block_for_scope(scope, code_block_index))
+    }
+
     fn apply_response_metadata(
         chat: &mut CurrentChat,
         response_start_index: usize,
@@ -2106,15 +2175,17 @@ impl Program {
 
                 total_tokens += 1;
 
+                let elapsed_ms = last_render_time.elapsed().as_millis();
+                if buffer.len() >= LARGE_LIVE_RENDER_BYTES && elapsed_ms < LARGE_LIVE_RENDER_MS {
+                    continue;
+                }
                 if fast_streaming {
                     // "Fast" remains visually immediate without reparsing the
                     // entire growing answer more than roughly once per frame.
-                    if last_render_time.elapsed().as_millis() < LIVE_RENDER_MS {
+                    if elapsed_ms < LIVE_RENDER_MS {
                         continue;
                     }
-                } else if total_tokens < batch_tokens
-                    && last_render_time.elapsed().as_millis() < 250
-                {
+                } else if total_tokens < batch_tokens && elapsed_ms < 250 {
                     continue;
                 }
 
@@ -2336,6 +2407,10 @@ impl Program {
 
                     match result {
                         Ok(result) => {
+                            // Sources are the durable evidence that this response actually
+                            // used a web tool. The tool loop can also run local tools (such as
+                            // Past Chats or code checking), which must not earn a WEB badge.
+                            let web_search_used = !result.sources.is_empty();
                             let complete_response = if result.thinking.trim().is_empty() {
                                 result.answer
                             } else {
@@ -2378,7 +2453,7 @@ impl Program {
                                     thinking_seconds: None,
                                     tokens_per_second: None,
                                     sources: result.sources,
-                                    web_search_used: true,
+                                    web_search_used,
                                 },
                             );
                         }
@@ -2408,7 +2483,7 @@ impl Program {
                                     thinking_seconds: None,
                                     tokens_per_second: None,
                                     sources: Vec::new(),
-                                    web_search_used: true,
+                                    web_search_used: false,
                                 },
                             );
                         }
@@ -3680,7 +3755,7 @@ impl Program {
                 Task::none()
             }
 
-            Message::CheckCode(language, code) => {
+            Message::CheckCode(scope, code_block_index, language) => {
                 if !self.code_checking_enabled {
                     self.code_check_result = Some(DebugMessage {
                         message:
@@ -3690,6 +3765,13 @@ impl Program {
                     });
                     return Task::none();
                 }
+                let Some(code) = self.code_block_for_scope(scope, code_block_index) else {
+                    self.code_check_result = Some(DebugMessage {
+                        message: "That code snippet is no longer available.".into(),
+                        is_error: true,
+                    });
+                    return Task::none();
+                };
                 self.code_check_result = Some(DebugMessage {
                     message: format!("Checking {language} code…"),
                     is_error: false,
@@ -4063,25 +4145,22 @@ impl Program {
 
             Message::ListPrompt => open_url("https://ollama.com/search".to_string()),
 
-            Message::CopyPressed(input) => {
-                if input.trim().is_empty() {
-                    self.set_debug_message(DebugMessage {
-                        message: "Nothing to copy yet.".to_string(),
-                        is_error: true,
+            Message::CopyResponse(message_index) => {
+                let input = self
+                    .chat_messages_cache
+                    .get(message_index)
+                    .and_then(|message| {
+                        if let Correspondence::Bot { text, .. } = message {
+                            Some(text.clone())
+                        } else {
+                            None
+                        }
                     });
+                self.copy_text(input)
+            }
 
-                    Task::none()
-                } else {
-                    self.last_copied_text = Some(input.clone());
-                    self.last_copied_at = Some(Instant::now());
-
-                    self.set_debug_message(DebugMessage {
-                        message: "Copied to clipboard.".to_string(),
-                        is_error: false,
-                    });
-
-                    clipboard::write::<Message>(input)
-                }
+            Message::CopyCode(scope, code_block_index) => {
+                self.copy_code_block(scope, code_block_index)
             }
 
             Message::KeyPressed(keyboard::Key::Character(key), modifiers)
@@ -5002,6 +5081,22 @@ mod tests {
         assert_eq!(canonical_code_language("c++"), Some("C++"));
         assert_eq!(canonical_code_language("csharp"), Some("C#"));
         assert_eq!(canonical_code_language("javascript"), None);
+    }
+
+    #[test]
+    fn code_copy_lookup_reads_only_the_requested_block() {
+        let items =
+            parse_markdown_items("```rust\nlet first = 1;\n```\n\n```python\nsecond = 2\n```");
+
+        assert_eq!(
+            Program::code_block_text(&items, 0).as_deref(),
+            Some("let first = 1;\n")
+        );
+        assert_eq!(
+            Program::code_block_text(&items, 1).as_deref(),
+            Some("second = 2\n")
+        );
+        assert_eq!(Program::code_block_text(&items, 2), None);
     }
 
     #[test]
