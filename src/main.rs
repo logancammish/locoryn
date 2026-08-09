@@ -2619,6 +2619,8 @@ impl Program {
                             // used a web tool. The tool loop can also run local tools (such as
                             // Past Chats or code checking), which must not earn a WEB badge.
                             let web_search_used = !result.sources.is_empty();
+                            *tokens_per_second_stats.lock().unwrap() =
+                                tokens_per_second(result.eval_count, result.eval_duration);
                             let complete_response = if result.thinking.trim().is_empty() {
                                 result.answer
                             } else {

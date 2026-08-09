@@ -34,6 +34,17 @@ pub struct ToolLoopResponse {
     pub answer: String,
     pub thinking: String,
     pub sources: Vec<WebSource>,
+    /// Evaluation statistics from the final Ollama response. These are kept
+    /// separate from chat messages so they are never sent back to Ollama in a
+    /// later tool-loop turn.
+    pub eval_count: Option<u64>,
+    pub eval_duration: Option<u64>,
+}
+
+struct StreamedChatMessage {
+    message: serde_json::Value,
+    eval_count: Option<u64>,
+    eval_duration: Option<u64>,
 }
 
 pub(super) fn user_message(prompt: String, images: Vec<String>) -> serde_json::Value {
@@ -535,13 +546,30 @@ pub(super) fn apply_chat_stream_line(
         .unwrap_or(false))
 }
 
-pub(super) async fn read_ollama_chat_stream(
+fn final_evaluation_statistics(line: &str) -> Result<(Option<u64>, Option<u64>), WebSearchError> {
+    let line = line.trim();
+    let line = line.strip_prefix("data:").map(str::trim).unwrap_or(line);
+    if line == "[DONE]" {
+        return Ok((None, None));
+    }
+    let value = serde_json::from_str::<serde_json::Value>(line).map_err(|error| {
+        WebSearchError::OllamaUnavailable(format!("invalid streamed chat response: {error}"))
+    })?;
+    Ok((
+        value.get("eval_count").and_then(serde_json::Value::as_u64),
+        value
+            .get("eval_duration")
+            .and_then(serde_json::Value::as_u64),
+    ))
+}
+
+async fn read_ollama_chat_stream(
     mut response: reqwest::Response,
     previous_thinking: &str,
     previous_answer: &str,
     progress_sender: &tokio::sync::watch::Sender<ToolLoopProgress>,
     cancel: &AtomicBool,
-) -> Result<serde_json::Value, WebSearchError> {
+) -> Result<StreamedChatMessage, WebSearchError> {
     let mut bytes = Vec::<u8>::new();
     let mut role = "assistant".to_string();
     let mut content = String::new();
@@ -549,6 +577,8 @@ pub(super) async fn read_ollama_chat_stream(
     let mut tool_calls = Vec::<serde_json::Value>::new();
     let mut saw_message = false;
     let mut done = false;
+    let mut eval_count = None;
+    let mut eval_duration = None;
     let progress = StreamProgressContext {
         previous_thinking,
         previous_answer,
@@ -581,6 +611,7 @@ pub(super) async fn read_ollama_chat_stream(
                 &progress,
             )?;
             if done {
+                (eval_count, eval_duration) = final_evaluation_statistics(&line)?;
                 break;
             }
         }
@@ -591,7 +622,7 @@ pub(super) async fn read_ollama_chat_stream(
         if !line.trim().is_empty() {
             saw_message = true;
         }
-        apply_chat_stream_line(
+        done = apply_chat_stream_line(
             &line,
             &mut role,
             &mut content,
@@ -599,6 +630,9 @@ pub(super) async fn read_ollama_chat_stream(
             &mut tool_calls,
             &progress,
         )?;
+        if done {
+            (eval_count, eval_duration) = final_evaluation_statistics(&line)?;
+        }
     }
     if !saw_message {
         return Err(WebSearchError::OllamaUnavailable(
@@ -616,10 +650,14 @@ pub(super) async fn read_ollama_chat_stream(
     if !tool_calls.is_empty() {
         message["tool_calls"] = serde_json::Value::Array(tool_calls);
     }
-    Ok(message)
+    Ok(StreamedChatMessage {
+        message,
+        eval_count,
+        eval_duration,
+    })
 }
 
-pub(super) async fn request_ollama_chat_message(
+async fn request_ollama_chat_message(
     client: &Client,
     request: &ToolLoopRequest,
     messages: &[serde_json::Value],
@@ -627,7 +665,7 @@ pub(super) async fn request_ollama_chat_message(
     thinking_override: Option<&serde_json::Value>,
     previous_thinking: &str,
     previous_answer: &str,
-) -> Result<serde_json::Value, WebSearchError> {
+) -> Result<StreamedChatMessage, WebSearchError> {
     let mut body = serde_json::json!({
         "model": request.model,
         "messages": messages,
@@ -811,7 +849,7 @@ pub(super) async fn finish_after_tool_limit(
         accumulated_answer.clone(),
     );
 
-    let message = request_ollama_chat_message(
+    let streamed = request_ollama_chat_message(
         client,
         request,
         messages,
@@ -821,6 +859,7 @@ pub(super) async fn finish_after_tool_limit(
         &accumulated_answer,
     )
     .await?;
+    let message = streamed.message;
     let mut thinking = message
         .get("thinking")
         .and_then(serde_json::Value::as_str)
@@ -851,6 +890,7 @@ pub(super) async fn finish_after_tool_limit(
         )
         .await?;
         if let Some(recovery_thinking) = recovery
+            .message
             .get("thinking")
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
@@ -858,7 +898,8 @@ pub(super) async fn finish_after_tool_limit(
         {
             thinking = combined_thinking(&thinking, recovery_thinking);
         }
-        recovery
+        let answer = recovery
+            .message
             .get("content")
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
@@ -869,7 +910,16 @@ pub(super) async fn finish_after_tool_limit(
                     "the model returned no visible answer after two no-tools synthesis attempts"
                         .to_string(),
                 )
-            })?
+            })?;
+        set_progress(&request.progress_sender, thinking.clone(), answer.clone());
+        set_state(&request.state_sender, WebSearchState::Completed);
+        return Ok(ToolLoopResponse {
+            answer,
+            thinking,
+            sources,
+            eval_count: recovery.eval_count,
+            eval_duration: recovery.eval_duration,
+        });
     } else {
         answer
     };
@@ -879,6 +929,8 @@ pub(super) async fn finish_after_tool_limit(
         answer,
         thinking,
         sources,
+        eval_count: streamed.eval_count,
+        eval_duration: streamed.eval_duration,
     })
 }
 
@@ -980,7 +1032,7 @@ pub async fn run_tool_loop(request: ToolLoopRequest) -> Result<ToolLoopResponse,
             )
             .await;
         }
-        let message = request_ollama_chat_message(
+        let streamed = request_ollama_chat_message(
             &client,
             &request,
             &messages,
@@ -990,6 +1042,7 @@ pub async fn run_tool_loop(request: ToolLoopRequest) -> Result<ToolLoopResponse,
             &accumulated_answer,
         )
         .await?;
+        let message = streamed.message;
         if let Some(thinking) = message
             .get("thinking")
             .and_then(serde_json::Value::as_str)
@@ -1051,6 +1104,8 @@ pub async fn run_tool_loop(request: ToolLoopRequest) -> Result<ToolLoopResponse,
                 answer: current_answer,
                 thinking: accumulated_thinking,
                 sources,
+                eval_count: streamed.eval_count,
+                eval_duration: streamed.eval_duration,
             });
         }
         if let Some(current_answer) = message

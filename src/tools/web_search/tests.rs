@@ -649,7 +649,7 @@ fn ollama_inference_does_not_use_the_external_web_timeout() {
         let body = concat!(
             "{\"message\":{\"role\":\"assistant\",\"thinking\":\"checked \",\"content\":\"\"},\"done\":false}\n",
             "{\"message\":{\"role\":\"assistant\",\"thinking\":\"the evidence\",\"content\":\"do\"},\"done\":false}\n",
-            "{\"message\":{\"role\":\"assistant\",\"content\":\"ne\"},\"done\":true}\n"
+            "{\"message\":{\"role\":\"assistant\",\"content\":\"ne\"},\"done\":true,\"eval_count\":120,\"eval_duration\":2000000000}\n"
         );
         write!(
                 stream,
@@ -689,6 +689,8 @@ fn ollama_inference_does_not_use_the_external_web_timeout() {
     let result = runtime.block_on(run_tool_loop(request)).unwrap();
     assert_eq!(result.answer, "done");
     assert_eq!(result.thinking, "checked the evidence");
+    assert_eq!(result.eval_count, Some(120));
+    assert_eq!(result.eval_duration, Some(2_000_000_000));
     assert_eq!(progress_receiver.borrow_and_update().answer, "done");
     server.join().unwrap();
 }
