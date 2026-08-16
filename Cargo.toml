@@ -16,7 +16,7 @@ url = "2.5.8"
 encoding_rs = "0.8.35"
 serde_json = "1.0.151"
 serde = { version = "1.0.229", features = ["derive"] }
-rustrict = "0.7.38"
+rustrict = "0.7.39"
 chrono = "0.4.45"
 image = "0.25.10"
 iced_selection = { version = "0.5", features = ["markdown"] }
