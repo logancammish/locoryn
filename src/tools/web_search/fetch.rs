@@ -202,11 +202,10 @@ pub(super) fn retry_after_delay(response: &reqwest::Response, attempt: usize) ->
         .clamp(Duration::from_millis(500), Duration::from_secs(15))
 }
 
-/// Ollama Cloud and proxied Ollama endpoints can briefly answer with a rate
-/// limit or gateway error while a model is loading. Retry only transient
-/// statuses, respect Retry-After when supplied, and keep every wait cancellable
-/// so Stop remains immediate.
-pub(crate) async fn send_ollama_request_with_retry(
+/// Local and proxied inference endpoints can briefly answer with a rate limit
+/// or gateway error while a model is loading. Retry only transient statuses,
+/// respect Retry-After, and keep every wait cancellable so Stop remains immediate.
+pub(crate) async fn send_inference_request_with_retry(
     client: &Client,
     url: &str,
     body: &serde_json::Value,

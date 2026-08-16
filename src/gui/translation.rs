@@ -10,14 +10,23 @@ pub(super) fn tr(language: Language, english: &'static str) -> &'static str {
         "A polished desktop interface for chatting with local Ollama models." => {
             "Una interfaz de escritorio cuidada para conversar con modelos locales de Ollama."
         }
+        "A polished desktop interface for chatting with local AI models." => {
+            "Una interfaz de escritorio cuidada para conversar con modelos locales de IA."
+        }
         "HELP" => "AYUDA",
         "Chat locally" => "Chat local",
         "Select one of your installed Ollama models, type a prompt, and press Enter to generate a response." => {
             "Selecciona uno de tus modelos de Ollama instalados, escribe un mensaje y pulsa Intro para generar una respuesta."
         }
+        "Select a model from your inference backend, type a prompt, and press Enter to generate a response." => {
+            "Selecciona un modelo de tu motor de inferencia, escribe un mensaje y pulsa Intro para generar una respuesta."
+        }
         "Manage models" => "Gestionar modelos",
         "Use Advanced Settings to install models by name, change the Ollama address, or tune response rendering." => {
             "Usa la configuración avanzada para instalar modelos por nombre, cambiar la dirección de Ollama o ajustar la presentación de respuestas."
+        }
+        "Use Advanced Settings to choose Ollama or OpenVINO, configure its address, and tune response rendering." => {
+            "Usa la configuración avanzada para elegir Ollama u OpenVINO, configurar su dirección y ajustar la presentación de respuestas."
         }
         "System prompts" => "Indicaciones del sistema",
         "System prompts let you switch the assistant's behaviour or personality without rewriting your prompt each time." => {
@@ -46,12 +55,20 @@ pub(super) fn tr(language: Language, english: &'static str) -> &'static str {
             "Elige un modelo, escribe un mensaje y empieza a conversar localmente."
         }
         "Ollama was not detected." => "No se detectó Ollama.",
+        "OpenVINO Model Server was not detected." => "No se detectó OpenVINO Model Server.",
         "Install Ollama or check your connection settings." => {
             "Instala Ollama o revisa la configuración de conexión."
         }
+        "Start OpenVINO Model Server or check your connection settings." => {
+            "Inicia OpenVINO Model Server o revisa la configuración de conexión."
+        }
         "Install Ollama" => "Instalar Ollama",
+        "Open setup guide" => "Abrir guía de configuración",
         "No models were detected." => "No se detectaron modelos.",
         "Install a model before sending prompts." => "Instala un modelo antes de enviar mensajes.",
+        "Deploy a text-generation model in OpenVINO Model Server first." => {
+            "Despliega primero un modelo de generación de texto en OpenVINO Model Server."
+        }
         "Find models" => "Buscar modelos",
         "＋ New chat" => "＋ Nuevo chat",
         "Leave temporary chat" => "Salir del chat temporal",
@@ -209,6 +226,9 @@ pub(super) fn tr(language: Language, english: &'static str) -> &'static str {
         "Choose the Ollama model used for new responses." => {
             "Elige el modelo de Ollama para las respuestas nuevas."
         }
+        "Choose the backend model used for new responses." => {
+            "Elige el modelo del motor para las respuestas nuevas."
+        }
         "Thinking effort" => "Nivel de razonamiento",
         "Choose how much reasoning the model should use." => {
             "Elige cuánto razonamiento debe usar el modelo."
@@ -277,6 +297,10 @@ pub(super) fn tr(language: Language, english: &'static str) -> &'static str {
         "Enter an Ollama model name and press Enter." => {
             "Escribe el nombre de un modelo de Ollama y pulsa Intro."
         }
+        "Manage OpenVINO models" => "Gestionar modelos de OpenVINO",
+        "Models are deployed by OpenVINO Model Server. Locoryn discovers every model exposed by its /v3/models endpoint." => {
+            "Los modelos se despliegan mediante OpenVINO Model Server. Locoryn detecta todos los modelos expuestos por su endpoint /v3/models."
+        }
         "Batch tokens" => "Lote de tokens",
         "Tokens per visual update when fast streaming is off. Higher values reduce rendering work." => {
             "Tokens por actualización visual cuando la transmisión rápida está desactivada. Los valores altos reducen el trabajo de presentación."
@@ -288,8 +312,8 @@ pub(super) fn tr(language: Language, english: &'static str) -> &'static str {
         "Show tokens per second at bottom of message" => {
             "Mostrar tokens por segundo al final del mensaje"
         }
-        "Display the generation speed under each assistant reply. Measured from the model's own statistics, independent of token batching." => {
-            "Muestra la velocidad de generación bajo cada respuesta. Se mide con las estadísticas del propio modelo, sin verse afectada por el lote de tokens."
+        "Display the generation speed under each assistant reply. Uses backend timing when available and otherwise times the generated stream." => {
+            "Muestra la velocidad de generación bajo cada respuesta. Usa la medición del servidor cuando está disponible y, en caso contrario, mide el flujo generado."
         }
         "Content filtering" => "Filtro de contenido",
         "Censor offensive, profane, sexual, and severely inappropriate words with # characters." => {
@@ -300,8 +324,16 @@ pub(super) fn tr(language: Language, english: &'static str) -> &'static str {
             "Muestra la descripción informativa cuando se inicia la app. Puedes abrirla en cualquier momento desde el botón de información."
         }
         "Ollama address" => "Dirección de Ollama",
+        "OpenVINO Model Server address" => "Dirección de OpenVINO Model Server",
+        "Inference backend" => "Motor de inferencia",
+        "Choose the server API used for model discovery and generation. The client does not depend on local hardware architecture." => {
+            "Elige la API del servidor para descubrir modelos y generar respuestas. El cliente no depende de la arquitectura del equipo local."
+        }
         "Choose HTTP or HTTPS, then enter the hostname or IP address and port used to connect to Ollama." => {
             "Elige HTTP o HTTPS e introduce el nombre de host o la dirección IP y el puerto para conectar con Ollama."
+        }
+        "Choose HTTP or HTTPS, then enter the hostname or IP address and port used by the selected inference server." => {
+            "Elige HTTP o HTTPS e introduce el nombre de host o la dirección IP y el puerto del servidor de inferencia seleccionado."
         }
         "Fastest · no extra reasoning" => "Más rápido · sin razonamiento adicional",
         "Use this model's standard reasoning mode" => {

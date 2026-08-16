@@ -20,6 +20,8 @@
   ·
   <a href="https://ollama.com/search">Browse Ollama models</a>
   ·
+  <a href="#openvino-setup-linux-and-windows">OpenVINO setup</a>
+  ·
   <a href="#build-from-source">Build from source</a>
 </p>
 
@@ -40,23 +42,30 @@ reach.
 
 It is a particularly good fit if you want to:
 
-- connect to Ollama on another computer instead of only `localhost`;
+- choose between Ollama and OpenVINO Model Server (OVMS) without changing the
+  chat workflow;
+- connect to an inference server on another computer instead of only
+  `localhost`;
 - choose exactly how much supported models reason;
 - separate disposable chats from conversations worth keeping;
 - inspect images with vision-capable models;
 - give tool-capable models optional, source-linked access to the web; or
-- tune generation and rendering without building your own Ollama client.
+- tune generation and rendering without building your own inference client.
 
 ## Quick start
 
-### 1. Install Ollama
+### 1. Start an inference backend
 
-Download and start [Ollama](https://ollama.com/download). On Linux, make sure its
-service is running:
+Ollama remains the default. Download and start
+[Ollama](https://ollama.com/download). On Linux, make sure its service is
+running:
 
 ```bash
 ollama serve
 ```
+
+To use Intel CPU, GPU, or NPU acceleration instead, start OpenVINO Model Server
+and follow the [Linux and Windows OpenVINO setup](#openvino-setup-linux-and-windows).
 
 ### 2. Install Locoryn
 
@@ -80,9 +89,87 @@ ollama serve
 ### 3. Open Locoryn
 
 Launch Locoryn from the Start menu or application launcher. The model picker
-lists models available from the connected Ollama server. If it is empty, open
-**Settings → Advanced settings**, enter a model name under **Install model**,
-and press Enter. Find model names in the [Ollama library](https://ollama.com/search).
+lists models available from the selected server.
+
+- For Ollama, an empty list can be filled from **Settings → Advanced settings →
+  Install model**. Find model names in the
+  [Ollama library](https://ollama.com/search).
+- For OpenVINO, open **Settings → Advanced settings**, select **OpenVINO**, and
+  enter the OVMS address. The default is `http://127.0.0.1:8000`. Models are
+  deployed on OVMS and discovered automatically through `/v3/models`.
+
+## OpenVINO setup (Linux and Windows)
+
+Locoryn's OpenVINO integration is machine agnostic. The desktop app does not
+link to the OpenVINO runtime, inspect the local processor, or assume an
+instruction-set architecture. It uses OVMS's OpenAI-compatible HTTP endpoints:
+`/v3/models` for discovery and `/v3/chat/completions` for generation. OVMS may
+run on the same machine or any reachable Linux or Windows host; that server
+chooses the Intel CPU, GPU, NPU, or heterogeneous device configuration.
+
+The following small CPU example is based on the
+[official OVMS serving guide](https://docs.openvino.ai/2026/model-server/ovms_docs_serving_model.html).
+It is a portable starting point; choose a larger compatible model when the
+server has enough memory.
+
+First download the example model on the server host:
+
+```bash
+python -m pip install huggingface_hub
+hf download OpenVINO/Qwen3-0.6B-int4-ov --local-dir Qwen3-0.6B-int4-ov
+```
+
+### Linux server
+
+With Docker installed, run:
+
+```bash
+docker run -d --rm \
+  -v "$PWD/Qwen3-0.6B-int4-ov:/model" \
+  -p 8000:8000 \
+  openvino/model_server:latest \
+  --model_path /model \
+  --model_name qwen3-0.6 \
+  --rest_port 8000 \
+  --task text_generation \
+  --target_device CPU \
+  --tool_parser hermes3 \
+  --reasoning_parser qwen3
+```
+
+### Windows server
+
+Install and unpack the current OVMS Windows binary package using the
+[official bare-metal guide](https://docs.openvino.ai/2026/model-server/ovms_docs_deploying_server_baremetal.html),
+run its `setupvars.bat` or `setupvars.ps1` in each new shell, then run:
+
+```powershell
+ovms.exe --model_path Qwen3-0.6B-int4-ov `
+  --model_name qwen3-0.6 `
+  --rest_port 8000 `
+  --task text_generation `
+  --target_device CPU `
+  --tool_parser hermes3 `
+  --reasoning_parser qwen3
+```
+
+Check that the server exposes the model:
+
+```bash
+curl http://127.0.0.1:8000/v3/models
+```
+
+Then select **OpenVINO** under **Settings → Advanced settings → Inference
+backend**. Keep the default address for a server on the same machine, or enter
+the reachable hostname/IP and REST port of a remote OVMS host. Locoryn retains
+separate addresses for Ollama and OpenVINO when you switch between them.
+
+The CPU example works without accelerator-specific container mappings. To use
+an Intel GPU or NPU, follow the
+[OVMS accelerator guide](https://docs.openvino.ai/2026/model-server/ovms_docs_target_devices.html)
+for the required driver, `--target_device`, image, and host-device settings.
+Reasoning, tool calls, and image input also depend on the deployed model and its
+OVMS parser/pipeline configuration.
 
 ### Prefer the simpler classic version?
 
@@ -103,7 +190,7 @@ Most controls live in **Settings**:
 
 | Setting | What it controls |
 |---|---|
-| Model and reasoning | Active Ollama model and its supported thinking effort |
+| Model and reasoning | Active backend model and its supported thinking effort |
 | Response and context limits | Output cap and how much conversation the model can hold |
 | Temperature | Predictability versus variety |
 | System prompt | Active instruction/personality profile |
@@ -114,9 +201,9 @@ Most controls live in **Settings**:
 | Model conversation context | Whether earlier messages are included in the next request |
 | Interface | Language, theme, text size, and chat font |
 
-**Advanced settings** contains model installation, custom Ollama connection
-details, streaming/batching controls, content filtering, and the local code
-checker.
+**Advanced settings** contains backend selection, separate Ollama and OpenVINO
+connection details, Ollama model installation, streaming/batching controls,
+content filtering, and the local code checker.
 
 ### Local code checking
 
@@ -148,30 +235,33 @@ instruction, then restart the application:
 Keep the file as valid JSON. When using an installed build, edit the copy in the
 `config` folder beside the executable.
 
-### Remote Ollama servers
+### Remote inference servers
 
-Open **Settings → Advanced settings → Ollama address** and choose the protocol,
-then enter the server hostname or IP address and port. The protocol field
-accepts `http`, `http://`, `https`, or `https://`; the default local endpoint
-is `http://127.0.0.1:11434`. HTTP and HTTPS are supported. Other URL schemes
-are rejected because Ollama’s API and the client transport use HTTP(S).
+Open **Settings → Advanced settings**, select the backend, and choose the
+protocol before entering its hostname/IP and port. The protocol field accepts
+`http`, `http://`, `https`, or `https://`. The defaults are
+`http://127.0.0.1:11434` for Ollama and `http://127.0.0.1:8000` for OpenVINO.
+Each backend keeps its own saved address. Other URL schemes are rejected
+because both APIs use HTTP(S).
 
-Use `https://` for any Ollama server reached over a network you do not fully
+Use `https://` for any inference server reached over a network you do not fully
 control. Plain `http://` does not encrypt requests: prompts, model replies,
 attached images, and API responses can be read or changed by someone able to
 observe the connection. HTTP also does not authenticate the server, so it is
 vulnerable to impersonation on an untrusted network.
 
-Do not expose Ollama directly to the public internet. Put a remote service
-behind a correctly configured TLS reverse proxy or VPN, restrict who can reach
-it, and use a certificate trusted by the computer running Locoryn. Locoryn does
-not add authentication headers to Ollama requests; if your deployment requires
-authentication, enforce it at the network or proxy layer.
+Do not expose Ollama or OVMS directly to the public internet. Put a remote
+service behind a correctly configured TLS reverse proxy or VPN, restrict who
+can reach it, and use a certificate trusted by the computer running Locoryn.
+Locoryn does not currently add authentication headers to inference requests;
+if your deployment requires authentication, enforce access at the network or
+proxy layer and allow Locoryn only from trusted clients.
 
 ### Web search setup
 
-Web search requires a model that supports Ollama tool calling and an API key
-from one of the supported providers:
+Web search requires a model that supports tool calling and an API key from one
+of the supported providers. For OpenVINO, deploy the model with the appropriate
+OVMS tool parser:
 
 | Provider | Status | Preferred environment variable |
 |---|---|---|
@@ -206,12 +296,12 @@ saved key in the local `settings.json`; API keys are redacted from diagnostics
 and are not printed in logs.
 
 > [!IMPORTANT]
-> Ordinary chats are sent only to the Ollama address you configure. When web
-> search is enabled, search queries are also sent to the selected search
-> provider and the app fetches public webpages selected by the model. A remote
-> Ollama server receives the conversation data needed to answer your request.
-> The update manager sends a version-check request to GitHub at startup and when
-> you select **Check now**.
+> Ordinary chats are sent only to the inference backend address you configure.
+> When web search is enabled, search queries are also sent to the selected
+> search provider and the app fetches public webpages selected by the model. A
+> remote inference server receives the conversation data needed to answer your
+> request. The update manager sends a version-check request to GitHub at startup
+> and when you select **Check now**.
 
 ## Local data and privacy
 
@@ -239,9 +329,11 @@ User preferences use `settings.json` in the application-data folder.
 | Linux x86_64 and ARM64 | Officially supported; desktop installer available |
 | macOS Apple Silicon (ARM64) | Build supported; automated native build available |
 
-Ollama itself must be installed and running locally or reachable at the custom
-address you configure. Rust and Cargo are required only when building from
-source.
+Either Ollama or an OpenVINO Model Server must be running locally or reachable
+at its configured address. OVMS itself has its own supported host and hardware
+requirements; the Locoryn client does not need to run on the same operating
+system or processor architecture as the inference server. Rust and Cargo are
+required only when building Locoryn from source.
 
 ## Build from source
 
@@ -294,10 +386,14 @@ cargo build
 - [Download the latest release](https://github.com/logancammish/locoryn/releases/latest)
 - [Browse Ollama models](https://ollama.com/search)
 - [Install Ollama](https://ollama.com/download)
+- [Deploy OpenVINO Model Server](https://docs.openvino.ai/2026/model-server/ovms_docs_deploying_server.html)
+- [Browse OpenVINO LLM models](https://huggingface.co/collections/OpenVINO/llm)
+- [Read the OVMS OpenAI-compatible API reference](https://docs.openvino.ai/2026/model-server/ovms_docs_rest_api_chat.html)
 - [View the source repository](https://github.com/logancammish/locoryn)
 - [Read the GNU GPL v3 license](LICENSE)
 
 ---
 
 Locoryn is an independent open-source project built for people who want a
-configurable, local-first desktop experience around Ollama.
+configurable, local-first desktop experience with their preferred inference
+backend.

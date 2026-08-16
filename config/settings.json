@@ -3,6 +3,19 @@
     "dark_mode": true,
     "text_size": 15.0,
     "font_family": "sans-serif",
+    "inference_backend": "ollama",
+    "backend_connections": {
+        "ollama": {
+            "protocol": "http",
+            "ip": "127.0.0.1",
+            "port": "11434"
+        },
+        "openvino": {
+            "protocol": "http",
+            "ip": "127.0.0.1",
+            "port": "8000"
+        }
+    },
     "current_chat_history_enabled": true,
     "info_popup": true,
     "fast_streaming": true,

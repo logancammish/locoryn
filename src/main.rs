@@ -15,23 +15,25 @@ use chrono::Local;
 use iced::{Element, Point, Size, Subscription, Task, Theme, clipboard, keyboard, mouse, time};
 use iced_widget::markdown;
 use ollama_rs::Ollama;
-use ollama_rs::generation::completion::GenerationResponse;
-use ollama_rs::generation::completion::request::GenerationRequest;
-use ollama_rs::models::ModelOptions;
 use rustrict::{Censor, Type};
 mod app;
 mod gui;
+mod inference;
 mod tools;
 
 use crate::app::{
     AppState, Channels, ChatImage, Correspondence, CurrentChat, DebugMessage,
-    DynamicPromptSettings, FontFamily, HostLocation, LEGACY_PROFILE_ID, LEGACY_PROFILE_NAME,
-    Language, Profile, ProfileRegistry, Prompt, SavedChat, SystemPrompt, ThinkingLevel,
-    UserInformation,
+    DynamicPromptSettings, FontFamily, LEGACY_PROFILE_ID, LEGACY_PROFILE_NAME, Language, Profile,
+    ProfileRegistry, Prompt, SavedChat, SystemPrompt, ThinkingLevel, UserInformation,
+};
+use crate::inference::{
+    BackendConnections, EncodedImage, InferenceBackend, OpenAiStreamLine,
+    api_url as backend_api_url, base_url as backend_base_url, decode_openai_stream_line,
+    direct_request_body, model_names,
 };
 use crate::tools::web_search::{
     ToolLoopProgress, ToolLoopRequest, WebSearchProviderKind, WebSearchSettings, WebSearchState,
-    create_search_provider, run_tool_loop, send_ollama_request_with_retry, validate_public_url,
+    create_search_provider, run_tool_loop, send_inference_request_with_retry, validate_public_url,
 };
 
 /// Tick points:
@@ -269,6 +271,7 @@ enum Message {
     ToggleInfoPopupSetting,
     WipeChatHistory,
     ToggleAdvancedSettings,
+    BackendChange(InferenceBackend),
     ChangeProtocol(String),
     ChangeIp(String),
     ChangePort(String),
@@ -284,9 +287,9 @@ struct ActivePrompt {
     web_search_state_receiver: crossbeam_channel::Receiver<WebSearchState>,
     web_progress_receiver: tokio::sync::watch::Receiver<ToolLoopProgress>,
     cancel: Arc<AtomicBool>,
-    /// Generation speed captured from Ollama's final stream statistics. The
-    /// async response loop writes it; the finish handler reads it when
-    /// stamping the reply. Independent of render batching.
+    /// Generation speed captured from final stream statistics. OpenVINO's
+    /// missing duration is measured locally. The async response loop writes
+    /// it; the finish handler reads it when stamping the reply.
     tokens_per_second: Arc<Mutex<Option<f32>>>,
     model_name: String,
     started_at: Instant,
@@ -303,6 +306,15 @@ struct LiveRender {
     text: String,
     thinking: String,
     markdown: Vec<markdown::Item>,
+}
+
+#[derive(Clone, Debug)]
+struct GenerationChunk {
+    response: String,
+    done: bool,
+    thinking: Option<String>,
+    eval_count: Option<u64>,
+    eval_duration: Option<u64>,
 }
 
 struct TemporaryChatSession {
@@ -644,9 +656,9 @@ fn conversation_context_prompt(context: &str, user_name: &str, prompt: &str) -> 
     )
 }
 
-/// Tokens per second straight from Ollama's final stream statistics. Because
-/// the numbers come from the server's own counters they are unaffected by the
-/// client-side render batching that groups tokens while streaming.
+/// Tokens per second from the final stream statistics. Ollama supplies both
+/// values directly; OpenVINO supplies the token count and Locoryn measures the
+/// generation interval. Neither path is affected by visual token batching.
 fn tokens_per_second(eval_count: Option<u64>, eval_duration: Option<u64>) -> Option<f32> {
     let tokens = eval_count? as f64;
     let duration_ns = eval_duration? as f64;
@@ -1177,14 +1189,65 @@ pub(crate) fn cached_character_count(text: &str) -> usize {
 
 fn decode_generation_line(
     input: &str,
-) -> Result<(GenerationResponse, Option<String>), serde_json::Error> {
+) -> Result<(GenerationChunk, Option<String>), serde_json::Error> {
     let value = serde_json::from_str::<serde_json::Value>(input)?;
     let done_reason = value
         .get("done_reason")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
-    let response = serde_json::from_value(value)?;
-    Ok((response, done_reason))
+    Ok((
+        GenerationChunk {
+            response: value
+                .get("response")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            done: value
+                .get("done")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            thinking: value
+                .get("thinking")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            eval_count: value.get("eval_count").and_then(serde_json::Value::as_u64),
+            eval_duration: value
+                .get("eval_duration")
+                .and_then(serde_json::Value::as_u64),
+        },
+        done_reason,
+    ))
+}
+
+enum InferenceStreamLine {
+    Chunk(GenerationChunk, Option<String>),
+    Done,
+    Ignore,
+}
+
+fn decode_inference_stream_line(
+    backend: InferenceBackend,
+    input: &str,
+) -> Result<InferenceStreamLine, String> {
+    match backend {
+        InferenceBackend::Ollama => decode_generation_line(input)
+            .map(|(chunk, reason)| InferenceStreamLine::Chunk(chunk, reason))
+            .map_err(|error| error.to_string()),
+        InferenceBackend::OpenVino => match decode_openai_stream_line(input)? {
+            OpenAiStreamLine::Done => Ok(InferenceStreamLine::Done),
+            OpenAiStreamLine::Ignore => Ok(InferenceStreamLine::Ignore),
+            OpenAiStreamLine::Event(event) => Ok(InferenceStreamLine::Chunk(
+                GenerationChunk {
+                    response: event.content,
+                    done: event.finish_reason.is_some(),
+                    thinking: (!event.reasoning.is_empty()).then_some(event.reasoning),
+                    eval_count: event.completion_tokens,
+                    eval_duration: None,
+                },
+                event.finish_reason,
+            )),
+        },
+    }
 }
 
 fn disabled_web_tool_message(input: &str) -> Option<&'static str> {
@@ -1358,47 +1421,6 @@ async fn load_markdown_image(url: String) -> Result<iced::widget::image::Handle,
     };
 
     decoded_image_handle(&bytes)
-}
-
-fn ollama_base_url(location: &HostLocation) -> Result<url::Url, String> {
-    let scheme = location
-        .protocol
-        .trim()
-        .trim_end_matches("://")
-        .to_ascii_lowercase();
-    if !matches!(scheme.as_str(), "http" | "https") {
-        return Err("Ollama protocol must be http or https.".to_string());
-    }
-
-    let host = location.ip.trim();
-    if host.is_empty() {
-        return Err("Enter an Ollama hostname or IP address.".to_string());
-    }
-    let host = if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]")
-    } else {
-        host.to_string()
-    };
-    let port = location
-        .port
-        .trim()
-        .parse::<u16>()
-        .map_err(|_| "Ollama port must be a number from 1 to 65535.".to_string())?;
-    if port == 0 {
-        return Err("Ollama port must be a number from 1 to 65535.".to_string());
-    }
-
-    let mut url = url::Url::parse(&format!("{scheme}://{host}"))
-        .map_err(|_| "Enter a valid Ollama hostname or IP address.".to_string())?;
-    url.set_port(Some(port))
-        .map_err(|_| "Enter a valid Ollama hostname or IP address.".to_string())?;
-    Ok(url)
-}
-
-fn ollama_api_url(location: &HostLocation, path: &str) -> Result<String, String> {
-    let mut url = ollama_base_url(location)?;
-    url.set_path(path);
-    Ok(url.into())
 }
 
 fn load_chat_image(path: &Path) -> Result<ChatImage, String> {
@@ -1862,6 +1884,16 @@ impl Program {
             Ok(value) => self.persist_setting_value("ui_layout", value),
             Err(error) => self.set_debug_message(DebugMessage {
                 message: format!("Could not save UI layout: {error}"),
+                is_error: true,
+            }),
+        }
+    }
+
+    fn persist_backend_connections(&mut self) {
+        match serde_json::to_value(&self.user_information.backend_connections) {
+            Ok(value) => self.persist_setting_value("backend_connections", value),
+            Err(error) => self.set_debug_message(DebugMessage {
+                message: format!("Could not save inference connections: {error}"),
                 is_error: true,
             }),
         }
@@ -2352,8 +2384,8 @@ impl Program {
         let render_receiver_for_renderer = render_receiver.clone();
 
         // Backpressure bounds token memory if preparing a large response is
-        // temporarily slower than Ollama's stream.
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<GenerationResponse>(64);
+        // temporarily slower than the inference stream.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<GenerationChunk>(64);
         let batch_tokens = self.batch_tokens;
         let fast_streaming = self.fast_streaming;
         std::thread::spawn(move || {
@@ -2446,18 +2478,10 @@ impl Program {
             return Task::none();
         }
 
-        let ollama_chat_url = match ollama_api_url(&self.user_information.ip_address, "/api/chat") {
-            Ok(url) => url,
-            Err(message) => {
-                self.set_debug_message(DebugMessage {
-                    message,
-                    is_error: true,
-                });
-                return Task::none();
-            }
-        };
-        let ollama_generate_url =
-            match ollama_api_url(&self.user_information.ip_address, "/api/generate") {
+        let backend = self.user_information.backend;
+        let backend_location = self.user_information.active_connection().clone();
+        let backend_chat_url =
+            match backend_api_url(backend, &backend_location, backend.chat_path()) {
                 Ok(url) => url,
                 Err(message) => {
                     self.set_debug_message(DebugMessage {
@@ -2467,11 +2491,35 @@ impl Program {
                     return Task::none();
                 }
             };
+        let backend_generate_url = match backend_api_url(
+            backend,
+            &backend_location,
+            match backend {
+                InferenceBackend::Ollama => "/api/generate",
+                InferenceBackend::OpenVino => backend.chat_path(),
+            },
+        ) {
+            Ok(url) => url,
+            Err(message) => {
+                self.set_debug_message(DebugMessage {
+                    message,
+                    is_error: true,
+                });
+                return Task::none();
+            }
+        };
 
         // Clone the attachment into the request/chat first. The composer owns its
         // copy until the submission has been accepted, avoiding a transient blank
         // preview while the async request is being prepared.
         let attached_images = self.pending_images.clone();
+        let encoded_images = attached_images
+            .iter()
+            .map(|image| EncodedImage {
+                mime_type: image.mime_type.clone(),
+                data: BASE64.encode(&image.bytes),
+            })
+            .collect::<Vec<_>>();
         let had_image = !attached_images.is_empty();
         let filtering = self.app_state.filtering;
         let code_checking_enabled = self.code_checking_enabled;
@@ -2495,9 +2543,9 @@ impl Program {
         let (web_search_state_sender, web_search_state_receiver) = crossbeam_channel::unbounded();
         let (web_progress_sender, web_progress_receiver) =
             tokio::sync::watch::channel(ToolLoopProgress::default());
-        // Generation speed captured from Ollama's own statistics so the value
-        // is unaffected by render batching. Written by the async loop, read
-        // when the response is finalized.
+        // Generation speed is captured independently of render batching. For
+        // OpenVINO, the stream timer fills in the duration paired with its
+        // completion-token count.
         let tokens_per_second_stats = Arc::new(Mutex::new(None::<f32>));
         let chat_id = self.current_chat_id.clone();
         let completion_chat_id = chat_id.clone();
@@ -2590,17 +2638,15 @@ impl Program {
                         None
                     };
                     let result = run_tool_loop(ToolLoopRequest {
-                        ollama_url: ollama_chat_url,
+                        backend,
+                        chat_url: backend_chat_url,
                         model: user_info.model.clone().unwrap(),
                         prompt: to_send_prompt,
                         system_prompt: system_prompt.clone(),
                         temperature: user_info.temperature / 10.0,
                         context_tokens: user_info.context_tokens,
                         max_response_tokens: user_info.max_response_tokens,
-                        images: attached_images
-                            .iter()
-                            .map(|image| BASE64.encode(&image.bytes))
-                            .collect(),
+                        images: encoded_images.clone(),
                         thinking: user_info.thinking_level.api_value(),
                         settings: web_search_settings.clone(),
                         tool_settings: tool_settings.clone(),
@@ -2632,20 +2678,12 @@ impl Program {
                                 complete_response
                             };
                             let _ = tx
-                                .send(GenerationResponse {
-                                    model: user_info.model.clone().unwrap(),
-                                    created_at: Local::now().to_rfc3339(),
+                                .send(GenerationChunk {
                                     response: complete_response.clone(),
                                     done: true,
-                                    context: None,
-                                    total_duration: None,
-                                    load_duration: None,
-                                    prompt_eval_count: None,
-                                    prompt_eval_duration: None,
                                     eval_count: None,
                                     eval_duration: None,
                                     thinking: None,
-                                    logprobs: None,
                                 })
                                 .await;
                             if user_info.current_chat_history_enabled {
@@ -2702,56 +2740,23 @@ impl Program {
                     return;
                 }
 
-                let request: GenerationRequest<'_> =
-                    GenerationRequest::new(user_info.model.clone().unwrap(), to_send_prompt)
-                        .options(
-                            ModelOptions::default()
-                                .temperature(user_info.temperature / 10.0)
-                                .num_predict(user_info.max_response_tokens as i32)
-                                .num_ctx(user_info.context_tokens as u64),
-                        )
-                        .system(system_prompt.clone());
-
                 println!("System prompt: {}", system_prompt.clone());
-
-                let mut request_body = match serde_json::to_value(request) {
-                    Ok(body) => body,
-                    Err(e) => {
-                        eprintln!("Error serializing request: {}", e);
-                        let message = "Could not prepare the Ollama request".to_string();
-                        send_chat_notice(
-                            &chat_notice_sender,
-                            &notice_chat_id,
-                            DebugMessage {
-                                message: message.clone(),
-                                is_error: true,
-                            },
-                        );
-                        append_failed_response(
-                            &user_info.chat_history,
-                            user_info.model.clone(),
-                            message,
-                        );
-                        user_info.chat_history.lock().unwrap().bot_responding = false;
-                        return;
-                    }
-                };
-
-                request_body["stream"] = serde_json::Value::Bool(true);
-                request_body["think"] = user_info.thinking_level.api_value();
-                if !attached_images.is_empty() {
-                    request_body["images"] = serde_json::json!(
-                        attached_images
-                            .iter()
-                            .map(|image| BASE64.encode(&image.bytes))
-                            .collect::<Vec<_>>()
-                    );
-                }
+                let request_body = direct_request_body(
+                    backend,
+                    user_info.model.as_deref().unwrap_or_default(),
+                    to_send_prompt,
+                    system_prompt,
+                    &encoded_images,
+                    &user_info.thinking_level.api_value(),
+                    user_info.temperature / 10.0,
+                    user_info.context_tokens,
+                    user_info.max_response_tokens,
+                );
 
                 let client = reqwest::Client::new();
-                let response = send_ollama_request_with_retry(
+                let response = send_inference_request_with_retry(
                     &client,
-                    &ollama_generate_url,
+                    &backend_generate_url,
                     &request_body,
                     &cancel,
                 )
@@ -2776,7 +2781,10 @@ impl Program {
                                 return;
                             }
                         };
-                        let message = format!("Ollama rejected the request ({status}): {detail}");
+                        let message = format!(
+                            "{} rejected the request ({status}): {detail}",
+                            backend.server_name()
+                        );
                         send_chat_notice(
                             &chat_notice_sender,
                             &notice_chat_id,
@@ -2794,7 +2802,7 @@ impl Program {
                         return;
                     }
                     Err(error) => {
-                        let message = format!("Could not reach Ollama: {error}");
+                        let message = format!("Could not reach {}: {error}", backend.server_name());
                         send_chat_notice(
                             &chat_notice_sender,
                             &notice_chat_id,
@@ -2815,6 +2823,12 @@ impl Program {
 
                 let mut final_response: Vec<String> = vec![];
                 let mut stream_buffer = String::new();
+                // OpenVINO's OpenAI-compatible stream reports completion-token
+                // usage but not an evaluation duration. Time from the first
+                // generated content through the usage terminator so the same
+                // footer can still be populated for that backend.
+                let mut openvino_generation_started_at = None::<Instant>;
+                let mut openvino_completion_tokens = None::<u64>;
 
                 'response_stream: while !cancel.load(Ordering::Relaxed) {
                     let chunk_result = tokio::select! {
@@ -2831,8 +2845,8 @@ impl Program {
                         if line.is_empty() {
                             continue;
                         }
-                        match decode_generation_line(&line) {
-                            Ok((mut token, done_reason)) => {
+                        match decode_inference_stream_line(backend, &line) {
+                            Ok(InferenceStreamLine::Chunk(mut token, done_reason)) => {
                                 if token.done
                                     && (done_reason.as_deref() == Some("length")
                                         || token.eval_count.unwrap_or_default()
@@ -2854,9 +2868,8 @@ impl Program {
                                     print!("{}", token.response);
                                 }
 
-                                // Ollama may return reasoning in its dedicated `thinking`
-                                // field, while some models emit literal <think> tags.
-                                // Normalize both forms so the renderer can disclose them alike.
+                                // Both backends can return reasoning separately, while
+                                // some models emit literal <think> tags. Normalize both.
                                 if let Some(thinking) = token.thinking.take()
                                     && !thinking.is_empty()
                                 {
@@ -2864,18 +2877,27 @@ impl Program {
                                         format!("<think>{thinking}</think>{}", token.response);
                                 }
 
+                                if backend == InferenceBackend::OpenVino {
+                                    if openvino_generation_started_at.is_none()
+                                        && !token.response.is_empty()
+                                    {
+                                        openvino_generation_started_at = Some(Instant::now());
+                                    }
+                                    if let Some(completion_tokens) = token.eval_count {
+                                        openvino_completion_tokens = Some(completion_tokens);
+                                    }
+                                }
+
                                 final_response.push(token.response.clone());
 
-                                // Capture the generation speed from Ollama's own
-                                // statistics on the final message, so the value is
-                                // independent of client-side render batching.
+                                // Capture backend timing statistics when supplied.
                                 if token.done {
                                     *tokens_per_second_stats.lock().unwrap() =
                                         tokens_per_second(token.eval_count, token.eval_duration);
                                 }
 
-                                // Filtering must see the complete response: Ollama can
-                                // split a profane word across arbitrary stream tokens.
+                                // Filtering must see the complete response because a
+                                // backend can split a word across arbitrary chunks.
                                 if !filtering {
                                     let sent = tokio::select! {
                                         result = tx.send(token) => result.is_ok(),
@@ -2886,14 +2908,18 @@ impl Program {
                                     }
                                 }
                             }
+                            Ok(InferenceStreamLine::Done) => break 'response_stream,
+                            Ok(InferenceStreamLine::Ignore) => {}
                             Err(e) => {
-                                eprintln!("Error decoding Ollama response: {}", e);
+                                eprintln!("Error decoding {} response: {e}", backend.server_name());
                                 send_chat_notice(
                                     &chat_notice_sender,
                                     &notice_chat_id,
                                     DebugMessage {
-                                        message: "Ollama returned an invalid streaming response"
-                                            .to_string(),
+                                        message: format!(
+                                            "{} returned an invalid streaming response",
+                                            backend.server_name()
+                                        ),
                                         is_error: true,
                                     },
                                 );
@@ -2903,13 +2929,11 @@ impl Program {
                 }
 
                 let was_cancelled = cancel.load(Ordering::Relaxed);
-                // NDJSON normally ends with a newline, but accepting a final
-                // unterminated object avoids dropping the last token from
-                // proxies or older Ollama builds.
+                // Accept a final unterminated event from proxies or older servers.
                 let trailing_line = stream_buffer.trim();
                 if !was_cancelled && !trailing_line.is_empty() {
-                    match decode_generation_line(trailing_line) {
-                        Ok((mut token, done_reason)) => {
+                    match decode_inference_stream_line(backend, trailing_line) {
+                        Ok(InferenceStreamLine::Chunk(mut token, done_reason)) => {
                             if token.done
                                 && (done_reason.as_deref() == Some("length")
                                     || token.eval_count.unwrap_or_default()
@@ -2933,6 +2957,16 @@ impl Program {
                                 token.response =
                                     format!("<think>{thinking}</think>{}", token.response);
                             }
+                            if backend == InferenceBackend::OpenVino {
+                                if openvino_generation_started_at.is_none()
+                                    && !token.response.is_empty()
+                                {
+                                    openvino_generation_started_at = Some(Instant::now());
+                                }
+                                if let Some(completion_tokens) = token.eval_count {
+                                    openvino_completion_tokens = Some(completion_tokens);
+                                }
+                            }
                             final_response.push(token.response.clone());
                             if token.done {
                                 *tokens_per_second_stats.lock().unwrap() =
@@ -2942,14 +2976,20 @@ impl Program {
                                 let _ = tx.send(token).await;
                             }
                         }
+                        Ok(InferenceStreamLine::Done | InferenceStreamLine::Ignore) => {}
                         Err(error) => {
-                            eprintln!("Error decoding final Ollama response: {error}");
+                            eprintln!(
+                                "Error decoding final {} response: {error}",
+                                backend.server_name()
+                            );
                             send_chat_notice(
                                 &chat_notice_sender,
                                 &notice_chat_id,
                                 DebugMessage {
-                                    message: "Ollama returned an invalid final streaming response"
-                                        .to_string(),
+                                    message: format!(
+                                        "{} returned an invalid final streaming response",
+                                        backend.server_name()
+                                    ),
                                     is_error: true,
                                 },
                             );
@@ -2957,9 +2997,19 @@ impl Program {
                     }
                 }
 
+                if backend == InferenceBackend::OpenVino
+                    && let Some(started_at) = openvino_generation_started_at
+                {
+                    let duration_ns = u64::try_from(started_at.elapsed().as_nanos()).ok();
+                    *tokens_per_second_stats.lock().unwrap() =
+                        tokens_per_second(openvino_completion_tokens, duration_ns);
+                }
+
                 if !was_cancelled && final_response.concat().trim().is_empty() {
-                    let message =
-                        "Ollama ended the response without returning content.".to_string();
+                    let message = format!(
+                        "{} ended the response without returning content.",
+                        backend.server_name()
+                    );
                     send_chat_notice(
                         &chat_notice_sender,
                         &notice_chat_id,
@@ -2981,20 +3031,12 @@ impl Program {
                     let filtered = censor_text(&final_response.join(""));
                     final_response = vec![filtered.clone()];
                     let _ = tx
-                        .send(GenerationResponse {
-                            model: user_info.model.clone().unwrap_or_default(),
-                            created_at: Local::now().to_rfc3339(),
+                        .send(GenerationChunk {
                             response: filtered,
                             done: true,
-                            context: None,
-                            total_duration: None,
-                            load_duration: None,
-                            prompt_eval_count: None,
-                            prompt_eval_duration: None,
                             eval_count: None,
                             eval_duration: None,
                             thinking: None,
-                            logprobs: None,
                         })
                         .await;
                 }
@@ -3020,7 +3062,7 @@ impl Program {
                         .unwrap()
                         .push_message(Correspondence::Bot {
                             text: partial_response,
-                            model: None,
+                            model: user_info.model.clone(),
                             thinking_seconds: None,
                             tokens_per_second: None,
                             sources: Vec::new(),
@@ -3645,18 +3687,22 @@ impl Program {
                 self.current_tick += 1;
 
                 if self.current_tick == VERSION_TICK {
-                    let ollama_state = Arc::clone(&self.app_state.ollama_state);
+                    let backend_state = Arc::clone(&self.app_state.backend_state);
                     let user_info = self.user_information.clone();
 
                     return Task::perform(
                         async move {
-                            println!("Checking Ollama version...");
-                            let ip = user_info.ip_address;
-                            let url = match ollama_api_url(&ip, "/api/version") {
+                            let backend = user_info.backend;
+                            println!("Checking {} status...", backend.server_name());
+                            let url = match backend_api_url(
+                                backend,
+                                user_info.active_connection(),
+                                backend.status_path(),
+                            ) {
                                 Ok(url) => url,
                                 Err(error) => {
-                                    println!("Invalid Ollama address: {error}");
-                                    *ollama_state.lock().unwrap() = "Offline".to_string();
+                                    println!("Invalid {} address: {error}", backend.server_name());
+                                    *backend_state.lock().unwrap() = "Offline".to_string();
                                     return;
                                 }
                             };
@@ -3666,38 +3712,41 @@ impl Program {
                                     println!("API responded with status: {}", response.status());
 
                                     if response.status().is_success() {
-                                        match response.json::<serde_json::Value>().await {
-                                            Ok(json) => {
-                                                if let Some(version) =
-                                                    json.get("version").and_then(|v| v.as_str())
-                                                {
-                                                    *ollama_state.lock().unwrap() =
-                                                        format!("Online (v{})", version);
-                                                } else {
-                                                    *ollama_state.lock().unwrap() =
-                                                        "Online (unknown version)".to_string();
-                                                }
+                                        *backend_state.lock().unwrap() = match backend {
+                                            InferenceBackend::Ollama => response
+                                                .json::<serde_json::Value>()
+                                                .await
+                                                .ok()
+                                                .and_then(|json| {
+                                                    json.get("version")
+                                                        .and_then(serde_json::Value::as_str)
+                                                        .map(|version| {
+                                                            format!("Online (v{version})")
+                                                        })
+                                                })
+                                                .unwrap_or_else(|| {
+                                                    "Online (unknown version)".to_string()
+                                                }),
+                                            InferenceBackend::OpenVino => {
+                                                "Online (OpenVINO)".to_string()
                                             }
-                                            Err(_) => {
-                                                *ollama_state.lock().unwrap() =
-                                                    "Online (version parse error)".to_string();
-                                            }
-                                        }
+                                        };
                                     } else {
-                                        *ollama_state.lock().unwrap() = "Offline".to_string();
+                                        *backend_state.lock().unwrap() = "Offline".to_string();
                                     }
                                 }
                                 Err(err) => {
                                     println!("Failed to reach API: {}", err);
-                                    *ollama_state.lock().unwrap() = "Offline".to_string();
+                                    *backend_state.lock().unwrap() = "Offline".to_string();
                                 }
                             }
                         },
                         Message::AsyncResult,
                     );
                 } else if self.current_tick == BOT_LIST_TICK {
-                    let ip = self.user_information.ip_address.clone();
-                    let base_url = match ollama_base_url(&ip) {
+                    let backend = self.user_information.backend;
+                    let location = self.user_information.active_connection().clone();
+                    let url = match backend_api_url(backend, &location, backend.models_path()) {
                         Ok(url) => url,
                         Err(message) => {
                             self.set_debug_message(DebugMessage {
@@ -3707,31 +3756,37 @@ impl Program {
                             return Task::none();
                         }
                     };
-                    let ollama = Ollama::builder().url(base_url).build();
                     let bots_list = Arc::clone(&self.app_state.bots_list);
                     let channels = self.channels.clone();
 
                     return Task::perform(
                         async move {
-                            match ollama.list_local_models().await {
-                                Ok(bots) => {
-                                    let mut names =
-                                        bots.into_iter().map(|bot| bot.name).collect::<Vec<_>>();
-                                    names.sort();
-                                    names.dedup();
+                            let result = match reqwest::get(url).await {
+                                Ok(response) if response.status().is_success() => response
+                                    .json::<serde_json::Value>()
+                                    .await
+                                    .map_err(|error| error.to_string())
+                                    .and_then(|json| model_names(backend, &json)),
+                                Ok(response) => Err(format!("HTTP {}", response.status())),
+                                Err(error) => Err(error.to_string()),
+                            };
+                            match result {
+                                Ok(names) => {
                                     *bots_list.lock().unwrap() = names;
                                 }
                                 Err(e) => {
                                     Channels::send_request_to_channel(
                                         Arc::clone(&channels.debug_channel),
                                         DebugMessage {
-                                            message: "Error occurred while listing bots"
-                                                .to_string(),
+                                            message: format!(
+                                                "Could not list models from {}",
+                                                backend.server_name()
+                                            ),
                                             is_error: true,
                                         },
                                     );
                                     bots_list.lock().unwrap().clear();
-                                    println!("Error: {:?}", e);
+                                    println!("Error listing models: {e}");
                                 }
                             }
                         },
@@ -3756,18 +3811,42 @@ impl Program {
             }
 
             Message::ChangeIp(ip) => {
-                self.user_information.ip_address.ip = ip;
+                self.user_information.active_connection_mut().ip = ip;
+                self.persist_backend_connections();
                 Task::none()
             }
 
             Message::ChangeProtocol(protocol) => {
-                self.user_information.ip_address.protocol =
+                self.user_information.active_connection_mut().protocol =
                     protocol.trim().trim_end_matches("://").to_ascii_lowercase();
+                self.persist_backend_connections();
                 Task::none()
             }
 
             Message::ChangePort(port) => {
-                self.user_information.ip_address.port = port;
+                self.user_information.active_connection_mut().port = port;
+                self.persist_backend_connections();
+                Task::none()
+            }
+
+            Message::BackendChange(backend) => {
+                if backend == self.user_information.backend {
+                    return Task::none();
+                }
+                self.user_information.backend = backend;
+                self.user_information.model = None;
+                self.user_information.thinking_level = ThinkingLevel::Off;
+                self.user_information.thinking_levels = vec![ThinkingLevel::Off];
+                self.user_information.thinking_supported = None;
+                self.user_information.vision_supported = None;
+                self.app_state.bots_list.lock().unwrap().clear();
+                *self.app_state.backend_state.lock().unwrap() = "Offline".to_string();
+                self.current_tick = VERSION_TICK - 1;
+                self.persist_setting_value(
+                    "inference_backend",
+                    serde_json::to_value(backend)
+                        .unwrap_or_else(|_| serde_json::Value::String("ollama".to_string())),
+                );
                 Task::none()
             }
 
@@ -4255,7 +4334,18 @@ impl Program {
             }
 
             Message::InstallModel(model_install) => {
-                let base_url = match ollama_base_url(&self.user_information.ip_address) {
+                if !self.user_information.backend.supports_model_install() {
+                    self.set_debug_message(DebugMessage {
+                        message: "Deploy OpenVINO models with OpenVINO Model Server, then refresh the model list here."
+                            .to_string(),
+                        is_error: false,
+                    });
+                    return Task::none();
+                }
+                let base_url = match backend_base_url(
+                    InferenceBackend::Ollama,
+                    self.user_information.active_connection(),
+                ) {
                     Ok(url) => url,
                     Err(message) => {
                         self.set_debug_message(DebugMessage {
@@ -4325,18 +4415,35 @@ impl Program {
                 // Reasoning support and accepted effort values vary by model. Do not carry an
                 // effort setting across models while capability detection is still in flight.
                 self.user_information.thinking_level = ThinkingLevel::Off;
-                let ip = self.user_information.ip_address.clone();
+                if self.user_information.backend == InferenceBackend::OpenVino {
+                    // OVMS exposes reasoning through chat-template parameters. The
+                    // exact accepted values remain model/template specific, so offer
+                    // the common controls while leaving vision capability unknown.
+                    self.user_information.thinking_levels = vec![
+                        ThinkingLevel::Off,
+                        ThinkingLevel::On,
+                        ThinkingLevel::Low,
+                        ThinkingLevel::Medium,
+                        ThinkingLevel::High,
+                    ];
+                    self.user_information.thinking_supported = Some(true);
+                    self.user_information.vision_supported = None;
+                    return Task::none();
+                }
+                let location = self.user_information.active_connection().clone();
                 Task::perform(
                     async move {
-                        let result = match ollama_api_url(&ip, "/api/show") {
-                            Ok(url) => reqwest::Client::new()
-                                .post(url)
-                                .json(&serde_json::json!({ "model": model }))
-                                .send()
-                                .await
-                                .ok(),
-                            Err(_) => None,
-                        };
+                        let result =
+                            match backend_api_url(InferenceBackend::Ollama, &location, "/api/show")
+                            {
+                                Ok(url) => reqwest::Client::new()
+                                    .post(url)
+                                    .json(&serde_json::json!({ "model": model }))
+                                    .send()
+                                    .await
+                                    .ok(),
+                                Err(_) => None,
+                            };
                         let capabilities = match result {
                             Some(response) if response.status().is_success() => response
                                 .json::<serde_json::Value>()
@@ -4351,9 +4458,16 @@ impl Program {
                 )
             }
 
-            Message::InstallationPrompt => open_url("https://ollama.com/download".to_string()),
+            Message::InstallationPrompt => {
+                open_url(self.user_information.backend.setup_url().to_string())
+            }
 
-            Message::ListPrompt => open_url("https://ollama.com/search".to_string()),
+            Message::ListPrompt => open_url(
+                self.user_information
+                    .backend
+                    .model_catalog_url()
+                    .to_string(),
+            ),
 
             Message::CopyResponse(message_index) => {
                 let input = self
@@ -4656,6 +4770,16 @@ impl Default for Program {
             Some("spanish") => Language::Spanish,
             _ => Language::English,
         };
+        let backend = settings_hmap
+            .get("inference_backend")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<InferenceBackend>(value).ok())
+            .unwrap_or_default();
+        let backend_connections = settings_hmap
+            .get("backend_connections")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<BackendConnections>(value).ok())
+            .unwrap_or_default();
         let legacy_configured_dir = settings_hmap
             .get("chat_storage_dir")
             .and_then(|value| value.as_str())
@@ -4805,6 +4929,8 @@ impl Default for Program {
             user_information: UserInformation {
                 chat_history: Arc::new(Mutex::new(current_chat)),
                 current_chat_history_enabled,
+                backend,
+                backend_connections,
                 model: None,
                 thinking_level: ThinkingLevel::Off,
                 thinking_levels: vec![ThinkingLevel::Off],
@@ -4815,11 +4941,6 @@ impl Default for Program {
                 temperature: 7.0,
                 text_size,
                 font_family,
-                ip_address: HostLocation {
-                    protocol: "http".to_string(),
-                    ip: "127.0.0.1".to_string(),
-                    port: "11434".to_string(),
-                },
                 language,
             },
             show_info_popup: info_popup,
@@ -4835,7 +4956,7 @@ impl Default for Program {
                 } else {
                     GUIState::Main
                 },
-                ollama_state: Arc::new(Mutex::new("Offline".to_string())),
+                backend_state: Arc::new(Mutex::new("Offline".to_string())),
                 bots_list: Arc::new(Mutex::new(vec![])),
             },
         }
@@ -4908,15 +5029,17 @@ mod tests {
 
     use iced_widget::markdown;
 
+    use crate::inference::{HostLocation, InferenceBackend, api_url, base_url};
+
     use super::{
-        ActivePrompt, Correspondence, CurrentChat, FontFamily, GUIState, HostLocation,
+        ActivePrompt, Correspondence, CurrentChat, FontFamily, GUIState, InferenceStreamLine,
         LEGACY_PROFILE_ID, Message, ModelCapabilities, Point, Profile, ProfileRegistry, Program,
         SavedChat, SettingsFeedbackTarget, Size, ThinkingLevel, ToolLoopProgress, UiResizeTarget,
         UserInformation, WebSearchSettings, WebSearchState, app_data_dir,
         assign_legacy_profile_ids, canonical_code_language, censor_text, chat_profile_id,
         compare_versions, conversation_context_prompt, decode_generation_line,
-        disabled_web_tool_message, ensure_legacy_profile, mask_live_code_blocks,
-        model_capabilities, normalize_code_fence_languages, ollama_api_url, ollama_base_url,
+        decode_inference_stream_line, disabled_web_tool_message, ensure_legacy_profile,
+        mask_live_code_blocks, model_capabilities, normalize_code_fence_languages,
         parse_live_markdown_items, parse_markdown_items, read_json_with_backup,
         remote_image_url_is_safe, sidecar_path, split_thinking_text, tokens_per_second,
         write_json_safely,
@@ -4984,7 +5107,7 @@ mod tests {
             port: "443".into(),
         };
         assert_eq!(
-            ollama_api_url(&https, "/api/chat").unwrap(),
+            api_url(InferenceBackend::Ollama, &https, "/api/chat").unwrap(),
             "https://ollama.example.com/api/chat"
         );
 
@@ -4994,7 +5117,7 @@ mod tests {
             port: "11434".into(),
         };
         assert_eq!(
-            ollama_base_url(&ipv6).unwrap().as_str(),
+            base_url(InferenceBackend::Ollama, &ipv6).unwrap().as_str(),
             "http://[::1]:11434/"
         );
     }
@@ -5006,14 +5129,14 @@ mod tests {
             ip: "ollama.example.com".into(),
             port: "21".into(),
         };
-        assert!(ollama_base_url(&invalid_scheme).is_err());
+        assert!(base_url(InferenceBackend::Ollama, &invalid_scheme).is_err());
 
         let invalid_port = HostLocation {
             protocol: "https".into(),
             ip: "ollama.example.com".into(),
             port: "invalid".into(),
         };
-        assert!(ollama_base_url(&invalid_port).is_err());
+        assert!(base_url(InferenceBackend::Ollama, &invalid_port).is_err());
     }
 
     #[test]
@@ -5394,6 +5517,21 @@ mod tests {
         let (response, reason) = decode_generation_line(line).unwrap();
         assert!(response.done);
         assert_eq!(reason.as_deref(), Some("length"));
+    }
+
+    #[test]
+    fn retains_openvino_usage_event_for_generation_speed() {
+        let line = r#"data: {"choices":[],"usage":{"completion_tokens":120}}"#;
+        let InferenceStreamLine::Chunk(chunk, reason) =
+            decode_inference_stream_line(InferenceBackend::OpenVino, line).unwrap()
+        else {
+            panic!("expected an OpenVINO generation chunk");
+        };
+
+        assert_eq!(chunk.eval_count, Some(120));
+        assert_eq!(chunk.eval_duration, None);
+        assert!(!chunk.done);
+        assert_eq!(reason, None);
     }
 
     #[test]

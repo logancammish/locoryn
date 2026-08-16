@@ -14,9 +14,9 @@ use std::{
 };
 
 use crate::{
-    AppUpdateState, ChatImage, CodeCopyScope, Correspondence, FontFamily, GUIState, Language,
-    MarkdownImageState, Message, Program, SettingsFeedbackTarget, ThinkingLevel,
-    cached_character_count, split_thinking_text,
+    AppUpdateState, ChatImage, CodeCopyScope, Correspondence, FontFamily, GUIState,
+    InferenceBackend, Language, MarkdownImageState, Message, Program, SettingsFeedbackTarget,
+    ThinkingLevel, cached_character_count, split_thinking_text,
     tools::web_search::{WebSearchState, WebSource},
 };
 
@@ -50,7 +50,7 @@ impl Program {
                                         .size(30)
                                         .color(text_main()),
                                     Space::new().height(Length::Fixed(6.0)),
-                                    widget::text(tr(language, "A polished desktop interface for chatting with local Ollama models."))
+                                    widget::text(tr(language, "A polished desktop interface for chatting with local AI models."))
                                         .size(14)
                                         .color(text_muted()),
                                 ]
@@ -76,13 +76,13 @@ impl Program {
                                 widget::row![
                                     help_card(
                                         tr(language, "Chat locally"),
-                                        tr(language, "Select one of your installed Ollama models, type a prompt, and press Enter to generate a response."),
+                                        tr(language, "Select a model from your inference backend, type a prompt, and press Enter to generate a response."),
                                         accent(),
                                     ),
                                     Space::new().width(Length::Fixed(12.0)),
                                     help_card(
                                         tr(language, "Manage models"),
-                                        tr(language, "Use Advanced Settings to install models by name, change the Ollama address, or tune response rendering."),
+                                        tr(language, "Use Advanced Settings to choose Ollama or OpenVINO, configure its address, and tune response rendering."),
                                         accent_2(),
                                     ),
                                 ],
@@ -149,7 +149,7 @@ impl Program {
                 let user_information = self.user_information.clone();
                 let bots_list = self.app_state.bots_list.lock().unwrap().clone();
                 let copied_text = self.last_copied_text.clone();
-                let local_ollamastate = self.app_state.ollama_state.lock().unwrap().clone();
+                let local_backend_state = self.app_state.backend_state.lock().unwrap().clone();
                 let active_prompt = self.current_active_prompt();
                 let is_processing = active_prompt.is_some();
                 let current_web_search_enabled = active_prompt
@@ -288,7 +288,7 @@ impl Program {
                     })
                     .collect();
 
-                let online = local_ollamastate.to_lowercase() != "offline";
+                let online = local_backend_state.to_lowercase() != "offline";
                 let status_color = if online { success() } else { danger() };
                 let pulse = 1.0 - (self.ui_motion * 2.0 - 1.0).abs();
                 let visible_debug = self.current_debug_message().clone();
@@ -536,20 +536,38 @@ impl Program {
                 let offline_hint: Element<Message> = if !online {
                     container(widget::row![
                         widget::column![
-                            widget::text(tr(language, "Ollama was not detected."))
-                                .size(14)
-                                .color(text_main()),
+                            widget::text(tr(
+                                language,
+                                if self.user_information.backend == InferenceBackend::Ollama {
+                                    "Ollama was not detected."
+                                } else {
+                                    "OpenVINO Model Server was not detected."
+                                }
+                            ))
+                            .size(14)
+                            .color(text_main()),
                             Space::new().height(Length::Fixed(3.0)),
                             widget::text(tr(
                                 language,
-                                "Install Ollama or check your connection settings."
+                                if self.user_information.backend == InferenceBackend::Ollama {
+                                    "Install Ollama or check your connection settings."
+                                } else {
+                                    "Start OpenVINO Model Server or check your connection settings."
+                                }
                             ))
                             .size(12)
                             .color(text_muted()),
                         ]
                         .width(Length::Fill),
                         secondary_button(
-                            tr(language, "Install Ollama"),
+                            tr(
+                                language,
+                                if self.user_information.backend == InferenceBackend::Ollama {
+                                    "Install Ollama"
+                                } else {
+                                    "Open setup guide"
+                                }
+                            ),
                             Message::InstallationPrompt
                         ),
                     ])
@@ -568,9 +586,16 @@ impl Program {
                                 .size(14)
                                 .color(text_main()),
                             Space::new().height(Length::Fixed(3.0)),
-                            widget::text(tr(language, "Install a model before sending prompts."))
-                                .size(12)
-                                .color(text_muted()),
+                            widget::text(tr(
+                                language,
+                                if self.user_information.backend == InferenceBackend::Ollama {
+                                    "Install a model before sending prompts."
+                                } else {
+                                    "Deploy a text-generation model in OpenVINO Model Server first."
+                                }
+                            ))
+                            .size(12)
+                            .color(text_muted()),
                         ]
                         .width(Length::Fill),
                         secondary_button(tr(language, "Find models"), Message::ListPrompt),
@@ -1881,7 +1906,7 @@ impl Program {
                                             self.user_information.max_response_tokens.ilog2() as f32,
                                             Message::UpdateMaxResponseTokens,
                                         )
-                                        .step(1.0),
+                                        .step(1.0_f32),
                                         Space::new().width(Length::Fixed(12.0)),
                                         iced::widget::TextInput::<Message>::new(
                                             "tokens",
@@ -1929,7 +1954,7 @@ impl Program {
                                             self.user_information.context_tokens.ilog2() as f32,
                                             Message::UpdateContextTokens,
                                         )
-                                        .step(1.0),
+                                        .step(1.0_f32),
                                         Space::new().width(Length::Fixed(12.0)),
                                         iced::widget::TextInput::<Message>::new(
                                             "tokens",
@@ -1968,7 +1993,7 @@ impl Program {
                                 widget::column![
                                     setting_label(
                                         tr(language, "Model"),
-                                        tr(language, "Choose the Ollama model used for new responses.")
+                                        tr(language, "Choose the backend model used for new responses.")
                                     ),
                                     widget::pick_list(
                                         bots_list,
@@ -2280,7 +2305,7 @@ impl Program {
                                             self.web_search_settings.result_limit as f32,
                                             Message::WebSearchResultLimitChange,
                                         )
-                                        .step(1.0),
+                                        .step(1.0_f32),
                                         Space::new().width(Length::Fixed(12.0)),
                                         feedback_value_chip(
                                             self.web_search_settings.result_limit.to_string(),
@@ -2323,7 +2348,7 @@ impl Program {
                                             self.web_search_settings.maximum_searches as f32,
                                             Message::WebSearchMaximumSearchesChange,
                                         )
-                                        .step(1.0),
+                                        .step(1.0_f32),
                                         Space::new().width(Length::Fixed(12.0)),
                                         feedback_value_chip(
                                             self.web_search_settings.maximum_searches.to_string(),
@@ -2344,7 +2369,7 @@ impl Program {
                                             self.web_search_settings.minimum_successful_searches as f32,
                                             Message::WebSearchMinimumSuccessfulSearchesChange,
                                         )
-                                        .step(1.0),
+                                        .step(1.0_f32),
                                         Space::new().width(Length::Fixed(12.0)),
                                         feedback_value_chip(
                                             self.web_search_settings.minimum_successful_searches.to_string(),
@@ -2365,7 +2390,7 @@ impl Program {
                                             self.web_search_settings.maximum_page_fetches as f32,
                                             Message::WebSearchMaximumPageFetchesChange,
                                         )
-                                        .step(1.0),
+                                        .step(1.0_f32),
                                         Space::new().width(Length::Fixed(12.0)),
                                         feedback_value_chip(
                                             self.web_search_settings.maximum_page_fetches.to_string(),
@@ -2386,7 +2411,7 @@ impl Program {
                                             self.web_search_settings.minimum_independent_pages as f32,
                                             Message::WebSearchMinimumIndependentPagesChange,
                                         )
-                                        .step(1.0),
+                                        .step(1.0_f32),
                                         Space::new().width(Length::Fixed(12.0)),
                                         feedback_value_chip(
                                             self.web_search_settings.minimum_independent_pages.to_string(),
@@ -2407,7 +2432,7 @@ impl Program {
                                             self.web_search_settings.tool_iteration_limit as f32,
                                             Message::WebSearchToolIterationLimitChange,
                                         )
-                                        .step(1.0),
+                                        .step(1.0_f32),
                                         Space::new().width(Length::Fixed(12.0)),
                                         feedback_value_chip(
                                             self.web_search_settings.tool_iteration_limit.to_string(),
@@ -2428,7 +2453,7 @@ impl Program {
                                             self.web_search_settings.request_timeout_seconds as f32,
                                             Message::WebSearchRequestTimeoutChange,
                                         )
-                                        .step(1.0),
+                                        .step(1.0_f32),
                                         Space::new().width(Length::Fixed(12.0)),
                                         feedback_value_chip(
                                             format!(
@@ -2592,8 +2617,7 @@ impl Program {
             }
 
             GUIState::AdvancedSettings => {
-                let user_information = self.user_information.clone();
-                let ip = self.user_information.ip_address.clone();
+                let ip = self.user_information.active_connection().clone();
 
                 let prompts_list = self
                     .system_prompt
@@ -2612,6 +2636,38 @@ impl Program {
                 .on_submit(Message::InstallModel(self.installing_model.clone()))
                 .on_input(Message::UpdateInstall)
                 .style(text_input_style);
+
+                let model_management: Element<Message> = if self.user_information.backend
+                    == InferenceBackend::Ollama
+                {
+                    container(widget::column![
+                        setting_label(
+                            tr(language, "Install model"),
+                            tr(language, "Enter an Ollama model name and press Enter.")
+                        ),
+                        model_install,
+                    ])
+                    .padding(16)
+                    .width(Length::Fill)
+                    .style(flat_card_style)
+                    .into()
+                } else {
+                    container(widget::column![
+                            setting_label(
+                                tr(language, "Manage OpenVINO models"),
+                                tr(language, "Models are deployed by OpenVINO Model Server. Locoryn discovers every model exposed by its /v3/models endpoint.")
+                            ),
+                            Space::new().height(Length::Fixed(10.0)),
+                            secondary_button(
+                                tr(language, "Open setup guide"),
+                                Message::InstallationPrompt,
+                            ),
+                        ])
+                        .padding(16)
+                        .width(Length::Fill)
+                        .style(flat_card_style)
+                        .into()
+                };
 
                 let change_ip = iced::widget::TextInput::<Message>::new(ip.ip.as_str(), &ip.ip)
                     .padding(12)
@@ -2699,16 +2755,7 @@ impl Program {
                         .width(Length::Fill)
                         .style(flat_card_style),
                         Space::new().height(Length::Fixed(10.0)),
-                        container(widget::column![
-                            setting_label(
-                                tr(language, "Install model"),
-                                tr(language, "Enter an Ollama model name and press Enter.")
-                            ),
-                            model_install,
-                        ])
-                        .padding(16)
-                        .width(Length::Fill)
-                        .style(flat_card_style),
+                        model_management,
                             ]
                         ]
                         .width(Length::Fill),
@@ -2721,7 +2768,27 @@ impl Program {
                             )),
                             settings_group_title(tr(language, "RUNTIME & CONNECTION")),
                             Space::new().height(Length::Fixed(8.0)),
-                            widget::column![
+                        widget::column![
+                        container(widget::column![
+                            setting_label(
+                                tr(language, "Inference backend"),
+                                tr(language, "Choose the server API used for model discovery and generation. The client does not depend on local hardware architecture.")
+                            ),
+                            widget::pick_list(
+                                InferenceBackend::ALL,
+                                Some(self.user_information.backend),
+                                Message::BackendChange,
+                            )
+                            .padding([12, 14])
+                            .text_size(14)
+                            .style(pick_list_style)
+                            .menu_style(pick_list_menu_style)
+                            .width(Length::Fill),
+                        ])
+                        .padding(16)
+                        .width(Length::Fill)
+                        .style(flat_card_style),
+                        Space::new().height(Length::Fixed(10.0)),
                         container(widget::column![
                             setting_label(
                                 tr(language, "Batch tokens"),
@@ -2760,7 +2827,7 @@ impl Program {
                         container(widget::row![
                             setting_label(
                                 tr(language, "Show tokens per second at bottom of message"),
-                                tr(language, "Display the generation speed under each assistant reply. Measured from the model's own statistics, independent of token batching.")
+                                tr(language, "Display the generation speed under each assistant reply. Uses backend timing when available and otherwise times the generated stream.")
                             ),
                             widget::checkbox(self.show_tokens_per_second)
                                 .label(tr(language, "Enabled"))
@@ -2798,8 +2865,15 @@ impl Program {
                         Space::new().height(Length::Fixed(10.0)),
                         container(widget::column![
                             setting_label(
-                                tr(language, "Ollama address"),
-                                tr(language, "Choose HTTP or HTTPS, then enter the hostname or IP address and port used to connect to Ollama.")
+                                tr(
+                                    language,
+                                    if self.user_information.backend == InferenceBackend::Ollama {
+                                        "Ollama address"
+                                    } else {
+                                        "OpenVINO Model Server address"
+                                    }
+                                ),
+                                tr(language, "Choose HTTP or HTTPS, then enter the hostname or IP address and port used by the selected inference server.")
                             ),
                             Space::new().height(Length::Fixed(12.0)),
                             widget::row![
@@ -2816,16 +2890,16 @@ impl Program {
                                 widget::text(if language == Language::Spanish {
                                     format!(
                                         "Dirección actual: {}://{}:{}",
-                                        user_information.ip_address.protocol,
-                                        user_information.ip_address.ip,
-                                        user_information.ip_address.port
+                                        ip.protocol,
+                                        ip.ip,
+                                        ip.port
                                     )
                                 } else {
                                     format!(
                                         "Current address: {}://{}:{}",
-                                        user_information.ip_address.protocol,
-                                        user_information.ip_address.ip,
-                                        user_information.ip_address.port
+                                        ip.protocol,
+                                        ip.ip,
+                                        ip.port
                                     )
                                 })
                                 .size(13)

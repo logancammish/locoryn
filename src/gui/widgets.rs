@@ -681,24 +681,6 @@ pub(super) fn markdown_with_code_copy<'a>(
         .into()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::web_search_activity_visible;
-    use crate::tools::web_search::WebSearchState;
-
-    #[test]
-    fn local_tool_synthesis_never_shows_web_search_activity() {
-        let state = WebSearchState::Synthesizing {
-            thinking: "Checking code".to_string(),
-            query: String::new(),
-            websites: Vec::new(),
-        };
-
-        assert!(!web_search_activity_visible(false, &state));
-        assert!(web_search_activity_visible(true, &state));
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(super) fn message_bubble<'a>(
     index: usize,
@@ -854,8 +836,8 @@ pub(super) fn message_bubble<'a>(
             };
 
             // Generation speed shown at the bottom of the reply when the
-            // setting is enabled. The value comes straight from Ollama's
-            // statistics, so render batching never distorts it.
+            // setting is enabled. It uses backend timing where available and
+            // otherwise times the stream, independent of render batching.
             let speed_note: Element<'a, Message> = if show_tokens_per_second {
                 match tokens_per_second {
                     Some(tps) => widget::column![
@@ -908,5 +890,23 @@ pub(super) fn message_bubble<'a>(
             ]
             .into()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::web_search_activity_visible;
+    use crate::tools::web_search::WebSearchState;
+
+    #[test]
+    fn local_tool_synthesis_never_shows_web_search_activity() {
+        let state = WebSearchState::Synthesizing {
+            thinking: "Checking code".to_string(),
+            query: String::new(),
+            websites: Vec::new(),
+        };
+
+        assert!(!web_search_activity_visible(false, &state));
+        assert!(web_search_activity_visible(true, &state));
     }
 }

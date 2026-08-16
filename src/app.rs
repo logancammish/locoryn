@@ -4,7 +4,11 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use crate::{GUIState, Program, tools::web_search::WebSource};
+use crate::{
+    GUIState, Program,
+    inference::{BackendConnections, InferenceBackend},
+    tools::web_search::WebSource,
+};
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 
@@ -14,8 +18,8 @@ pub enum Correspondence {
         text: String,
         model: Option<String>,
         thinking_seconds: Option<u64>,
-        /// Generation speed reported by Ollama for this reply. Measured from
-        /// the model's own statistics, so it is independent of render batching.
+        /// Generation speed for this reply. This uses backend timing when it is
+        /// available and otherwise times the generated stream locally.
         tokens_per_second: Option<f32>,
         sources: Vec<WebSource>,
         web_search_used: bool,
@@ -47,9 +51,9 @@ pub struct SavedChat {
     pub models: Vec<Option<String>>,
     #[serde(default)]
     pub thinking_seconds: Vec<Option<u64>>,
-    /// Generation speed in tokens per second, as reported by Ollama's own
-    /// evaluation statistics for each reply. `None` when the response gave no
-    /// stats (web-search answers, cancellations, older chats).
+    /// Generation speed in tokens per second for each reply. `None` when the
+    /// response gave no token statistics (including cancellations and older
+    /// chats).
     #[serde(default)]
     pub tokens_per_second: Vec<Option<f32>>,
     #[serde(default)]
@@ -321,7 +325,7 @@ impl CurrentChat {
 pub struct AppState {
     pub filtering: bool,
     pub dark_mode: bool,
-    pub ollama_state: Arc<Mutex<String>>,
+    pub backend_state: Arc<Mutex<String>>,
     pub bots_list: Arc<Mutex<Vec<String>>>,
     pub gui_state: GUIState,
 }
@@ -442,17 +446,11 @@ impl SystemPrompt {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct HostLocation {
-    /// URL scheme used for Ollama. Only HTTP and HTTPS are accepted.
-    pub protocol: String,
-    pub ip: String,
-    pub port: String,
-}
-
 // UserInformation saves certain important information about the program specific to the current user
 #[derive(Clone)]
 pub struct UserInformation {
+    pub backend: InferenceBackend,
+    pub backend_connections: BackendConnections,
     pub model: Option<String>,
     pub thinking_level: ThinkingLevel,
     /// The exact controls accepted by the selected model. A regular thinking
@@ -469,8 +467,17 @@ pub struct UserInformation {
     pub font_family: FontFamily,
     pub chat_history: Arc<Mutex<CurrentChat>>,
     pub current_chat_history_enabled: bool,
-    pub ip_address: HostLocation,
     pub language: Language,
+}
+
+impl UserInformation {
+    pub fn active_connection(&self) -> &crate::inference::HostLocation {
+        self.backend_connections.active(self.backend)
+    }
+
+    pub fn active_connection_mut(&mut self) -> &mut crate::inference::HostLocation {
+        self.backend_connections.active_mut(self.backend)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]

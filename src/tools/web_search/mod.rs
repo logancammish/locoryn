@@ -15,6 +15,8 @@ use reqwest::{Client, StatusCode, header};
 use serde::{Deserialize, Serialize};
 use url::{Host, Url};
 
+use crate::inference::{EncodedImage, InferenceBackend};
+
 mod fetch;
 mod providers;
 mod tool_loop;
@@ -26,7 +28,7 @@ use providers::*;
 #[cfg(test)]
 use tool_loop::*;
 
-pub(crate) use fetch::send_ollama_request_with_retry;
+pub(crate) use fetch::send_inference_request_with_retry;
 pub use fetch::validate_public_url;
 pub use providers::{BraveSearchProvider, ExaSearchProvider, TavilySearchProvider};
 #[allow(unused_imports)]
@@ -360,7 +362,7 @@ pub enum WebSearchError {
     EmptyResults,
     InvalidToolCall,
     ModelToolsUnsupported,
-    OllamaUnavailable(String),
+    InferenceUnavailable(String),
     ProviderUnavailable(String),
     Cancelled,
 }
@@ -382,9 +384,11 @@ impl WebSearchError {
             Self::EmptyResults => "The search returned no results.",
             Self::InvalidToolCall => "The model requested web access with invalid arguments.",
             Self::ModelToolsUnsupported => {
-                "The selected Ollama model does not support web tool calling."
+                "The selected model or inference server does not support tool calling."
             }
-            Self::OllamaUnavailable(_) => "Ollama could not complete the web-enabled response.",
+            Self::InferenceUnavailable(_) => {
+                "The inference backend could not complete the tool-enabled response."
+            }
             Self::ProviderUnavailable(_) => "The web-search provider is unavailable.",
             Self::Cancelled => "Web search was cancelled.",
         }
@@ -392,8 +396,8 @@ impl WebSearchError {
 
     pub fn diagnostic(&self, api_key: Option<&str>) -> String {
         let detail = match self {
-            Self::OllamaUnavailable(detail) => {
-                format!("Ollama unavailable: {detail}")
+            Self::InferenceUnavailable(detail) => {
+                format!("inference backend unavailable: {detail}")
             }
             Self::ProviderUnavailable(detail) => {
                 format!("provider unavailable: {detail}")
@@ -405,7 +409,7 @@ impl WebSearchError {
 
     pub fn detailed_user_message(&self, api_key: Option<&str>) -> String {
         let detail = match self {
-            Self::OllamaUnavailable(detail) | Self::ProviderUnavailable(detail) => {
+            Self::InferenceUnavailable(detail) | Self::ProviderUnavailable(detail) => {
                 redact_secret(detail, api_key)
                     .trim()
                     .chars()

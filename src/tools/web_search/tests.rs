@@ -225,7 +225,7 @@ fn streamed_chat_chunks_accumulate_visible_progress_and_tool_calls() {
         sender: &progress_sender,
     };
 
-    apply_chat_stream_line(
+    apply_ollama_chat_stream_line(
             r#"{"message":{"role":"assistant","thinking":"checking ","content":"","tool_calls":[{"function":{"name":"web_search","arguments":{"query":"first"}}}]},"done":false}"#,
             &mut role,
             &mut content,
@@ -234,7 +234,7 @@ fn streamed_chat_chunks_accumulate_visible_progress_and_tool_calls() {
             &progress,
         )
         .unwrap();
-    apply_chat_stream_line(
+    apply_ollama_chat_stream_line(
             r#"{"message":{"role":"assistant","thinking":"sources","content":"partial answer","tool_calls":[{"function":{"name":"fetch_webpage","arguments":{"url":"https://example.com"}}}]},"done":true}"#,
             &mut role,
             &mut content,
@@ -578,6 +578,8 @@ fn search_calls_can_choose_bounded_breadth_and_freshness() {
 #[test]
 fn malformed_tool_calls_are_returned_as_recoverable_feedback() {
     let message = invalid_tool_message(
+        InferenceBackend::Ollama,
+        &serde_json::json!({}),
         "search_locoryn_conversations",
         "search_locoryn_conversations requires a non-empty string query.",
     );
@@ -625,8 +627,18 @@ fn repeated_search_queries_are_compared_case_and_whitespace_insensitively() {
 #[test]
 fn web_tool_loop_user_message_keeps_all_images() {
     let message = user_message(
+        InferenceBackend::Ollama,
         "Compare these images".into(),
-        vec!["first-image".into(), "second-image".into()],
+        &[
+            EncodedImage {
+                mime_type: "image/png".into(),
+                data: "first-image".into(),
+            },
+            EncodedImage {
+                mime_type: "image/png".into(),
+                data: "second-image".into(),
+            },
+        ],
     );
 
     assert_eq!(message["role"], "user");
@@ -662,7 +674,8 @@ fn ollama_inference_does_not_use_the_external_web_timeout() {
     let (progress_sender, mut progress_receiver) =
         tokio::sync::watch::channel(ToolLoopProgress::default());
     let request = ToolLoopRequest {
-        ollama_url: format!("http://{address}/api/chat"),
+        backend: InferenceBackend::Ollama,
+        chat_url: format!("http://{address}/api/chat"),
         model: "test-model".into(),
         prompt: "test prompt".into(),
         system_prompt: "test system prompt".into(),
@@ -692,6 +705,75 @@ fn ollama_inference_does_not_use_the_external_web_timeout() {
     assert_eq!(result.eval_count, Some(120));
     assert_eq!(result.eval_duration, Some(2_000_000_000));
     assert_eq!(progress_receiver.borrow_and_update().answer, "done");
+    server.join().unwrap();
+}
+
+#[test]
+fn openvino_inference_reads_openai_compatible_sse() {
+    let _loopback_guard = LOOPBACK_TEST_LOCK.lock().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        read_http_request(&mut stream);
+        let generated = concat!(
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"checked the backend\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"OpenVINO \"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ready\"},\"finish_reason\":\"stop\"}]}\n\n"
+        );
+        let completed = concat!(
+            "data: {\"choices\":[],\"usage\":{\"completion_tokens\":2}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let body_len = generated.len() + completed.len();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {body_len}\r\nconnection: close\r\n\r\n{generated}"
+        )
+        .unwrap();
+        stream.flush().unwrap();
+        // Keep the usage terminator in a later network write so the client-side
+        // OpenVINO generation timer observes a real interval.
+        thread::sleep(Duration::from_millis(20));
+        write!(stream, "{completed}").unwrap();
+    });
+
+    let (progress_sender, mut progress_receiver) =
+        tokio::sync::watch::channel(ToolLoopProgress::default());
+    let request = ToolLoopRequest {
+        backend: InferenceBackend::OpenVino,
+        chat_url: format!("http://{address}/v3/chat/completions"),
+        model: "qwen3".into(),
+        prompt: "test prompt".into(),
+        system_prompt: "test system prompt".into(),
+        temperature: 0.0,
+        context_tokens: 4_096,
+        max_response_tokens: 512,
+        images: Vec::new(),
+        thinking: serde_json::Value::Bool(true),
+        settings: WebSearchSettings {
+            enabled: true,
+            ..WebSearchSettings::default()
+        },
+        provider: Some(Arc::new(CountingProvider(AtomicUsize::new(0)))),
+        state_sender: crossbeam_channel::unbounded().0,
+        progress_sender,
+        cancel: Arc::new(AtomicBool::new(false)),
+        chat_storage_dir: None,
+        tool_settings: crate::tools::ToolSettings::default(),
+        code_checking_enabled: false,
+    };
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let result = runtime.block_on(run_tool_loop(request)).unwrap();
+    assert_eq!(result.answer, "OpenVINO ready");
+    assert_eq!(result.thinking, "checked the backend");
+    assert_eq!(result.eval_count, Some(2));
+    assert!(result.eval_duration.is_some_and(|duration| duration > 0));
+    assert_eq!(
+        progress_receiver.borrow_and_update().answer,
+        "OpenVINO ready"
+    );
     server.join().unwrap();
 }
 
@@ -726,7 +808,7 @@ fn transient_ollama_rate_limits_are_retried() {
     let client = Client::new();
     let cancel = AtomicBool::new(false);
     let response = runtime
-        .block_on(send_ollama_request_with_retry(
+        .block_on(send_inference_request_with_retry(
             &client,
             &format!("http://{address}/api/chat"),
             &serde_json::json!({"model": "test-model"}),
@@ -833,7 +915,8 @@ fn tool_round_limit_forces_final_synthesis_without_losing_progress() {
     let (progress_sender, mut progress_receiver) =
         tokio::sync::watch::channel(ToolLoopProgress::default());
     let request = ToolLoopRequest {
-        ollama_url: format!("http://{address}/api/chat"),
+        backend: InferenceBackend::Ollama,
+        chat_url: format!("http://{address}/api/chat"),
         model: "test-model".into(),
         prompt: "research this".into(),
         system_prompt: "test system prompt".into(),
@@ -929,7 +1012,8 @@ fn empty_limit_synthesis_gets_a_clean_no_tools_recovery() {
     let (progress_sender, mut progress_receiver) =
         tokio::sync::watch::channel(ToolLoopProgress::default());
     let request = ToolLoopRequest {
-        ollama_url: format!("http://{address}/api/chat"),
+        backend: InferenceBackend::Ollama,
+        chat_url: format!("http://{address}/api/chat"),
         model: "test-model".into(),
         prompt: "research this".into(),
         system_prompt: "test system prompt".into(),
@@ -1106,7 +1190,8 @@ fn follow_up_research_rejects_one_broad_search_and_cross_references_sources() {
     });
     let (state_sender, state_receiver) = crossbeam_channel::unbounded();
     let request = ToolLoopRequest {
-        ollama_url: format!("http://{address}/api/chat"),
+        backend: InferenceBackend::Ollama,
+        chat_url: format!("http://{address}/api/chat"),
         model: "test-model".into(),
         prompt: "research this current topic thoroughly".into(),
         system_prompt: "test system prompt".into(),

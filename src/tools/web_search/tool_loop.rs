@@ -2,14 +2,15 @@ use super::*;
 
 #[derive(Clone)]
 pub struct ToolLoopRequest {
-    pub ollama_url: String,
+    pub backend: InferenceBackend,
+    pub chat_url: String,
     pub model: String,
     pub prompt: String,
     pub system_prompt: String,
     pub temperature: f32,
     pub context_tokens: u32,
     pub max_response_tokens: u32,
-    pub images: Vec<String>,
+    pub images: Vec<EncodedImage>,
     pub thinking: serde_json::Value,
     pub settings: WebSearchSettings,
     pub tool_settings: crate::tools::ToolSettings,
@@ -34,9 +35,9 @@ pub struct ToolLoopResponse {
     pub answer: String,
     pub thinking: String,
     pub sources: Vec<WebSource>,
-    /// Evaluation statistics from the final Ollama response. These are kept
-    /// separate from chat messages so they are never sent back to Ollama in a
-    /// later tool-loop turn.
+    /// Evaluation statistics for the final backend response. OpenVINO's
+    /// duration is timed locally. These are kept separate from chat messages
+    /// so they are never sent back in a later turn.
     pub eval_count: Option<u64>,
     pub eval_duration: Option<u64>,
 }
@@ -47,12 +48,12 @@ struct StreamedChatMessage {
     eval_duration: Option<u64>,
 }
 
-pub(super) fn user_message(prompt: String, images: Vec<String>) -> serde_json::Value {
-    let mut message = serde_json::json!({"role": "user", "content": prompt});
-    if !images.is_empty() {
-        message["images"] = serde_json::json!(images);
-    }
-    message
+pub(super) fn user_message(
+    backend: InferenceBackend,
+    prompt: String,
+    images: &[EncodedImage],
+) -> serde_json::Value {
+    crate::inference::user_message(backend, prompt, images)
 }
 
 pub(super) struct ToolBudget {
@@ -492,7 +493,7 @@ pub(super) struct StreamProgressContext<'a> {
     pub(super) sender: &'a tokio::sync::watch::Sender<ToolLoopProgress>,
 }
 
-pub(super) fn apply_chat_stream_line(
+pub(super) fn apply_ollama_chat_stream_line(
     line: &str,
     role: &mut String,
     content: &mut String,
@@ -506,10 +507,10 @@ pub(super) fn apply_chat_stream_line(
         return Ok(line == "[DONE]");
     }
     let value = serde_json::from_str::<serde_json::Value>(line).map_err(|error| {
-        WebSearchError::OllamaUnavailable(format!("invalid streamed chat response: {error}"))
+        WebSearchError::InferenceUnavailable(format!("invalid streamed chat response: {error}"))
     })?;
     if let Some(error) = value.get("error").and_then(serde_json::Value::as_str) {
-        return Err(WebSearchError::OllamaUnavailable(error.to_string()));
+        return Err(WebSearchError::InferenceUnavailable(error.to_string()));
     }
     let Some(message) = value.get("message") else {
         return Ok(value
@@ -546,6 +547,69 @@ pub(super) fn apply_chat_stream_line(
         .unwrap_or(false))
 }
 
+fn apply_openvino_chat_stream_line(
+    line: &str,
+    role: &mut String,
+    content: &mut String,
+    thinking: &mut String,
+    tool_calls: &mut Vec<serde_json::Value>,
+    completion_tokens: &mut Option<u64>,
+    progress: &StreamProgressContext<'_>,
+) -> Result<bool, WebSearchError> {
+    match crate::inference::decode_openai_stream_line(line)
+        .map_err(WebSearchError::InferenceUnavailable)?
+    {
+        crate::inference::OpenAiStreamLine::Done => Ok(true),
+        crate::inference::OpenAiStreamLine::Ignore => Ok(false),
+        crate::inference::OpenAiStreamLine::Event(event) => {
+            if let Some(count) = event.completion_tokens {
+                *completion_tokens = Some(count);
+            }
+            if let Some(next_role) = event.role
+                && !next_role.is_empty()
+            {
+                role.clear();
+                role.push_str(&next_role);
+            }
+            content.push_str(&event.content);
+            thinking.push_str(&event.reasoning);
+            crate::inference::merge_openai_tool_call_deltas(tool_calls, &event.tool_calls);
+            set_progress(
+                progress.sender,
+                combined_thinking(progress.previous_thinking, thinking),
+                combined_answer(progress.previous_answer, content),
+            );
+            Ok(false)
+        }
+    }
+}
+
+fn apply_backend_chat_stream_line(
+    backend: InferenceBackend,
+    line: &str,
+    role: &mut String,
+    content: &mut String,
+    thinking: &mut String,
+    tool_calls: &mut Vec<serde_json::Value>,
+    completion_tokens: &mut Option<u64>,
+    progress: &StreamProgressContext<'_>,
+) -> Result<bool, WebSearchError> {
+    match backend {
+        InferenceBackend::Ollama => {
+            apply_ollama_chat_stream_line(line, role, content, thinking, tool_calls, progress)
+        }
+        InferenceBackend::OpenVino => apply_openvino_chat_stream_line(
+            line,
+            role,
+            content,
+            thinking,
+            tool_calls,
+            completion_tokens,
+            progress,
+        ),
+    }
+}
+
 fn final_evaluation_statistics(line: &str) -> Result<(Option<u64>, Option<u64>), WebSearchError> {
     let line = line.trim();
     let line = line.strip_prefix("data:").map(str::trim).unwrap_or(line);
@@ -553,7 +617,7 @@ fn final_evaluation_statistics(line: &str) -> Result<(Option<u64>, Option<u64>),
         return Ok((None, None));
     }
     let value = serde_json::from_str::<serde_json::Value>(line).map_err(|error| {
-        WebSearchError::OllamaUnavailable(format!("invalid streamed chat response: {error}"))
+        WebSearchError::InferenceUnavailable(format!("invalid streamed chat response: {error}"))
     })?;
     Ok((
         value.get("eval_count").and_then(serde_json::Value::as_u64),
@@ -563,7 +627,8 @@ fn final_evaluation_statistics(line: &str) -> Result<(Option<u64>, Option<u64>),
     ))
 }
 
-async fn read_ollama_chat_stream(
+async fn read_backend_chat_stream(
+    backend: InferenceBackend,
     mut response: reqwest::Response,
     previous_thinking: &str,
     previous_answer: &str,
@@ -579,6 +644,7 @@ async fn read_ollama_chat_stream(
     let mut done = false;
     let mut eval_count = None;
     let mut eval_duration = None;
+    let mut openvino_generation_started_at = None::<Instant>;
     let progress = StreamProgressContext {
         previous_thinking,
         previous_answer,
@@ -588,7 +654,7 @@ async fn read_ollama_chat_stream(
     while !done {
         let chunk = tokio::select! {
             chunk = response.chunk() => {
-                chunk.map_err(|error| WebSearchError::OllamaUnavailable(error.to_string()))?
+                chunk.map_err(|error| WebSearchError::InferenceUnavailable(error.to_string()))?
             }
             () = wait_for_cancel(cancel) => return Err(WebSearchError::Cancelled),
         };
@@ -602,16 +668,27 @@ async fn read_ollama_chat_stream(
             if !line.trim().is_empty() {
                 saw_message = true;
             }
-            done = apply_chat_stream_line(
+            let generated_bytes_before = content.len() + thinking.len();
+            done = apply_backend_chat_stream_line(
+                backend,
                 &line,
                 &mut role,
                 &mut content,
                 &mut thinking,
                 &mut tool_calls,
+                &mut eval_count,
                 &progress,
             )?;
+            if backend == InferenceBackend::OpenVino
+                && openvino_generation_started_at.is_none()
+                && content.len() + thinking.len() > generated_bytes_before
+            {
+                openvino_generation_started_at = Some(Instant::now());
+            }
             if done {
-                (eval_count, eval_duration) = final_evaluation_statistics(&line)?;
+                if backend == InferenceBackend::Ollama {
+                    (eval_count, eval_duration) = final_evaluation_statistics(&line)?;
+                }
                 break;
             }
         }
@@ -622,22 +699,39 @@ async fn read_ollama_chat_stream(
         if !line.trim().is_empty() {
             saw_message = true;
         }
-        done = apply_chat_stream_line(
+        let generated_bytes_before = content.len() + thinking.len();
+        done = apply_backend_chat_stream_line(
+            backend,
             &line,
             &mut role,
             &mut content,
             &mut thinking,
             &mut tool_calls,
+            &mut eval_count,
             &progress,
         )?;
-        if done {
+        if backend == InferenceBackend::OpenVino
+            && openvino_generation_started_at.is_none()
+            && content.len() + thinking.len() > generated_bytes_before
+        {
+            openvino_generation_started_at = Some(Instant::now());
+        }
+        if done && backend == InferenceBackend::Ollama {
             (eval_count, eval_duration) = final_evaluation_statistics(&line)?;
         }
     }
     if !saw_message {
-        return Err(WebSearchError::OllamaUnavailable(
-            "Ollama returned an empty chat stream".to_string(),
-        ));
+        return Err(WebSearchError::InferenceUnavailable(format!(
+            "{} returned an empty chat stream",
+            backend.server_name()
+        )));
+    }
+
+    if backend == InferenceBackend::OpenVino
+        && eval_count.is_some()
+        && let Some(started_at) = openvino_generation_started_at
+    {
+        eval_duration = u64::try_from(started_at.elapsed().as_nanos()).ok();
     }
 
     let mut message = serde_json::json!({
@@ -645,7 +739,11 @@ async fn read_ollama_chat_stream(
         "content": content,
     });
     if !thinking.is_empty() {
-        message["thinking"] = serde_json::Value::String(thinking);
+        let key = match backend {
+            InferenceBackend::Ollama => "thinking",
+            InferenceBackend::OpenVino => "reasoning_content",
+        };
+        message[key] = serde_json::Value::String(thinking);
     }
     if !tool_calls.is_empty() {
         message["tool_calls"] = serde_json::Value::Array(tool_calls);
@@ -657,7 +755,7 @@ async fn read_ollama_chat_stream(
     })
 }
 
-async fn request_ollama_chat_message(
+async fn request_backend_chat_message(
     client: &Client,
     request: &ToolLoopRequest,
     messages: &[serde_json::Value],
@@ -666,25 +764,21 @@ async fn request_ollama_chat_message(
     previous_thinking: &str,
     previous_answer: &str,
 ) -> Result<StreamedChatMessage, WebSearchError> {
-    let mut body = serde_json::json!({
-        "model": request.model,
-        "messages": messages,
-        "stream": true,
-        "think": thinking_override.unwrap_or(&request.thinking),
-        "options": {
-            "temperature": request.temperature,
-            "num_ctx": request.context_tokens,
-            "num_predict": request.max_response_tokens,
-        }
-    });
-    if let Some(tools) = tools {
-        body["tools"] = tools.clone();
-    }
+    let body = crate::inference::chat_request_body(
+        request.backend,
+        &request.model,
+        messages,
+        tools,
+        thinking_override.unwrap_or(&request.thinking),
+        request.temperature,
+        request.context_tokens,
+        request.max_response_tokens,
+    );
 
     let response =
-        send_ollama_request_with_retry(client, &request.ollama_url, &body, &request.cancel)
+        send_inference_request_with_retry(client, &request.chat_url, &body, &request.cancel)
             .await
-            .map_err(|error| WebSearchError::OllamaUnavailable(error.to_string()))?;
+            .map_err(|error| WebSearchError::InferenceUnavailable(error.to_string()))?;
     let Some(response) = response else {
         return cancel_request(request);
     };
@@ -696,7 +790,7 @@ async fn request_ollama_chat_message(
                 let detail = detail.unwrap_or_default();
                 serde_json::from_str::<serde_json::Value>(&detail)
                     .ok()
-                    .and_then(|value| value.get("error").and_then(serde_json::Value::as_str).map(str::to_string))
+                    .and_then(|value| crate::inference::response_error_detail(&value))
                     .unwrap_or_else(|| detail.trim().to_string())
             }
             () = wait_for_cancel(&request.cancel) => return cancel_request(request),
@@ -709,13 +803,15 @@ async fn request_ollama_chat_message(
         return if tools.is_some() && detail.to_ascii_lowercase().contains("tool") {
             Err(WebSearchError::ModelToolsUnsupported)
         } else {
-            Err(WebSearchError::OllamaUnavailable(format!(
-                "Ollama HTTP {status}: {detail}"
+            Err(WebSearchError::InferenceUnavailable(format!(
+                "{} HTTP {status}: {detail}",
+                request.backend.server_name()
             )))
         };
     }
 
-    read_ollama_chat_stream(
+    read_backend_chat_stream(
+        request.backend,
         response,
         previous_thinking,
         previous_answer,
@@ -808,7 +904,7 @@ pub(super) fn recovery_synthesis_messages(
                 request.system_prompt,
             ),
         }),
-        user_message(prompt, request.images.clone()),
+        user_message(request.backend, prompt, &request.images),
     ]
 }
 
@@ -849,7 +945,7 @@ pub(super) async fn finish_after_tool_limit(
         accumulated_answer.clone(),
     );
 
-    let streamed = request_ollama_chat_message(
+    let streamed = request_backend_chat_message(
         client,
         request,
         messages,
@@ -862,6 +958,7 @@ pub(super) async fn finish_after_tool_limit(
     let message = streamed.message;
     let mut thinking = message
         .get("thinking")
+        .or_else(|| message.get("reasoning_content"))
         .and_then(serde_json::Value::as_str)
         .map(|current| combined_thinking(&accumulated_thinking, current))
         .unwrap_or(accumulated_thinking);
@@ -879,7 +976,7 @@ pub(super) async fn finish_after_tool_limit(
         set_progress(&request.progress_sender, thinking.clone(), String::new());
         let recovery_messages = recovery_synthesis_messages(request, messages, budget);
         let disabled_thinking = serde_json::Value::Bool(false);
-        let recovery = request_ollama_chat_message(
+        let recovery = request_backend_chat_message(
             client,
             request,
             &recovery_messages,
@@ -892,6 +989,7 @@ pub(super) async fn finish_after_tool_limit(
         if let Some(recovery_thinking) = recovery
             .message
             .get("thinking")
+            .or_else(|| recovery.message.get("reasoning_content"))
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
             .filter(|thinking| !thinking.is_empty())
@@ -906,7 +1004,7 @@ pub(super) async fn finish_after_tool_limit(
             .filter(|answer| !answer.is_empty())
             .map(str::to_string)
             .ok_or_else(|| {
-                WebSearchError::OllamaUnavailable(
+                WebSearchError::InferenceUnavailable(
                     "the model returned no visible answer after two no-tools synthesis attempts"
                         .to_string(),
                 )
@@ -940,7 +1038,7 @@ pub async fn run_tool_loop(request: ToolLoopRequest) -> Result<ToolLoopResponse,
     // model is loaded, and remains cancellable through the select below.
     let client = Client::builder()
         .build()
-        .map_err(|error| WebSearchError::OllamaUnavailable(error.to_string()))?;
+        .map_err(|error| WebSearchError::InferenceUnavailable(error.to_string()))?;
     let settings = request.settings.clone().normalized();
     let tool_settings = request.tool_settings.clone();
     let allow_multiple_searches = settings.allow_multiple_searches;
@@ -962,7 +1060,7 @@ pub async fn run_tool_loop(request: ToolLoopRequest) -> Result<ToolLoopResponse,
                 &current_date,
             ),
         )}),
-        user_message(request.prompt.clone(), request.images.clone()),
+        user_message(request.backend, request.prompt.clone(), &request.images),
     ];
     let mut sources = Vec::<WebSource>::new();
     let mut budget = ToolBudget::new(&settings);
@@ -1032,7 +1130,7 @@ pub async fn run_tool_loop(request: ToolLoopRequest) -> Result<ToolLoopResponse,
             )
             .await;
         }
-        let streamed = request_ollama_chat_message(
+        let streamed = request_backend_chat_message(
             &client,
             &request,
             &messages,
@@ -1045,6 +1143,7 @@ pub async fn run_tool_loop(request: ToolLoopRequest) -> Result<ToolLoopResponse,
         let message = streamed.message;
         if let Some(thinking) = message
             .get("thinking")
+            .or_else(|| message.get("reasoning_content"))
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
             .filter(|thinking| !thinking.is_empty())
@@ -1121,6 +1220,8 @@ pub async fn run_tool_loop(request: ToolLoopRequest) -> Result<ToolLoopResponse,
             check_cancelled(&request)?;
             let Some(function) = call.get("function") else {
                 messages.push(invalid_tool_message(
+                    request.backend,
+                    &call,
                     "unknown",
                     "The call must contain a function name and an arguments object.",
                 ));
@@ -1128,6 +1229,8 @@ pub async fn run_tool_loop(request: ToolLoopRequest) -> Result<ToolLoopResponse,
             };
             let Some(name) = function.get("name").and_then(serde_json::Value::as_str) else {
                 messages.push(invalid_tool_message(
+                    request.backend,
+                    &call,
                     "unknown",
                     "The call must contain a function name and an arguments object.",
                 ));
@@ -1137,6 +1240,8 @@ pub async fn run_tool_loop(request: ToolLoopRequest) -> Result<ToolLoopResponse,
                 Ok(arguments) => arguments,
                 Err(_) => {
                     messages.push(invalid_tool_message(
+                        request.backend,
+                        &call,
                         name,
                         "Arguments must be one JSON object matching this tool's schema. Correct the call and try again.",
                     ));
@@ -1156,6 +1261,8 @@ pub async fn run_tool_loop(request: ToolLoopRequest) -> Result<ToolLoopResponse,
                         Ok(arguments) => arguments,
                         Err(_) => {
                             messages.push(invalid_tool_message(
+                                request.backend,
+                                &call,
                                 name,
                                 "web_search requires a non-empty string query. result_count must be within the advertised limit and freshness must be any, day, week, month, or year.",
                             ));
@@ -1284,6 +1391,8 @@ pub async fn run_tool_loop(request: ToolLoopRequest) -> Result<ToolLoopResponse,
                         Ok(url) => url,
                         Err(_) => {
                             messages.push(invalid_tool_message(
+                                request.backend,
+                                &call,
                                 name,
                                 "fetch_webpage requires a non-empty public HTTP(S) URL in url.",
                             ));
@@ -1371,6 +1480,8 @@ pub async fn run_tool_loop(request: ToolLoopRequest) -> Result<ToolLoopResponse,
                         Ok(query) => query,
                         Err(_) => {
                             messages.push(invalid_tool_message(
+                                request.backend,
+                                &call,
                                 name,
                                 "search_locoryn_conversations requires a non-empty string query. limit is optional and must be between 1 and 20.",
                             ));
@@ -1407,6 +1518,8 @@ pub async fn run_tool_loop(request: ToolLoopRequest) -> Result<ToolLoopResponse,
                         Ok(arguments) => arguments,
                         Err(_) => {
                             messages.push(invalid_tool_message(
+                                request.backend,
+                                &call,
                                 name,
                                 "check_code requires non-empty string language and code fields.",
                             ));
@@ -1455,11 +1568,12 @@ pub async fn run_tool_loop(request: ToolLoopRequest) -> Result<ToolLoopResponse,
                 }
                 _ => serde_json::json!({"error": "unknown tool"}),
             };
-            messages.push(serde_json::json!({
-                "role": "tool",
-                "tool_name": name,
-                "content": result.to_string(),
-            }));
+            messages.push(crate::inference::tool_result_message(
+                request.backend,
+                &call,
+                name,
+                result.to_string(),
+            ));
         }
         if !budget.has_tool_capacity(&request.tool_settings, request.code_checking_enabled) {
             return finish_after_tool_limit(
@@ -1633,19 +1747,24 @@ pub(super) fn parse_tool_arguments(
     }
 }
 
-/// A malformed model call is returned to the model as tool feedback instead
-/// of aborting the whole user response. Some Ollama models need one schema
-/// correction before they emit a valid native tool call.
-pub(super) fn invalid_tool_message(tool_name: &str, instruction: &str) -> serde_json::Value {
-    serde_json::json!({
-        "role": "tool",
-        "tool_name": tool_name,
-        "content": serde_json::json!({
+/// A malformed model call is returned as tool feedback instead of aborting the
+/// whole response. Some models need one schema correction before retrying.
+pub(super) fn invalid_tool_message(
+    backend: InferenceBackend,
+    call: &serde_json::Value,
+    tool_name: &str,
+    instruction: &str,
+) -> serde_json::Value {
+    crate::inference::tool_result_message(
+        backend,
+        call,
+        tool_name,
+        serde_json::json!({
             "error": "invalid tool call",
             "instruction": instruction,
         })
         .to_string(),
-    })
+    )
 }
 
 pub(super) fn required_string(
