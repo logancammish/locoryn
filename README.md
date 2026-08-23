@@ -29,6 +29,7 @@ Locoryn is a fork of [ollama-gui-interface](https://github.com/logancammish/olla
 
 ### What's different?
 
+<small>
 Locoryn builds on ollama-gui-interface, which I originally developed in 2025 as
 a Windows-first, Linux-compatible and x86-exclusive application for running 
 Ollama models locally. However, as the project expanded I realised that limiting
@@ -40,6 +41,7 @@ This application is different. It has different goals, and a different approach.
 Now supporting macOS, arm, and with a now Linux-first, Windows-compatible design
 approach, it not longer just sticks with Ollama. I hope you will have a positive
 experience with it!
+</small>
 
 
 > [!NOTE]
