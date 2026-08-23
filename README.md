@@ -25,7 +25,7 @@
   <a href="#build-from-source">Build from source</a>
 </p>
 
-Locoryn is a fork of [ollama-gui-interface](https://github.com/logancammish/ollama-gui-interface).
+<sub>Locoryn is a fork of [ollama-gui-interface](https://github.com/logancammish/ollama-gui-interface).</sub>
 
 <sub><b>What's different?</b></sub>
 
