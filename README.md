@@ -44,6 +44,7 @@ Now supporting macOS, arm, and with a now Linux-first, Windows-compatible design
 approach, it not longer just sticks with Ollama. I hope you will have a positive
 experience with it!
 </sub>
+<br>
 
 
 > [!NOTE]
