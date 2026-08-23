@@ -46,8 +46,6 @@ experience with it!
 </sub>
 <br>
 <br>
-<br>
-<br>
 
 
 > [!NOTE]
