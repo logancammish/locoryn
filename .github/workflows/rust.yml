@@ -50,6 +50,24 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Read package version
+        id: package-version
+        shell: bash
+        run: |
+          version="$(awk '
+            /^\[package\][[:space:]]*$/ { in_package = 1; next }
+            /^\[/ { in_package = 0 }
+            in_package && /^[[:space:]]*version[[:space:]]*=/ {
+              value = $0
+              sub(/^[^=]*=[[:space:]]*"/, "", value)
+              sub(/"[[:space:]]*$/, "", value)
+              print value
+              exit
+            }
+          ' Cargo.toml)"
+          test -n "$version"
+          printf 'value=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
       - name: Build release binary
         run: cargo build --locked --release
 
@@ -57,9 +75,10 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
-          portable="dist/locoryn-${{ matrix.platform }}"
-          installer="dist/locoryn-${{ matrix.platform }}-installer"
+          version="${{ steps.package-version.outputs.value }}"
+          package="locoryn-$version-${{ matrix.platform }}"
+          portable="dist/$package"
+          installer="dist/$package-local-installer"
 
           mkdir -p "$portable" "$installer/payload"
           install -m 755 target/release/locoryn "$portable/locoryn"
@@ -73,25 +92,25 @@ jobs:
             "$installer/io.github.logancammish.locoryn.desktop.in"
           install -m 644 linux_installations/LOCAL_INSTALL_README.md "$installer/README.md"
 
-          tar -czf "dist/locoryn-${{ matrix.platform }}-portable.tar.gz" \
-            -C dist "locoryn-${{ matrix.platform }}"
-          tar -czf "dist/locoryn-${{ matrix.platform }}-local-installer.tar.gz" \
-            -C dist "locoryn-${{ matrix.platform }}-installer"
+          tar -czf "dist/$package.tar.gz" -C dist "$package"
+          tar -czf "dist/$package-local-installer.tar.gz" \
+            -C dist "$package-local-installer"
 
-      - name: Upload Linux portable
+      - name: Upload Linux release package
         if: runner.os == 'Linux'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: locoryn-${{ matrix.platform }}-portable
-          path: dist/locoryn-${{ matrix.platform }}-portable.tar.gz
+          path: dist/locoryn-${{ steps.package-version.outputs.value }}-${{ matrix.platform }}.tar.gz
+          archive: false
           if-no-files-found: error
           retention-days: 30
+
       - name: Upload Linux local installer
         if: runner.os == 'Linux'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: locoryn-${{ matrix.platform }}-local-installer
-          path: dist/locoryn-${{ matrix.platform }}-local-installer.tar.gz
+          path: dist/locoryn-${{ steps.package-version.outputs.value }}-${{ matrix.platform }}-local-installer.tar.gz
+          archive: false
           if-no-files-found: error
           retention-days: 30
 
@@ -99,21 +118,22 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $portable = "dist/locoryn-${{ matrix.platform }}"
+          $package = "locoryn-${{ steps.package-version.outputs.value }}-${{ matrix.platform }}"
+          $portable = "dist/$package"
           New-Item -ItemType Directory -Force -Path $portable | Out-Null
           Copy-Item target/release/locoryn.exe "$portable/locoryn.exe"
           Copy-Item assets, config -Destination $portable -Recurse
           # Include the staged package directory itself. Using "$portable/*"
           # spills every packaged file into the ZIP root and makes extraction
           # scatter assets beside the user's other files.
-          Compress-Archive -Path $portable -DestinationPath "dist/locoryn-${{ matrix.platform }}-portable.zip"
+          Compress-Archive -Path $portable -DestinationPath "dist/$package.zip"
 
       - name: Upload Windows portable
         if: runner.os == 'Windows'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: locoryn-${{ matrix.platform }}-portable
-          path: dist/locoryn-${{ matrix.platform }}-portable.zip
+          path: dist/locoryn-${{ steps.package-version.outputs.value }}-${{ matrix.platform }}.zip
+          archive: false
           if-no-files-found: error
           retention-days: 30
 
@@ -121,19 +141,20 @@ jobs:
         if: matrix.windows_installer
         shell: pwsh
         run: |
-          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          $version = '${{ steps.package-version.outputs.value }}'
+          $versionInfoVersion = ($version -split '[-+]')[0]
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) {
             choco install innosetup --no-progress --yes
           }
-          & $iscc "/DMyAppVersion=$version" InnoSetupScript.iss
+          & $iscc "/DMyAppVersion=$version" "/DMyVersionInfoVersion=$versionInfoVersion" InnoSetupScript.iss
 
       - name: Upload Windows installer
         if: matrix.windows_installer
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: locoryn-${{ matrix.platform }}-installer
-          path: dist/*-setup.exe
+          path: dist/locoryn-${{ steps.package-version.outputs.value }}-windows-11-x64-setup.exe
+          archive: false
           if-no-files-found: error
           retention-days: 30
 
@@ -141,18 +162,18 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          portable="dist/locoryn-${{ matrix.platform }}"
+          package="locoryn-${{ steps.package-version.outputs.value }}-${{ matrix.platform }}"
+          portable="dist/$package"
           mkdir -p "$portable"
           install -m 755 target/release/locoryn "$portable/locoryn"
           cp -R assets config "$portable/"
-          tar -czf "dist/locoryn-${{ matrix.platform }}-portable.tar.gz" \
-            -C dist "locoryn-${{ matrix.platform }}"
+          tar -czf "dist/$package.tar.gz" -C dist "$package"
 
       - name: Upload macOS portable
         if: runner.os == 'macOS'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: locoryn-${{ matrix.platform }}-portable
-          path: dist/locoryn-${{ matrix.platform }}-portable.tar.gz
+          path: dist/locoryn-${{ steps.package-version.outputs.value }}-${{ matrix.platform }}.tar.gz
+          archive: false
           if-no-files-found: error
           retention-days: 30

@@ -1,11 +1,14 @@
 #ifndef MyAppVersion
-  #define MyAppVersion "1.2.0"
+  #define MyAppVersion "1.2.1-pre1"
+#endif
+#ifndef MyVersionInfoVersion
+  #define MyVersionInfoVersion "1.2.1"
 #endif
 
 [Setup]
 AppName=Locoryn
 AppVersion={#MyAppVersion}
-VersionInfoVersion={#MyAppVersion}
+VersionInfoVersion={#MyVersionInfoVersion}
 ; Install per-user so setup and the application never require elevation.
 DefaultDirName={localappdata}\Programs\Locoryn
 DefaultGroupName=Locoryn

@@ -28,7 +28,7 @@
 Locoryn is a fork of [ollama-gui-interface](https://github.com/logancammish/ollama-gui-interface).
 
 > [!NOTE]
-> This README describes the current `main` branch (`1.2.0`). Packaged releases
+> This README describes the current `main` branch (`1.2.1-pre1`). Packaged releases
 > may trail the source branch; check the release notes for the exact feature set
 > in a download.
 
@@ -70,7 +70,7 @@ and follow the [Linux and Windows OpenVINO setup](#openvino-setup-linux-and-wind
 ### 2. Install Locoryn
 
 - **Windows:** download and run
-  `locoryn-1.2.0-windows-11-x64-setup.exe` from the
+  `locoryn-1.2.1-pre1-windows-11-x64-setup.exe` from the
   [latest release](https://github.com/logancammish/locoryn/releases/latest).
   It installs for the current user and does not require administrator access.
 - **Linux:** run these commands in a terminal. The installer downloads the
