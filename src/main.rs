@@ -27,7 +27,7 @@ use crate::app::{
     ProfileRegistry, Prompt, SavedChat, SystemPrompt, ThinkingLevel, UserInformation,
 };
 use crate::inference::{
-    BackendConnections, EncodedImage, InferenceBackend, OpenAiStreamLine,
+    BackendConnections, EncodedImage, GenerationDetails, InferenceBackend, OpenAiStreamLine,
     api_url as backend_api_url, base_url as backend_base_url, decode_openai_stream_line,
     direct_request_body, model_names,
 };
@@ -291,6 +291,7 @@ struct ActivePrompt {
     /// missing duration is measured locally. The async response loop writes
     /// it; the finish handler reads it when stamping the reply.
     tokens_per_second: Arc<Mutex<Option<f32>>>,
+    generation_details: Arc<Mutex<Option<GenerationDetails>>>,
     model_name: String,
     started_at: Instant,
     response_start_index: usize,
@@ -315,6 +316,10 @@ struct GenerationChunk {
     thinking: Option<String>,
     eval_count: Option<u64>,
     eval_duration: Option<u64>,
+    prompt_eval_count: Option<u64>,
+    prompt_eval_duration: Option<u64>,
+    total_duration: Option<u64>,
+    load_duration: Option<u64>,
 }
 
 struct TemporaryChatSession {
@@ -666,6 +671,27 @@ fn tokens_per_second(eval_count: Option<u64>, eval_duration: Option<u64>) -> Opt
         return None;
     }
     Some((tokens / (duration_ns / 1_000_000_000.0)) as f32)
+}
+
+fn nanoseconds_to_milliseconds(duration: Option<u64>) -> Option<u64> {
+    duration.map(|duration| duration / 1_000_000)
+}
+
+fn elapsed_milliseconds(started_at: Instant) -> u64 {
+    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn merge_generation_chunk_details(details: &mut GenerationDetails, chunk: &GenerationChunk) {
+    details.prompt_tokens = chunk.prompt_eval_count.or(details.prompt_tokens);
+    details.output_tokens = chunk.eval_count.or(details.output_tokens);
+    details.prompt_duration_ms =
+        nanoseconds_to_milliseconds(chunk.prompt_eval_duration).or(details.prompt_duration_ms);
+    details.generation_duration_ms =
+        nanoseconds_to_milliseconds(chunk.eval_duration).or(details.generation_duration_ms);
+    details.backend_total_duration_ms =
+        nanoseconds_to_milliseconds(chunk.total_duration).or(details.backend_total_duration_ms);
+    details.load_duration_ms =
+        nanoseconds_to_milliseconds(chunk.load_duration).or(details.load_duration_ms);
 }
 
 fn collect_reported_thinking_levels(value: &serde_json::Value, levels: &mut Vec<ThinkingLevel>) {
@@ -1214,6 +1240,18 @@ fn decode_generation_line(
             eval_duration: value
                 .get("eval_duration")
                 .and_then(serde_json::Value::as_u64),
+            prompt_eval_count: value
+                .get("prompt_eval_count")
+                .and_then(serde_json::Value::as_u64),
+            prompt_eval_duration: value
+                .get("prompt_eval_duration")
+                .and_then(serde_json::Value::as_u64),
+            total_duration: value
+                .get("total_duration")
+                .and_then(serde_json::Value::as_u64),
+            load_duration: value
+                .get("load_duration")
+                .and_then(serde_json::Value::as_u64),
         },
         done_reason,
     ))
@@ -1243,6 +1281,10 @@ fn decode_inference_stream_line(
                     thinking: (!event.reasoning.is_empty()).then_some(event.reasoning),
                     eval_count: event.completion_tokens,
                     eval_duration: None,
+                    prompt_eval_count: event.prompt_tokens,
+                    prompt_eval_duration: None,
+                    total_duration: None,
+                    load_duration: None,
                 },
                 event.finish_reason,
             )),
@@ -1579,6 +1621,7 @@ fn append_failed_response(
             model,
             thinking_seconds: None,
             tokens_per_second: None,
+            generation_details: None,
             sources: Vec::new(),
             web_search_used: false,
         });
@@ -2263,11 +2306,13 @@ impl Program {
         model_name: &str,
         elapsed_seconds: u64,
         tokens_per_second: Option<f32>,
+        generation_details: Option<GenerationDetails>,
     ) {
         if let Some(Correspondence::Bot {
             model: stored_model,
             thinking_seconds,
             tokens_per_second: stored_tokens_per_second,
+            generation_details: stored_generation_details,
             ..
         }) = chat
             .messages
@@ -2285,12 +2330,22 @@ impl Program {
             if stored_tokens_per_second.is_none() {
                 *stored_tokens_per_second = tokens_per_second;
             }
+            if stored_generation_details.is_none() {
+                *stored_generation_details = generation_details;
+            }
         }
     }
 
     fn finalize_response_metadata(job: &ActivePrompt) {
         let elapsed_seconds = job.started_at.elapsed().as_secs().max(1);
         let tokens_per_second = job.tokens_per_second.lock().ok().and_then(|stats| *stats);
+        let mut generation_details = job
+            .generation_details
+            .lock()
+            .ok()
+            .and_then(|details| *details)
+            .unwrap_or_default();
+        generation_details.response_duration_ms = Some(elapsed_milliseconds(job.started_at));
         if let Ok(mut chat) = job.chat_history.lock() {
             Self::apply_response_metadata(
                 &mut chat,
@@ -2298,6 +2353,7 @@ impl Program {
                 &job.model_name,
                 elapsed_seconds,
                 tokens_per_second,
+                Some(generation_details),
             );
         }
     }
@@ -2547,6 +2603,7 @@ impl Program {
         // OpenVINO, the stream timer fills in the duration paired with its
         // completion-token count.
         let tokens_per_second_stats = Arc::new(Mutex::new(None::<f32>));
+        let generation_details_stats = Arc::new(Mutex::new(None::<GenerationDetails>));
         let chat_id = self.current_chat_id.clone();
         let completion_chat_id = chat_id.clone();
         let notice_chat_id = chat_id.clone();
@@ -2583,6 +2640,7 @@ impl Program {
                 web_progress_receiver,
                 cancel: Arc::clone(&cancel),
                 tokens_per_second: Arc::clone(&tokens_per_second_stats),
+                generation_details: Arc::clone(&generation_details_stats),
                 model_name,
                 started_at,
                 response_start_index,
@@ -2642,6 +2700,7 @@ impl Program {
                         chat_url: backend_chat_url,
                         model: user_info.model.clone().unwrap(),
                         prompt: to_send_prompt,
+                        user_prompt: prompt.clone(),
                         system_prompt: system_prompt.clone(),
                         temperature: user_info.temperature / 10.0,
                         context_tokens: user_info.context_tokens,
@@ -2667,6 +2726,10 @@ impl Program {
                             let web_search_used = !result.sources.is_empty();
                             *tokens_per_second_stats.lock().unwrap() =
                                 tokens_per_second(result.eval_count, result.eval_duration);
+                            if !result.generation_details.is_empty() {
+                                *generation_details_stats.lock().unwrap() =
+                                    Some(result.generation_details);
+                            }
                             let complete_response = if result.thinking.trim().is_empty() {
                                 result.answer
                             } else {
@@ -2683,6 +2746,10 @@ impl Program {
                                     done: true,
                                     eval_count: None,
                                     eval_duration: None,
+                                    prompt_eval_count: None,
+                                    prompt_eval_duration: None,
+                                    total_duration: None,
+                                    load_duration: None,
                                     thinking: None,
                                 })
                                 .await;
@@ -2700,6 +2767,7 @@ impl Program {
                                     model: user_info.model.clone(),
                                     thinking_seconds: None,
                                     tokens_per_second: None,
+                                    generation_details: None,
                                     sources: result.sources,
                                     web_search_used,
                                 },
@@ -2730,6 +2798,7 @@ impl Program {
                                     model: user_info.model.clone(),
                                     thinking_seconds: None,
                                     tokens_per_second: None,
+                                    generation_details: None,
                                     sources: Vec::new(),
                                     web_search_used: false,
                                 },
@@ -2754,6 +2823,7 @@ impl Program {
                 );
 
                 let client = reqwest::Client::new();
+                let inference_started_at = Instant::now();
                 let response = send_inference_request_with_retry(
                     &client,
                     &backend_generate_url,
@@ -2827,8 +2897,9 @@ impl Program {
                 // usage but not an evaluation duration. Time from the first
                 // generated content through the usage terminator so the same
                 // footer can still be populated for that backend.
-                let mut openvino_generation_started_at = None::<Instant>;
+                let mut generation_started_at = None::<Instant>;
                 let mut openvino_completion_tokens = None::<u64>;
+                let mut generation_details = GenerationDetails::default();
 
                 'response_stream: while !cancel.load(Ordering::Relaxed) {
                     let chunk_result = tokio::select! {
@@ -2877,16 +2948,15 @@ impl Program {
                                         format!("<think>{thinking}</think>{}", token.response);
                                 }
 
-                                if backend == InferenceBackend::OpenVino {
-                                    if openvino_generation_started_at.is_none()
-                                        && !token.response.is_empty()
-                                    {
-                                        openvino_generation_started_at = Some(Instant::now());
-                                    }
-                                    if let Some(completion_tokens) = token.eval_count {
-                                        openvino_completion_tokens = Some(completion_tokens);
-                                    }
+                                if generation_started_at.is_none() && !token.response.is_empty() {
+                                    generation_started_at = Some(Instant::now());
                                 }
+                                if backend == InferenceBackend::OpenVino
+                                    && let Some(completion_tokens) = token.eval_count
+                                {
+                                    openvino_completion_tokens = Some(completion_tokens);
+                                }
+                                merge_generation_chunk_details(&mut generation_details, &token);
 
                                 final_response.push(token.response.clone());
 
@@ -2957,16 +3027,15 @@ impl Program {
                                 token.response =
                                     format!("<think>{thinking}</think>{}", token.response);
                             }
-                            if backend == InferenceBackend::OpenVino {
-                                if openvino_generation_started_at.is_none()
-                                    && !token.response.is_empty()
-                                {
-                                    openvino_generation_started_at = Some(Instant::now());
-                                }
-                                if let Some(completion_tokens) = token.eval_count {
-                                    openvino_completion_tokens = Some(completion_tokens);
-                                }
+                            if generation_started_at.is_none() && !token.response.is_empty() {
+                                generation_started_at = Some(Instant::now());
                             }
+                            if backend == InferenceBackend::OpenVino
+                                && let Some(completion_tokens) = token.eval_count
+                            {
+                                openvino_completion_tokens = Some(completion_tokens);
+                            }
+                            merge_generation_chunk_details(&mut generation_details, &token);
                             final_response.push(token.response.clone());
                             if token.done {
                                 *tokens_per_second_stats.lock().unwrap() =
@@ -2998,11 +3067,23 @@ impl Program {
                 }
 
                 if backend == InferenceBackend::OpenVino
-                    && let Some(started_at) = openvino_generation_started_at
+                    && let Some(started_at) = generation_started_at
                 {
                     let duration_ns = u64::try_from(started_at.elapsed().as_nanos()).ok();
                     *tokens_per_second_stats.lock().unwrap() =
                         tokens_per_second(openvino_completion_tokens, duration_ns);
+                    generation_details.output_tokens = openvino_completion_tokens;
+                    generation_details.generation_duration_ms =
+                        nanoseconds_to_milliseconds(duration_ns);
+                    generation_details.generation_duration_locally_measured = true;
+                }
+                generation_details.time_to_first_token_ms =
+                    generation_started_at.map(|started_at| {
+                        u64::try_from(started_at.duration_since(inference_started_at).as_millis())
+                            .unwrap_or(u64::MAX)
+                    });
+                if !generation_details.is_empty() {
+                    *generation_details_stats.lock().unwrap() = Some(generation_details);
                 }
 
                 if !was_cancelled && final_response.concat().trim().is_empty() {
@@ -3036,6 +3117,10 @@ impl Program {
                             done: true,
                             eval_count: None,
                             eval_duration: None,
+                            prompt_eval_count: None,
+                            prompt_eval_duration: None,
+                            total_duration: None,
+                            load_duration: None,
                             thinking: None,
                         })
                         .await;
@@ -3065,6 +3150,7 @@ impl Program {
                             model: user_info.model.clone(),
                             thinking_seconds: None,
                             tokens_per_second: None,
+                            generation_details: None,
                             sources: Vec::new(),
                             web_search_used: false,
                         });
@@ -4967,7 +5053,7 @@ pub fn main() -> iced::Result {
     // Keep the live window icon in the executable. In particular, Linux launchers
     // do not guarantee a working directory beside the installed asset folder.
     let icon = image::load_from_memory_with_format(
-        include_bytes!("../assets/icon.png"),
+        include_bytes!("../assets/icon-transparent.png"),
         image::ImageFormat::Png,
     )
     .map_err(|error| error.to_string())
@@ -5029,7 +5115,7 @@ mod tests {
 
     use iced_widget::markdown;
 
-    use crate::inference::{HostLocation, InferenceBackend, api_url, base_url};
+    use crate::inference::{GenerationDetails, HostLocation, InferenceBackend, api_url, base_url};
 
     use super::{
         ActivePrompt, Correspondence, CurrentChat, FontFamily, GUIState, InferenceStreamLine,
@@ -5039,10 +5125,10 @@ mod tests {
         assign_legacy_profile_ids, canonical_code_language, censor_text, chat_profile_id,
         compare_versions, conversation_context_prompt, decode_generation_line,
         decode_inference_stream_line, disabled_web_tool_message, ensure_legacy_profile,
-        mask_live_code_blocks, model_capabilities, normalize_code_fence_languages,
-        parse_live_markdown_items, parse_markdown_items, read_json_with_backup,
-        remote_image_url_is_safe, sidecar_path, split_thinking_text, tokens_per_second,
-        write_json_safely,
+        mask_live_code_blocks, merge_generation_chunk_details, model_capabilities,
+        normalize_code_fence_languages, parse_live_markdown_items, parse_markdown_items,
+        read_json_with_backup, remote_image_url_is_safe, sidecar_path, split_thinking_text,
+        tokens_per_second, write_json_safely,
     };
 
     fn test_active_prompt(
@@ -5064,6 +5150,7 @@ mod tests {
             web_progress_receiver,
             cancel,
             tokens_per_second: Arc::new(Mutex::new(None)),
+            generation_details: Arc::new(Mutex::new(None)),
             model_name: "test-model".to_string(),
             started_at: Instant::now(),
             response_start_index: 1,
@@ -5332,6 +5419,7 @@ mod tests {
                 model: Some("test-model".into()),
                 thinking_seconds: Some(1),
                 tokens_per_second: None,
+                generation_details: None,
                 sources: Vec::new(),
                 web_search_used: false,
             }],
@@ -5512,16 +5600,29 @@ mod tests {
             "response":"",
             "done":true,
             "done_reason":"length",
-            "eval_count":10240
+            "eval_count":100,
+            "eval_duration":2500000000,
+            "prompt_eval_count":64,
+            "prompt_eval_duration":500000000,
+            "total_duration":3250000000,
+            "load_duration":250000000
         }"#;
         let (response, reason) = decode_generation_line(line).unwrap();
         assert!(response.done);
         assert_eq!(reason.as_deref(), Some("length"));
+        let mut details = GenerationDetails::default();
+        merge_generation_chunk_details(&mut details, &response);
+        assert_eq!(details.prompt_tokens, Some(64));
+        assert_eq!(details.output_tokens, Some(100));
+        assert_eq!(details.prompt_duration_ms, Some(500));
+        assert_eq!(details.generation_duration_ms, Some(2_500));
+        assert_eq!(details.backend_total_duration_ms, Some(3_250));
+        assert_eq!(details.load_duration_ms, Some(250));
     }
 
     #[test]
     fn retains_openvino_usage_event_for_generation_speed() {
-        let line = r#"data: {"choices":[],"usage":{"completion_tokens":120}}"#;
+        let line = r#"data: {"choices":[],"usage":{"prompt_tokens":48,"completion_tokens":120}}"#;
         let InferenceStreamLine::Chunk(chunk, reason) =
             decode_inference_stream_line(InferenceBackend::OpenVino, line).unwrap()
         else {
@@ -5529,6 +5630,7 @@ mod tests {
         };
 
         assert_eq!(chunk.eval_count, Some(120));
+        assert_eq!(chunk.prompt_eval_count, Some(48));
         assert_eq!(chunk.eval_duration, None);
         assert!(!chunk.done);
         assert_eq!(reason, None);
@@ -5552,13 +5654,14 @@ mod tests {
                 model: None,
                 thinking_seconds: None,
                 tokens_per_second: None,
+                generation_details: None,
                 sources: Vec::new(),
                 web_search_used: false,
             }],
             bot_responding: false,
         };
 
-        Program::apply_response_metadata(&mut chat, 1, "new-model", 9, Some(42.0));
+        Program::apply_response_metadata(&mut chat, 1, "new-model", 9, Some(42.0), None);
 
         assert!(matches!(
             &chat.messages[0],
@@ -5581,6 +5684,7 @@ mod tests {
                     model: None,
                     thinking_seconds: None,
                     tokens_per_second: None,
+                    generation_details: None,
                     sources: Vec::new(),
                     web_search_used: false,
                 },
@@ -5593,6 +5697,7 @@ mod tests {
                     model: None,
                     thinking_seconds: None,
                     tokens_per_second: None,
+                    generation_details: None,
                     sources: Vec::new(),
                     web_search_used: false,
                 },
@@ -5600,7 +5705,7 @@ mod tests {
             bot_responding: false,
         };
 
-        Program::apply_response_metadata(&mut chat, 2, "new-model", 9, Some(42.0));
+        Program::apply_response_metadata(&mut chat, 2, "new-model", 9, Some(42.0), None);
 
         assert!(matches!(
             &chat.messages[0],
@@ -5675,6 +5780,7 @@ mod tests {
             model: None,
             thinking_seconds: None,
             tokens_per_second: None,
+            generation_details: None,
             sources: Vec::new(),
             web_search_used: true,
         });

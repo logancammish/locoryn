@@ -6,7 +6,7 @@ use std::{
 
 use crate::{
     GUIState, Program,
-    inference::{BackendConnections, InferenceBackend},
+    inference::{BackendConnections, GenerationDetails, InferenceBackend},
     tools::web_search::WebSource,
 };
 use chrono::Local;
@@ -21,6 +21,9 @@ pub enum Correspondence {
         /// Generation speed for this reply. This uses backend timing when it is
         /// available and otherwise times the generated stream locally.
         tokens_per_second: Option<f32>,
+        /// Counts and timings that explain how the displayed token rate was
+        /// obtained. Missing for chats saved by older Locoryn versions.
+        generation_details: Option<GenerationDetails>,
         sources: Vec<WebSource>,
         web_search_used: bool,
     },
@@ -56,6 +59,8 @@ pub struct SavedChat {
     /// chats).
     #[serde(default)]
     pub tokens_per_second: Vec<Option<f32>>,
+    #[serde(default)]
+    pub generation_details: Vec<Option<GenerationDetails>>,
     #[serde(default)]
     pub sources: Vec<Vec<WebSource>>,
     #[serde(default)]
@@ -120,6 +125,16 @@ impl SavedChat {
                     Correspondence::User { .. } => None,
                 })
                 .collect(),
+            generation_details: chat
+                .messages
+                .iter()
+                .map(|message| match message {
+                    Correspondence::Bot {
+                        generation_details, ..
+                    } => *generation_details,
+                    Correspondence::User { .. } => None,
+                })
+                .collect(),
             sources: chat
                 .messages
                 .iter()
@@ -163,6 +178,7 @@ impl SavedChat {
                         model: self.models.get(index).cloned().flatten(),
                         thinking_seconds: self.thinking_seconds.get(index).copied().flatten(),
                         tokens_per_second: self.tokens_per_second.get(index).copied().flatten(),
+                        generation_details: self.generation_details.get(index).copied().flatten(),
                         sources: self.sources.get(index).cloned().unwrap_or_default(),
                         web_search_used: self.web_search_used.get(index).copied().unwrap_or(false),
                     },
@@ -192,6 +208,7 @@ mod saved_chat_tests {
         assert!(chat.models.is_empty());
         assert!(chat.thinking_seconds.is_empty());
         assert!(chat.tokens_per_second.is_empty());
+        assert!(chat.generation_details.is_empty());
         assert!(chat.sources.is_empty());
         assert!(chat.web_search_used.is_empty());
         assert_eq!(chat.web_search_enabled, None);
@@ -212,6 +229,13 @@ mod saved_chat_tests {
                     model: Some("model-a".into()),
                     thinking_seconds: Some(30),
                     tokens_per_second: Some(18.75),
+                    generation_details: Some(crate::inference::GenerationDetails {
+                        prompt_tokens: Some(42),
+                        output_tokens: Some(75),
+                        generation_duration_ms: Some(4_000),
+                        response_duration_ms: Some(4_500),
+                        ..crate::inference::GenerationDetails::default()
+                    }),
                     sources: vec![crate::tools::web_search::WebSource {
                         title: "Example".into(),
                         url: "https://example.com".into(),
@@ -232,6 +256,7 @@ mod saved_chat_tests {
         assert_eq!(saved.web_search_enabled, Some(true));
         assert_eq!(saved.profile.as_deref(), Some("profile-1"));
         assert_eq!(saved.tokens_per_second, vec![None, Some(18.75)]);
+        assert_eq!(saved.generation_details[1].unwrap().output_tokens, Some(75));
         let reopened = saved.to_current();
         assert!(matches!(
             &reopened.messages[1],
@@ -239,10 +264,14 @@ mod saved_chat_tests {
                 model: Some(model),
                 thinking_seconds: Some(30),
                 tokens_per_second: Some(tps),
+                generation_details: Some(details),
                 sources,
                 web_search_used: true,
                 ..
-            } if model == "model-a" && sources.len() == 1 && (tps - 18.75).abs() < f32::EPSILON
+            } if model == "model-a"
+                && sources.len() == 1
+                && details.prompt_tokens == Some(42)
+                && (tps - 18.75).abs() < f32::EPSILON
         ));
     }
 }

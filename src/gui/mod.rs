@@ -324,24 +324,32 @@ impl Program {
                 };
 
                 let thinking_selector = || -> Element<Message> {
-                    widget::pick_list(
-                        ThinkingChoice::from_levels(
+                    if standard_reasoning_slider_available(&self.user_information.thinking_levels) {
+                        compact_thinking_control(
+                            self.user_information.thinking_level,
                             &self.user_information.thinking_levels,
                             language,
-                        ),
-                        Some(ThinkingChoice {
-                            level: self.user_information.thinking_level,
-                            language,
-                        }),
-                        |choice| Message::ThinkingLevelChange(choice.level),
-                    )
-                    .placeholder(tr(language, "Thinking"))
-                    .padding([7, 10])
-                    .text_size(13)
-                    .style(pick_list_style)
-                    .menu_style(pick_list_menu_style)
-                    .width(Length::Fixed(126.0))
-                    .into()
+                        )
+                    } else {
+                        widget::pick_list(
+                            ThinkingChoice::from_levels(
+                                &self.user_information.thinking_levels,
+                                language,
+                            ),
+                            Some(ThinkingChoice {
+                                level: self.user_information.thinking_level,
+                                language,
+                            }),
+                            |choice| Message::ThinkingLevelChange(choice.level),
+                        )
+                        .placeholder(tr(language, "Thinking"))
+                        .padding([7, 10])
+                        .text_size(13)
+                        .style(pick_list_style)
+                        .menu_style(pick_list_menu_style)
+                        .width(Length::Fixed(126.0))
+                        .into()
+                    }
                 };
 
                 let live_response: Element<Message> = if let Some(active_prompt) = active_prompt {
@@ -2826,8 +2834,8 @@ impl Program {
                         Space::new().height(Length::Fixed(10.0)),
                         container(widget::row![
                             setting_label(
-                                tr(language, "Show tokens per second at bottom of message"),
-                                tr(language, "Display the generation speed under each assistant reply. Uses backend timing when available and otherwise times the generated stream.")
+                                tr(language, "Show generation statistics"),
+                                tr(language, "Show output speed, token counts, generation time, time to first token, and total response time. Uses backend timing when available and otherwise measures the stream locally.")
                             ),
                             widget::checkbox(self.show_tokens_per_second)
                                 .label(tr(language, "Enabled"))

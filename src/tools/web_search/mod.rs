@@ -15,7 +15,7 @@ use reqwest::{Client, StatusCode, header};
 use serde::{Deserialize, Serialize};
 use url::{Host, Url};
 
-use crate::inference::{EncodedImage, InferenceBackend};
+use crate::inference::{EncodedImage, GenerationDetails, InferenceBackend};
 
 mod fetch;
 mod providers;
@@ -362,6 +362,13 @@ pub enum WebSearchError {
     EmptyResults,
     InvalidToolCall,
     ModelToolsUnsupported,
+    /// Native function calling was accepted by the server, but the model
+    /// returned neither a tool call nor a usable answer. Locoryn can recover
+    /// by performing one compact search itself before a no-tools synthesis.
+    WebSearchNotPerformed,
+    /// Kept distinct from ordinary inference failures so NPU deployments with
+    /// a small `max_prompt_len` can retry with a compact, no-tools request.
+    ContextLengthExceeded(String),
     InferenceUnavailable(String),
     ProviderUnavailable(String),
     Cancelled,
@@ -386,6 +393,10 @@ impl WebSearchError {
             Self::ModelToolsUnsupported => {
                 "The selected model or inference server does not support tool calling."
             }
+            Self::WebSearchNotPerformed => "The model did not perform the requested web search.",
+            Self::ContextLengthExceeded(_) => {
+                "The inference request exceeded the model server's prompt-length limit. For OpenVINO on NPU, increase --max_prompt_len or shorten the active chat context."
+            }
             Self::InferenceUnavailable(_) => {
                 "The inference backend could not complete the tool-enabled response."
             }
@@ -396,7 +407,7 @@ impl WebSearchError {
 
     pub fn diagnostic(&self, api_key: Option<&str>) -> String {
         let detail = match self {
-            Self::InferenceUnavailable(detail) => {
+            Self::InferenceUnavailable(detail) | Self::ContextLengthExceeded(detail) => {
                 format!("inference backend unavailable: {detail}")
             }
             Self::ProviderUnavailable(detail) => {
@@ -409,13 +420,13 @@ impl WebSearchError {
 
     pub fn detailed_user_message(&self, api_key: Option<&str>) -> String {
         let detail = match self {
-            Self::InferenceUnavailable(detail) | Self::ProviderUnavailable(detail) => {
-                redact_secret(detail, api_key)
-                    .trim()
-                    .chars()
-                    .take(320)
-                    .collect::<String>()
-            }
+            Self::InferenceUnavailable(detail)
+            | Self::ProviderUnavailable(detail)
+            | Self::ContextLengthExceeded(detail) => redact_secret(detail, api_key)
+                .trim()
+                .chars()
+                .take(320)
+                .collect::<String>(),
             _ => String::new(),
         };
         if detail.is_empty() {

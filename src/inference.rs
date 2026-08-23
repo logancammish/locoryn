@@ -139,6 +139,43 @@ pub struct EncodedImage {
     pub data: String,
 }
 
+/// Durable generation measurements shown beside the output-token rate. Every
+/// field is optional because backend APIs expose different subsets. Durations
+/// are stored in milliseconds to keep saved chats readable and stable across
+/// platforms.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct GenerationDetails {
+    pub prompt_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub prompt_duration_ms: Option<u64>,
+    pub generation_duration_ms: Option<u64>,
+    pub time_to_first_token_ms: Option<u64>,
+    /// End-to-end time from Send until the response is reconciled. For web
+    /// requests this deliberately includes searching and page retrieval.
+    pub response_duration_ms: Option<u64>,
+    /// Backend-reported total when available (currently Ollama). This can be
+    /// slightly shorter than the end-to-end response duration above.
+    pub backend_total_duration_ms: Option<u64>,
+    pub load_duration_ms: Option<u64>,
+    /// True when generation duration (and therefore tok/s) was measured by the
+    /// client because the backend supplied a token count without a duration.
+    pub generation_duration_locally_measured: bool,
+}
+
+impl GenerationDetails {
+    pub fn is_empty(self) -> bool {
+        self.prompt_tokens.is_none()
+            && self.output_tokens.is_none()
+            && self.prompt_duration_ms.is_none()
+            && self.generation_duration_ms.is_none()
+            && self.time_to_first_token_ms.is_none()
+            && self.response_duration_ms.is_none()
+            && self.backend_total_duration_ms.is_none()
+            && self.load_duration_ms.is_none()
+    }
+}
+
 pub fn base_url(backend: InferenceBackend, location: &HostLocation) -> Result<url::Url, String> {
     let server = backend.server_name();
     let scheme = location
@@ -360,6 +397,7 @@ pub struct OpenAiStreamEvent {
     pub reasoning: String,
     pub tool_calls: Vec<serde_json::Value>,
     pub finish_reason: Option<String>,
+    pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
 }
 
@@ -404,6 +442,9 @@ pub fn decode_openai_stream_line(input: &str) -> Result<OpenAiStreamLine, String
     }
 
     let mut event = OpenAiStreamEvent {
+        prompt_tokens: value
+            .pointer("/usage/prompt_tokens")
+            .and_then(serde_json::Value::as_u64),
         completion_tokens: value
             .pointer("/usage/completion_tokens")
             .and_then(serde_json::Value::as_u64),

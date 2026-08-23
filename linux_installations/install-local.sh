@@ -20,7 +20,7 @@ fail() {
 [ "$(uname -s 2>/dev/null || true)" = Linux ] || fail 'This installer only supports Linux.'
 [ -n "${HOME:-}" ] || fail 'HOME is not set.'
 [ -f "$PAYLOAD_DIR/locoryn" ] || fail "Missing application binary: $PAYLOAD_DIR/locoryn"
-[ -f "$PAYLOAD_DIR/assets/icon.png" ] || fail 'The application icon is missing from the payload.'
+[ -f "$PAYLOAD_DIR/assets/icon-transparent.png" ] || fail 'The rounded application icon is missing from the payload.'
 [ -d "$PAYLOAD_DIR/config" ] || fail 'The config directory is missing from the payload.'
 [ -f "$DESKTOP_TEMPLATE" ] || fail "Missing desktop template: $DESKTOP_TEMPLATE"
 
@@ -78,7 +78,7 @@ fi
 
 rm -f "$LAUNCHER"
 ln -s "$INSTALL_DIR/locoryn" "$LAUNCHER"
-install -m 644 "$PAYLOAD_DIR/assets/icon.png" "$ICON_FILE"
+install -m 644 "$PAYLOAD_DIR/assets/icon-transparent.png" "$ICON_FILE"
 
 DESKTOP_EXEC=$(printf '%s' "$INSTALL_DIR/locoryn" | sed 's/\\/\\\\/g; s/"/\\"/g')
 SED_REPLACEMENT=$(printf '%s' "$DESKTOP_EXEC" | sed 's/[\\&|]/\\&/g')
@@ -94,4 +94,3 @@ fi
 
 printf '\nLocoryn %s is installed.\n' "$VERSION"
 printf 'Launch it from your application menu or run: %s\n' "$LAUNCHER"
-

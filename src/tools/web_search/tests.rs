@@ -15,7 +15,7 @@ fn progress_sender() -> tokio::sync::watch::Sender<ToolLoopProgress> {
     tokio::sync::watch::channel(ToolLoopProgress::default()).0
 }
 
-fn read_http_request(stream: &mut std::net::TcpStream) {
+fn read_http_request_bytes(stream: &mut std::net::TcpStream) -> Vec<u8> {
     let mut request = Vec::new();
     let mut chunk = [0_u8; 4096];
     loop {
@@ -43,6 +43,11 @@ fn read_http_request(stream: &mut std::net::TcpStream) {
             break;
         }
     }
+    request
+}
+
+fn read_http_request(stream: &mut std::net::TcpStream) {
+    let _ = read_http_request_bytes(stream);
 }
 
 struct CountingProvider(AtomicUsize);
@@ -209,6 +214,31 @@ fn api_keys_are_redacted_from_diagnostics() {
             .detailed_user_message(Some("secret-123"))
             .contains("bad key <redacted>")
     );
+}
+
+#[test]
+fn inference_errors_distinguish_tool_support_from_context_overflow() {
+    assert!(is_tools_unsupported_error(
+        "Tool parser is not configured for this model"
+    ));
+    assert!(!is_tools_unsupported_error(
+        "A tool returned an ordinary provider error"
+    ));
+    assert!(is_context_length_error(
+        "LLMExecutor failed: Input length exceeds the maximum allowed length"
+    ));
+    assert!(!is_context_length_error(
+        "temporary inference connection error"
+    ));
+    assert!(explicitly_requests_web_search(
+        "Using web search, find the latest release"
+    ));
+    assert!(explicitly_requests_web_search(
+        "Please search the web for this"
+    ));
+    assert!(!explicitly_requests_web_search(
+        "Explain what a binary search is"
+    ));
 }
 
 #[test]
@@ -678,6 +708,7 @@ fn ollama_inference_does_not_use_the_external_web_timeout() {
         chat_url: format!("http://{address}/api/chat"),
         model: "test-model".into(),
         prompt: "test prompt".into(),
+        user_prompt: "test prompt".into(),
         system_prompt: "test system prompt".into(),
         temperature: 0.0,
         context_tokens: 4_096,
@@ -745,6 +776,7 @@ fn openvino_inference_reads_openai_compatible_sse() {
         chat_url: format!("http://{address}/v3/chat/completions"),
         model: "qwen3".into(),
         prompt: "test prompt".into(),
+        user_prompt: "test prompt".into(),
         system_prompt: "test system prompt".into(),
         temperature: 0.0,
         context_tokens: 4_096,
@@ -760,7 +792,11 @@ fn openvino_inference_reads_openai_compatible_sse() {
         progress_sender,
         cancel: Arc::new(AtomicBool::new(false)),
         chat_storage_dir: None,
-        tool_settings: crate::tools::ToolSettings::default(),
+        tool_settings: crate::tools::ToolSettings {
+            web_search: false,
+            fetch_webpage: false,
+            ..crate::tools::ToolSettings::default()
+        },
         code_checking_enabled: false,
     };
 
@@ -824,6 +860,92 @@ fn transient_ollama_rate_limits_are_retried() {
 struct QueryRecordingProvider {
     queries: Mutex<Vec<(String, usize, WebSearchFreshness)>>,
     pages: Mutex<Vec<String>>,
+}
+
+#[test]
+fn openvino_prompt_overflow_retries_with_compact_web_synthesis() {
+    let _loopback_guard = LOOPBACK_TEST_LOCK.lock().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (request_sender, request_receiver) = std::sync::mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut native_request, _) = listener.accept().unwrap();
+        let native_payload = read_http_request_bytes(&mut native_request);
+        assert!(String::from_utf8_lossy(&native_payload).contains("\"tools\""));
+        let error = serde_json::json!({
+            "error": {
+                "message": "Mediapipe execution failed: Input length exceeds the maximum allowed length"
+            }
+        })
+        .to_string();
+        write!(
+            native_request,
+            "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{error}",
+            error.len()
+        )
+        .unwrap();
+
+        let (mut compact_request, _) = listener.accept().unwrap();
+        let compact_payload = read_http_request_bytes(&mut compact_request);
+        request_sender.send(compact_payload).unwrap();
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Verified result [1].\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":180,\"completion_tokens\":4}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        write!(
+            compact_request,
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+    });
+
+    let provider = Arc::new(QueryRecordingProvider {
+        queries: Mutex::new(Vec::new()),
+        pages: Mutex::new(Vec::new()),
+    });
+    let request = ToolLoopRequest {
+        backend: InferenceBackend::OpenVino,
+        chat_url: format!("http://{address}/v3/chat/completions"),
+        model: "qwen3-npu".into(),
+        prompt: format!("old conversation {}", "very long context ".repeat(2_000)),
+        user_prompt: "find the current stable release".into(),
+        system_prompt: "Be helpful.".into(),
+        temperature: 0.0,
+        context_tokens: 131_072,
+        max_response_tokens: 32_768,
+        images: Vec::new(),
+        thinking: serde_json::Value::Bool(true),
+        settings: WebSearchSettings {
+            enabled: true,
+            ..WebSearchSettings::default()
+        },
+        provider: Some(provider.clone()),
+        state_sender: crossbeam_channel::unbounded().0,
+        progress_sender: progress_sender(),
+        cancel: Arc::new(AtomicBool::new(false)),
+        chat_storage_dir: None,
+        tool_settings: crate::tools::ToolSettings::default(),
+        code_checking_enabled: false,
+    };
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let result = runtime.block_on(run_tool_loop(request)).unwrap();
+    server.join().unwrap();
+    let compact_payload = request_receiver.recv().unwrap();
+    let compact_payload = String::from_utf8_lossy(&compact_payload);
+
+    assert_eq!(result.answer, "Verified result [1].");
+    assert_eq!(result.sources.len(), 1);
+    assert_eq!(result.generation_details.prompt_tokens, Some(180));
+    assert!(!compact_payload.contains("\"tools\""));
+    assert!(!compact_payload.contains("very long context"));
+    assert!(compact_payload.len() < 8_000);
+    assert_eq!(
+        provider.queries.lock().unwrap()[0].0,
+        "find the current stable release"
+    );
 }
 
 #[async_trait]
@@ -919,6 +1041,7 @@ fn tool_round_limit_forces_final_synthesis_without_losing_progress() {
         chat_url: format!("http://{address}/api/chat"),
         model: "test-model".into(),
         prompt: "research this".into(),
+        user_prompt: "research this".into(),
         system_prompt: "test system prompt".into(),
         temperature: 0.0,
         context_tokens: 4_096,
@@ -1016,6 +1139,7 @@ fn empty_limit_synthesis_gets_a_clean_no_tools_recovery() {
         chat_url: format!("http://{address}/api/chat"),
         model: "test-model".into(),
         prompt: "research this".into(),
+        user_prompt: "research this".into(),
         system_prompt: "test system prompt".into(),
         temperature: 0.0,
         context_tokens: 4_096,
@@ -1194,6 +1318,7 @@ fn follow_up_research_rejects_one_broad_search_and_cross_references_sources() {
         chat_url: format!("http://{address}/api/chat"),
         model: "test-model".into(),
         prompt: "research this current topic thoroughly".into(),
+        user_prompt: "research this current topic thoroughly".into(),
         system_prompt: "test system prompt".into(),
         temperature: 0.0,
         context_tokens: 4_096,

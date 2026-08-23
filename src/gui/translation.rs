@@ -312,8 +312,23 @@ pub(super) fn tr(language: Language, english: &'static str) -> &'static str {
         "Show tokens per second at bottom of message" => {
             "Mostrar tokens por segundo al final del mensaje"
         }
+        "Show generation statistics" => "Mostrar estadísticas de generación",
+        "Show output speed, token counts, generation time, time to first token, and total response time. Uses backend timing when available and otherwise measures the stream locally." => {
+            "Muestra la velocidad de salida, los recuentos de tokens, el tiempo de generación, el tiempo hasta el primer token y el tiempo total de respuesta. Usa la medición del servidor cuando está disponible y, en caso contrario, mide el flujo localmente."
+        }
         "Display the generation speed under each assistant reply. Uses backend timing when available and otherwise times the generated stream." => {
             "Muestra la velocidad de generación bajo cada respuesta. Usa la medición del servidor cuando está disponible y, en caso contrario, mide el flujo generado."
+        }
+        "generated" => "generados",
+        "prompt tokens" => "tokens de entrada",
+        "Generation" => "Generación",
+        "First token" => "Primer token",
+        "Prompt processing" => "Procesamiento de entrada",
+        "Model load" => "Carga del modelo",
+        "Response total" => "Respuesta total",
+        "client timed" => "medido por el cliente",
+        "tok/s measures output generation only. Response total includes prompt processing, model loading, tools, and web research. OpenVINO timing is measured by Locoryn when the server omits a duration." => {
+            "tok/s mide solo la generación de salida. El total incluye el procesamiento de entrada, la carga del modelo, las herramientas y la investigación web. Locoryn mide OpenVINO cuando el servidor no indica una duración."
         }
         "Content filtering" => "Filtro de contenido",
         "Censor offensive, profane, sexual, and severely inappropriate words with # characters." => {

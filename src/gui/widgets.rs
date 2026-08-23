@@ -1,5 +1,145 @@
 use super::*;
 
+pub(super) fn standard_reasoning_slider_available(levels: &[ThinkingLevel]) -> bool {
+    [
+        ThinkingLevel::Low,
+        ThinkingLevel::Medium,
+        ThinkingLevel::High,
+    ]
+    .iter()
+    .all(|level| levels.contains(level))
+}
+
+fn reasoning_slider_style(_theme: &Theme, status: widget::slider::Status) -> widget::slider::Style {
+    let active = matches!(status, widget::slider::Status::Dragged);
+    widget::slider::Style {
+        rail: widget::slider::Rail {
+            backgrounds: (
+                Background::Color(accent()),
+                Background::Color(if is_dark_mode() {
+                    border_bright()
+                } else {
+                    border_soft()
+                }),
+            ),
+            width: 7.0,
+            border: Border {
+                radius: Radius::from(8.0),
+                ..Border::default()
+            },
+        },
+        handle: widget::slider::Handle {
+            shape: widget::slider::HandleShape::Circle {
+                radius: if active { 10.0 } else { 9.0 },
+            },
+            background: Background::Color(if is_dark_mode() {
+                text_main()
+            } else {
+                Color::WHITE
+            }),
+            border_width: 2.0,
+            border_color: accent_2(),
+        },
+    }
+}
+
+fn reasoning_slider<'a>(
+    selected: ThinkingLevel,
+    levels: &[ThinkingLevel],
+    language: Language,
+    width: Length,
+    show_labels: bool,
+) -> Element<'a, Message> {
+    let options = levels.to_vec();
+    let selected_index = options
+        .iter()
+        .position(|level| *level == selected)
+        .unwrap_or(0);
+    let maximum = options.len().saturating_sub(1) as f32;
+    let slider_options = options.clone();
+    let slider = widget::slider(0.0..=maximum, selected_index as f32, move |value| {
+        let index = (value.round() as usize).min(slider_options.len().saturating_sub(1));
+        Message::ThinkingLevelChange(slider_options[index])
+    })
+    .step(1.0_f32)
+    .width(width)
+    .style(reasoning_slider_style);
+
+    if !show_labels {
+        return slider.into();
+    }
+
+    let labels = options
+        .iter()
+        .map(|level| {
+            let selected_label = *level == selected;
+            container(
+                widget::text(
+                    ThinkingChoice {
+                        level: *level,
+                        language,
+                    }
+                    .to_string(),
+                )
+                .size(10)
+                .color(if selected_label {
+                    accent_2()
+                } else {
+                    text_faint()
+                })
+                .align_x(Horizontal::Center),
+            )
+            .width(Length::Fill)
+            .align_x(Horizontal::Center)
+            .into()
+        })
+        .collect::<Vec<Element<'a, Message>>>();
+
+    widget::column![
+        slider,
+        Space::new().height(Length::Fixed(4.0)),
+        widget::Row::with_children(labels).width(Length::Fill),
+    ]
+    .into()
+}
+
+pub(super) fn compact_thinking_control<'a>(
+    selected: ThinkingLevel,
+    levels: &[ThinkingLevel],
+    language: Language,
+) -> Element<'a, Message> {
+    let label = ThinkingChoice {
+        level: selected,
+        language,
+    }
+    .to_string();
+    let control = widget::column![
+        widget::text(label)
+            .size(10)
+            .color(accent_2())
+            .align_x(Horizontal::Center)
+            .width(Length::Fill),
+        reasoning_slider(selected, levels, language, Length::Fill, false),
+    ]
+    .spacing(iced::Pixels(2.0));
+
+    widget::tooltip(
+        container(control)
+            .padding([3, 8])
+            .width(Length::Fixed(176.0))
+            .style(flat_card_style),
+        container(
+            widget::text(tr(language, "Reasoning effort"))
+                .size(11)
+                .color(text_main()),
+        )
+        .padding(8)
+        .style(flat_card_style),
+        widget::tooltip::Position::Bottom,
+    )
+    .into()
+}
+
 pub(super) fn thinking_control<'a>(
     selected: ThinkingLevel,
     levels: &[ThinkingLevel],
@@ -16,7 +156,9 @@ pub(super) fn thinking_control<'a>(
         ThinkingLevel::Max => "Maximum reasoning the model offers",
     };
 
-    widget::column![
+    let selector: Element<'a, Message> = if standard_reasoning_slider_available(levels) {
+        reasoning_slider(selected, levels, language, Length::Fill, true)
+    } else {
         widget::pick_list(
             ThinkingChoice::from_levels(levels, language),
             Some(ThinkingChoice {
@@ -30,7 +172,12 @@ pub(super) fn thinking_control<'a>(
         .text_size(14)
         .style(pick_list_style)
         .menu_style(pick_list_menu_style)
-        .width(Length::Fill),
+        .width(Length::Fill)
+        .into()
+    };
+
+    widget::column![
+        selector,
         Space::new().height(Length::Fixed(6.0)),
         widget::text(tr(language, description))
             .size(11)
@@ -731,6 +878,7 @@ pub(super) fn message_bubble<'a>(
             text,
             thinking_seconds,
             tokens_per_second,
+            generation_details,
             sources,
             web_search_used,
             ..
@@ -835,19 +983,111 @@ pub(super) fn message_bubble<'a>(
                 .into()
             };
 
-            // Generation speed shown at the bottom of the reply when the
-            // setting is enabled. It uses backend timing where available and
-            // otherwise times the stream, independent of render batching.
+            // Generation telemetry is deliberately split into rate/count and
+            // timing rows. This explains what the headline tok/s value covers
+            // without making the reply header noisy.
             let speed_note: Element<'a, Message> = if show_tokens_per_second {
-                match tokens_per_second {
-                    Some(tps) => widget::column![
+                let mut counts = Vec::<String>::new();
+                let mut timings = Vec::<String>::new();
+                if let Some(tps) = tokens_per_second {
+                    counts.push(format!("{tps:.1} tok/s"));
+                }
+                if let Some(details) = generation_details {
+                    if let Some(tokens) = details.output_tokens {
+                        counts.push(format!("{tokens} {}", tr(language, "generated")));
+                    }
+                    if let Some(tokens) = details.prompt_tokens {
+                        counts.push(format!("{tokens} {}", tr(language, "prompt tokens")));
+                    }
+                    let format_seconds = |milliseconds: u64| {
+                        let seconds = milliseconds as f64 / 1_000.0;
+                        if seconds < 10.0 {
+                            format!("{seconds:.2}s")
+                        } else {
+                            format!("{seconds:.1}s")
+                        }
+                    };
+                    if let Some(duration) = details.generation_duration_ms {
+                        let local = if details.generation_duration_locally_measured {
+                            format!(" · {}", tr(language, "client timed"))
+                        } else {
+                            String::new()
+                        };
+                        timings.push(format!(
+                            "{} {}{local}",
+                            tr(language, "Generation"),
+                            format_seconds(duration),
+                        ));
+                    }
+                    if let Some(duration) = details.time_to_first_token_ms {
+                        timings.push(format!(
+                            "{} {}",
+                            tr(language, "First token"),
+                            format_seconds(duration),
+                        ));
+                    }
+                    if let Some(duration) = details.prompt_duration_ms {
+                        timings.push(format!(
+                            "{} {}",
+                            tr(language, "Prompt processing"),
+                            format_seconds(duration),
+                        ));
+                    }
+                    if let Some(duration) =
+                        details.load_duration_ms.filter(|duration| *duration > 0)
+                    {
+                        timings.push(format!(
+                            "{} {}",
+                            tr(language, "Model load"),
+                            format_seconds(duration),
+                        ));
+                    }
+                    if let Some(duration) = details.response_duration_ms {
+                        timings.push(format!(
+                            "{} {}",
+                            tr(language, "Response total"),
+                            format_seconds(duration),
+                        ));
+                    }
+                }
+
+                if counts.is_empty() && timings.is_empty() {
+                    widget::column![].into()
+                } else {
+                    let mut lines = widget::Column::new().spacing(iced::Pixels(2.0));
+                    if !counts.is_empty() {
+                        lines = lines.push(
+                            widget::text(counts.join(" · "))
+                                .size(11)
+                                .color(text_muted()),
+                        );
+                    }
+                    if !timings.is_empty() {
+                        lines = lines.push(
+                            widget::text(timings.join(" · "))
+                                .size(10)
+                                .color(text_faint()),
+                        );
+                    }
+                    widget::column![
                         Space::new().height(Length::Fixed(10.0)),
-                        widget::text(format!("{tps:.1} tokens/s"))
-                            .size(11)
-                            .color(text_muted()),
+                        widget::tooltip(
+                            lines,
+                            container(
+                                widget::text(tr(
+                                    language,
+                                    "tok/s measures output generation only. Response total includes prompt processing, model loading, tools, and web research. OpenVINO timing is measured by Locoryn when the server omits a duration."
+                                ))
+                                .size(11)
+                                .color(text_main())
+                            )
+                            .padding(9)
+                            .max_width(420)
+                            .style(flat_card_style),
+                            widget::tooltip::Position::Bottom,
+                        )
                     ]
-                    .into(),
-                    None => widget::column![].into(),
+                    .into()
                 }
             } else {
                 widget::column![].into()
@@ -895,8 +1135,8 @@ pub(super) fn message_bubble<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::web_search_activity_visible;
-    use crate::tools::web_search::WebSearchState;
+    use super::{standard_reasoning_slider_available, web_search_activity_visible};
+    use crate::{ThinkingLevel, tools::web_search::WebSearchState};
 
     #[test]
     fn local_tool_synthesis_never_shows_web_search_activity() {
@@ -908,5 +1148,19 @@ mod tests {
 
         assert!(!web_search_activity_visible(false, &state));
         assert!(web_search_activity_visible(true, &state));
+    }
+
+    #[test]
+    fn reasoning_slider_requires_low_medium_and_high() {
+        assert!(standard_reasoning_slider_available(&[
+            ThinkingLevel::Off,
+            ThinkingLevel::Low,
+            ThinkingLevel::Medium,
+            ThinkingLevel::High,
+        ]));
+        assert!(!standard_reasoning_slider_available(&[
+            ThinkingLevel::Low,
+            ThinkingLevel::High,
+        ]));
     }
 }

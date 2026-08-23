@@ -344,8 +344,8 @@ fi
 
 [ -f "$PACKAGE_ROOT/locoryn" ] && [ ! -L "$PACKAGE_ROOT/locoryn" ] \
     || fail 'The Locoryn executable is missing or is an unsafe symbolic link.'
-[ -f "$PACKAGE_ROOT/assets/icon.png" ] && [ ! -L "$PACKAGE_ROOT/assets/icon.png" ] \
-    || fail 'The release archive is missing a safe assets/icon.png file.'
+[ -f "$PACKAGE_ROOT/assets/icon-transparent.png" ] && [ ! -L "$PACKAGE_ROOT/assets/icon-transparent.png" ] \
+    || fail 'The release archive is missing a safe rounded application icon.'
 [ -d "$PACKAGE_ROOT/config" ] || fail 'The release archive is missing its config directory.'
 
 if [ -L "$LAUNCHER" ]; then
@@ -367,7 +367,7 @@ fi
 
 rm -f "$LAUNCHER"
 ln -s "$INSTALL_DIR/locoryn" "$LAUNCHER"
-install -m 644 "$PACKAGE_ROOT/assets/icon.png" "$ICON_FILE"
+install -m 644 "$PACKAGE_ROOT/assets/icon-transparent.png" "$ICON_FILE"
 
 DESKTOP_EXEC=$(printf '%s' "$LAUNCHER" | sed 's/\\/\\\\/g; s/"/\\"/g')
 SED_REPLACEMENT=$(printf '%s' "$DESKTOP_EXEC" | sed 's/[\\&|]/\\&/g')
