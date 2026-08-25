@@ -5608,6 +5608,61 @@ mod tests {
         }
     }
 
+    #[test]
+    fn desktop_icons_have_transparent_corners() {
+        let icons = [
+            ("icon.png", include_bytes!("../assets/icon.png").as_slice()),
+            (
+                "icon-transparent.png",
+                include_bytes!("../assets/icon-transparent.png").as_slice(),
+            ),
+        ];
+
+        for (name, bytes) in icons {
+            let icon = image::load_from_memory_with_format(bytes, image::ImageFormat::Png)
+                .unwrap_or_else(|error| panic!("failed to decode {name}: {error}"))
+                .into_rgba8();
+
+            assert_eq!(icon.dimensions(), (512, 512), "unexpected size for {name}");
+
+            for (x, y) in [(0, 0), (511, 0), (0, 511), (511, 511)] {
+                assert_eq!(
+                    icon.get_pixel(x, y).0[3],
+                    0,
+                    "{name} has an opaque corner at ({x}, {y})"
+                );
+            }
+
+            assert_eq!(
+                icon.get_pixel(256, 256).0[3],
+                255,
+                "{name} unexpectedly has a transparent center"
+            );
+        }
+
+        let windows_icon = image::load_from_memory_with_format(
+            include_bytes!("../assets/icon.ico"),
+            image::ImageFormat::Ico,
+        )
+        .expect("failed to decode icon.ico")
+        .into_rgba8();
+        let (width, height) = windows_icon.dimensions();
+
+        assert_eq!((width, height), (256, 256));
+        for (x, y) in [
+            (0, 0),
+            (width - 1, 0),
+            (0, height - 1),
+            (width - 1, height - 1),
+        ] {
+            assert_eq!(
+                windows_icon.get_pixel(x, y).0[3],
+                0,
+                "icon.ico has an opaque corner at ({x}, {y})"
+            );
+        }
+    }
+
     fn test_saved_chat(id: &str, profile: &str, updated_at: &str) -> SavedChat {
         let mut chat = SavedChat::from_current(
             id.to_string(),

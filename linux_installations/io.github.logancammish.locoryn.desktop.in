@@ -2,12 +2,12 @@
 Type=Application
 Version=1.0
 Name=Locoryn
-GenericName=Ollama desktop client
-Comment=Chat with local Ollama models
+GenericName=AI desktop client
+Comment=Chat with local AI models
 Exec="@EXEC@"
-Icon=io.github.logancammish.locoryn
+Icon=io.github.logancammish.locoryn-transparent
 Terminal=false
 Categories=Utility;Development;ArtificialIntelligence;
-Keywords=AI;LLM;Ollama;Chat;
+Keywords=AI;LLM;Ollama;Chat;OpenVINO
 StartupNotify=true
 StartupWMClass=io.github.logancammish.locoryn

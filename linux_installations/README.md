@@ -29,7 +29,7 @@ Files are installed to these per-user locations:
 - application: `~/.local/lib/locoryn`
 - command: `~/.local/bin/locoryn`
 - desktop entry: `$XDG_DATA_HOME/applications/io.github.logancammish.locoryn.desktop`
-- icon: `$XDG_DATA_HOME/icons/hicolor/512x512/apps/io.github.logancammish.locoryn.png`
+- icon: `$XDG_DATA_HOME/icons/hicolor/512x512/apps/io.github.logancammish.locoryn-transparent.png`
 
 `XDG_DATA_HOME` defaults to `~/.local/share`. Override the application or
 command locations with `LOCORYN_INSTALL_DIR` and `LOCORYN_BIN_DIR`.

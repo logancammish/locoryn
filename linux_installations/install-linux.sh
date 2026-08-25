@@ -2,6 +2,7 @@
 set -eu
 
 APP_ID=io.github.logancammish.locoryn
+ICON_ID=$APP_ID-transparent
 REPOSITORY=logancammish/locoryn
 GITHUB_API=https://api.github.com/repos/$REPOSITORY
 GITHUB_RELEASES=https://github.com/$REPOSITORY/releases
@@ -213,7 +214,8 @@ APPLICATIONS_DIR="$DATA_HOME/applications"
 ICON_DIR="$DATA_HOME/icons/hicolor/512x512/apps"
 LAUNCHER="$BIN_DIR/locoryn"
 DESKTOP_FILE="$APPLICATIONS_DIR/$APP_ID.desktop"
-ICON_FILE="$ICON_DIR/$APP_ID.png"
+ICON_FILE="$ICON_DIR/$ICON_ID.png"
+LEGACY_ICON_FILE="$ICON_DIR/$APP_ID.png"
 
 case "$INSTALL_DIR" in
     "$HOME"|"$HOME/"|"$HOME/.local"|"$HOME/.local/"|"$HOME/.local/lib"|"$HOME/.local/lib/"|/|"")
@@ -368,6 +370,7 @@ fi
 rm -f "$LAUNCHER"
 ln -s "$INSTALL_DIR/locoryn" "$LAUNCHER"
 install -m 644 "$PACKAGE_ROOT/assets/icon-transparent.png" "$ICON_FILE"
+rm -f "$LEGACY_ICON_FILE"
 
 DESKTOP_EXEC=$(printf '%s' "$LAUNCHER" | sed 's/\\/\\\\/g; s/"/\\"/g')
 SED_REPLACEMENT=$(printf '%s' "$DESKTOP_EXEC" | sed 's/[\\&|]/\\&/g')
@@ -379,6 +382,11 @@ if command -v update-desktop-database >/dev/null 2>&1; then
 fi
 if command -v gtk-update-icon-cache >/dev/null 2>&1; then
     gtk-update-icon-cache -f -t "$DATA_HOME/icons/hicolor" >/dev/null 2>&1 || true
+fi
+if command -v kbuildsycoca6 >/dev/null 2>&1; then
+    kbuildsycoca6 --noincremental >/dev/null 2>&1 || true
+elif command -v kbuildsycoca5 >/dev/null 2>&1; then
+    kbuildsycoca5 --noincremental >/dev/null 2>&1 || true
 fi
 
 say ""
