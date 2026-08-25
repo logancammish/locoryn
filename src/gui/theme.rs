@@ -646,17 +646,19 @@ pub(super) fn resize_rail_style(_theme: &Theme) -> Style {
     }
 }
 
+pub(super) const SIDEBAR_RESIZE_HANDLE_WIDTH: f32 = 6.0;
+
 pub(super) fn sidebar_resize_handle<'a>() -> Element<'a, Message> {
     widget::mouse_area(
         container(
             container(Space::new())
                 .width(Length::Fixed(2.0))
-                .height(Length::Fill)
+                .height(Length::Fixed(54.0))
                 .style(resize_rail_style),
         )
         .center_x(Length::Fill)
         .center_y(Length::Fill)
-        .width(Length::Fixed(10.0))
+        .width(Length::Fixed(SIDEBAR_RESIZE_HANDLE_WIDTH))
         .height(Length::Fill),
     )
     .on_press(Message::StartUiResize(crate::UiResizeTarget::Sidebar))

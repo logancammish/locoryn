@@ -30,6 +30,10 @@ use widgets::*;
 
 pub(crate) use theme::set_dark_mode;
 
+// Iced scrollbars float above scrollable content. Keep sidebar row actions out
+// of that overlay without making the sidebar itself wider.
+const SIDEBAR_SCROLLBAR_CLEARANCE: f32 = 14.0;
+
 impl Program {
     pub fn get_ui_information<'a>(
         &'a self,
@@ -870,7 +874,16 @@ impl Program {
                         ],
                         Space::new().height(Length::Fixed(18.0)),
                         widget::scrollable(
-                            widget::Column::with_children(entries).spacing(iced::Pixels(6.0))
+                            container(
+                                widget::Column::with_children(entries).spacing(iced::Pixels(6.0))
+                            )
+                            .padding(iced::Padding {
+                                top: 0.0,
+                                right: SIDEBAR_SCROLLBAR_CLEARANCE,
+                                bottom: 0.0,
+                                left: 0.0,
+                            })
+                            .width(Length::Fill)
                         ),
                         // Reserve room for the profile switcher overlaid in
                         // the bottom-left corner.
@@ -985,8 +998,17 @@ impl Program {
                     }
                     container(widget::column![
                         widget::scrollable(
-                            widget::Column::with_children(compact_entries)
-                                .spacing(iced::Pixels(5.0)),
+                            container(
+                                widget::Column::with_children(compact_entries)
+                                    .spacing(iced::Pixels(5.0))
+                            )
+                            .padding(iced::Padding {
+                                top: 0.0,
+                                right: SIDEBAR_SCROLLBAR_CLEARANCE,
+                                bottom: 0.0,
+                                left: 0.0,
+                            })
+                            .width(Length::Fill),
                         ),
                         // Reserve room for the profile switcher overlaid in
                         // the bottom-left corner.
@@ -1462,7 +1484,9 @@ impl Program {
                     if self.chat_menu_open && self.sidebar_animation >= 0.998 {
                         sidebar_resize_handle()
                     } else {
-                        Space::new().width(Length::Fixed(10.0)).into()
+                        Space::new()
+                            .width(Length::Fixed(SIDEBAR_RESIZE_HANDLE_WIDTH))
+                            .into()
                     };
                 let workspace: Element<Message> =
                     widget::row![chat_sidebar, sidebar_handle, content].into();

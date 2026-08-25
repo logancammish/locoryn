@@ -400,6 +400,10 @@ fn tool_limits_are_bounded() {
     assert!(!single_search_budget.take_search());
     assert!(single_search_budget.take_code_check());
     assert!(!single_search_budget.take_code_check());
+    for _ in 0..CONVERSATION_SEARCHES_PER_MESSAGE {
+        assert!(single_search_budget.take_conversation_search());
+    }
+    assert!(!single_search_budget.take_conversation_search());
 
     let multiple_settings = WebSearchSettings {
         allow_multiple_searches: true,
@@ -437,6 +441,8 @@ fn tool_guidance_matches_the_repeated_search_setting() {
     assert!(research_guidance.contains("Run 3 to 6"));
     assert!(research_guidance.contains("at least 2 independent"));
     assert!(research_guidance.contains("Prefer standards documents."));
+    assert!(single_guidance.contains("1-5 distinctive"));
+    assert!(single_guidance.contains("not a question or instruction"));
 
     let single_search_tools = tool_definitions(&single_settings);
     let repeated_search_tools = tool_definitions(&research_settings);
@@ -623,6 +629,114 @@ fn malformed_tool_calls_are_returned_as_recoverable_feedback() {
 }
 
 #[test]
+fn conversation_search_can_retry_with_a_broader_query_and_then_answer() {
+    let _loopback_guard = LOOPBACK_TEST_LOCK.lock().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let responses = [
+        serde_json::json!({
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "function": {
+                        "name": "search_locoryn_conversations",
+                        "arguments": {"query": "lighthouse deployment deadline"}
+                    }
+                }]
+            }
+        })
+        .to_string(),
+        serde_json::json!({
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "function": {
+                        "name": "search_locoryn_conversations",
+                        "arguments": {"query": "lighthouse deployment"}
+                    }
+                }]
+            }
+        })
+        .to_string(),
+        serde_json::json!({
+            "message": {
+                "role": "assistant",
+                "content": "The saved chat says the lighthouse deployment is next week."
+            }
+        })
+        .to_string(),
+    ];
+    let server = thread::spawn(move || {
+        for body in responses {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_http_request(&mut stream);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        }
+    });
+
+    let dir = std::env::temp_dir().join("locoryn-test-tool-loop-conversation-retry");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let chats = serde_json::json!([{
+        "id": "matching-chat",
+        "profile": "profile-a",
+        "title": "Lighthouse plan",
+        "updated_at": "2026-01-01T00:00:00Z",
+        "messages": [
+            {"role": "user", "text": "When is the lighthouse deployment?"},
+            {"role": "bot", "text": "It is planned for next week."}
+        ]
+    }]);
+    std::fs::write(dir.join("chats.json"), chats.to_string()).unwrap();
+
+    let (progress_sender, _) = tokio::sync::watch::channel(ToolLoopProgress::default());
+    let request = ToolLoopRequest {
+        backend: InferenceBackend::Ollama,
+        chat_url: format!("http://{address}/api/chat"),
+        model: "test-model".into(),
+        prompt: "What did we decide about the lighthouse deployment?".into(),
+        user_prompt: "What did we decide about the lighthouse deployment?".into(),
+        system_prompt: "test system prompt".into(),
+        temperature: 0.0,
+        context_tokens: 4_096,
+        max_response_tokens: 512,
+        images: Vec::new(),
+        thinking: serde_json::Value::Bool(false),
+        settings: WebSearchSettings::default(),
+        tool_settings: crate::tools::ToolSettings {
+            web_search: false,
+            fetch_webpage: false,
+            ..crate::tools::ToolSettings::default()
+        },
+        code_checking_enabled: false,
+        provider: None,
+        state_sender: crossbeam_channel::unbounded().0,
+        progress_sender,
+        cancel: Arc::new(AtomicBool::new(false)),
+        chat_storage_dir: Some(dir.clone()),
+        conversation_profile_id: "profile-a".into(),
+    };
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let result = runtime.block_on(run_tool_loop(request)).unwrap();
+    server.join().unwrap();
+
+    assert_eq!(
+        result.answer,
+        "The saved chat says the lighthouse deployment is next week."
+    );
+    assert!(result.sources.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn page_excerpt_budget_scales_with_context_but_stays_bounded() {
     assert_eq!(page_text_limit(4_096, 6), 2_000);
     assert_eq!(page_text_limit(1_000_000, 6), MAX_PAGE_TEXT_CHARS);
@@ -725,6 +839,7 @@ fn ollama_inference_does_not_use_the_external_web_timeout() {
         progress_sender,
         cancel: Arc::new(AtomicBool::new(false)),
         chat_storage_dir: None,
+        conversation_profile_id: crate::app::LEGACY_PROFILE_ID.to_string(),
         tool_settings: crate::tools::ToolSettings::default(),
         code_checking_enabled: false,
     };
@@ -792,6 +907,7 @@ fn openvino_inference_reads_openai_compatible_sse() {
         progress_sender,
         cancel: Arc::new(AtomicBool::new(false)),
         chat_storage_dir: None,
+        conversation_profile_id: crate::app::LEGACY_PROFILE_ID.to_string(),
         tool_settings: crate::tools::ToolSettings {
             web_search: false,
             fetch_webpage: false,
@@ -926,6 +1042,7 @@ fn openvino_prompt_overflow_retries_with_compact_web_synthesis() {
         progress_sender: progress_sender(),
         cancel: Arc::new(AtomicBool::new(false)),
         chat_storage_dir: None,
+        conversation_profile_id: crate::app::LEGACY_PROFILE_ID.to_string(),
         tool_settings: crate::tools::ToolSettings::default(),
         code_checking_enabled: false,
     };
@@ -1063,6 +1180,7 @@ fn tool_round_limit_forces_final_synthesis_without_losing_progress() {
         progress_sender,
         cancel: Arc::new(AtomicBool::new(false)),
         chat_storage_dir: None,
+        conversation_profile_id: crate::app::LEGACY_PROFILE_ID.to_string(),
         tool_settings: crate::tools::ToolSettings::default(),
         code_checking_enabled: false,
     };
@@ -1161,6 +1279,7 @@ fn empty_limit_synthesis_gets_a_clean_no_tools_recovery() {
         progress_sender,
         cancel: Arc::new(AtomicBool::new(false)),
         chat_storage_dir: None,
+        conversation_profile_id: crate::app::LEGACY_PROFILE_ID.to_string(),
         tool_settings: crate::tools::ToolSettings::default(),
         code_checking_enabled: false,
     };
@@ -1335,6 +1454,7 @@ fn follow_up_research_rejects_one_broad_search_and_cross_references_sources() {
         progress_sender: progress_sender(),
         cancel: Arc::new(AtomicBool::new(false)),
         chat_storage_dir: None,
+        conversation_profile_id: crate::app::LEGACY_PROFILE_ID.to_string(),
         tool_settings: crate::tools::ToolSettings::default(),
         code_checking_enabled: false,
     };

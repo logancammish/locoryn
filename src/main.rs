@@ -197,6 +197,7 @@ enum Message {
     ChooseChatFolder,
     ChatFolderSelected(Option<PathBuf>),
     AsyncResult(()),
+    ModelsLoaded(InferenceBackend, Result<Vec<String>, String>),
     PromptFinished(String),
     ListPrompt,
     ThinkingLevelChange(ThinkingLevel),
@@ -1627,6 +1628,13 @@ fn append_failed_response(
         });
 }
 
+fn preferred_or_first_model(preferred: Option<&str>, available: &[String]) -> Option<String> {
+    preferred
+        .filter(|preferred| available.iter().any(|model| model == *preferred))
+        .map(str::to_string)
+        .or_else(|| available.first().cloned())
+}
+
 async fn wait_until_cancelled(cancel: &AtomicBool) {
     while !cancel.load(Ordering::Relaxed) {
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2647,7 +2655,7 @@ impl Program {
                 had_image,
                 web_search_enabled,
                 temporary: self.temporary_chat,
-                profile_id: prompt_profile_id,
+                profile_id: prompt_profile_id.clone(),
             },
         );
 
@@ -2715,6 +2723,7 @@ impl Program {
                         progress_sender: web_progress_sender,
                         cancel: Arc::clone(&cancel),
                         chat_storage_dir: Some(chat_storage_dir),
+                        conversation_profile_id: prompt_profile_id,
                     })
                     .await;
 
@@ -3173,6 +3182,54 @@ impl Program {
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::AsyncResult(_result) => Task::none(),
+
+            Message::ModelsLoaded(backend, result) => {
+                // A backend can be switched while its model request is still in flight.
+                // Ignore that stale response instead of selecting a model from the old backend.
+                if backend != self.user_information.backend {
+                    return Task::none();
+                }
+
+                match result {
+                    Ok(names) => {
+                        let selected = preferred_or_first_model(
+                            self.user_information.model.as_deref(),
+                            &names,
+                        );
+                        *self.app_state.bots_list.lock().unwrap() = names;
+                        if let Some(model) = selected {
+                            let changed = self.user_information.model.as_ref() != Some(&model);
+                            let capabilities_unknown =
+                                self.user_information.thinking_supported.is_none()
+                                    && self.user_information.vision_supported.is_none();
+                            if changed || capabilities_unknown {
+                                self.update(Message::ModelChange(model))
+                            } else {
+                                Task::none()
+                            }
+                        } else {
+                            self.user_information.model = None;
+                            self.user_information.thinking_level = ThinkingLevel::Off;
+                            self.user_information.thinking_levels = vec![ThinkingLevel::Off];
+                            self.user_information.thinking_supported = None;
+                            self.user_information.vision_supported = None;
+                            Task::none()
+                        }
+                    }
+                    Err(error) => {
+                        self.app_state.bots_list.lock().unwrap().clear();
+                        self.set_debug_message(DebugMessage {
+                            message: format!(
+                                "Could not list models from {}",
+                                backend.server_name()
+                            ),
+                            is_error: true,
+                        });
+                        println!("Error listing models: {error}");
+                        Task::none()
+                    }
+                }
+            }
 
             Message::PromptFinished(chat_id) => {
                 self.finish_prompt(&chat_id);
@@ -3842,12 +3899,9 @@ impl Program {
                             return Task::none();
                         }
                     };
-                    let bots_list = Arc::clone(&self.app_state.bots_list);
-                    let channels = self.channels.clone();
-
                     return Task::perform(
                         async move {
-                            let result = match reqwest::get(url).await {
+                            match reqwest::get(url).await {
                                 Ok(response) if response.status().is_success() => response
                                     .json::<serde_json::Value>()
                                     .await
@@ -3855,28 +3909,9 @@ impl Program {
                                     .and_then(|json| model_names(backend, &json)),
                                 Ok(response) => Err(format!("HTTP {}", response.status())),
                                 Err(error) => Err(error.to_string()),
-                            };
-                            match result {
-                                Ok(names) => {
-                                    *bots_list.lock().unwrap() = names;
-                                }
-                                Err(e) => {
-                                    Channels::send_request_to_channel(
-                                        Arc::clone(&channels.debug_channel),
-                                        DebugMessage {
-                                            message: format!(
-                                                "Could not list models from {}",
-                                                backend.server_name()
-                                            ),
-                                            is_error: true,
-                                        },
-                                    );
-                                    bots_list.lock().unwrap().clear();
-                                    println!("Error listing models: {e}");
-                                }
                             }
                         },
-                        Message::AsyncResult,
+                        move |result| Message::ModelsLoaded(backend, result),
                     );
                 }
 
@@ -4494,13 +4529,17 @@ impl Program {
             }
 
             Message::ModelChange(model) => {
+                let changed = self.user_information.model.as_ref() != Some(&model);
                 self.user_information.model = Some(model.clone());
-                self.user_information.thinking_supported = None;
-                self.user_information.vision_supported = None;
-                self.user_information.thinking_levels = vec![ThinkingLevel::Off];
-                // Reasoning support and accepted effort values vary by model. Do not carry an
-                // effort setting across models while capability detection is still in flight.
-                self.user_information.thinking_level = ThinkingLevel::Off;
+                self.persist_setting_value("model", serde_json::Value::String(model.clone()));
+                if changed {
+                    self.user_information.thinking_supported = None;
+                    self.user_information.vision_supported = None;
+                    self.user_information.thinking_levels = vec![ThinkingLevel::Off];
+                    // Reasoning support and accepted effort values vary by model. Do not carry an
+                    // effort setting across models while capability detection is still in flight.
+                    self.user_information.thinking_level = ThinkingLevel::Off;
+                }
                 if self.user_information.backend == InferenceBackend::OpenVino {
                     // OVMS exposes reasoning through chat-template parameters. The
                     // exact accepted values remain model/template specific, so offer
@@ -4866,6 +4905,12 @@ impl Default for Program {
             .cloned()
             .and_then(|value| serde_json::from_value::<BackendConnections>(value).ok())
             .unwrap_or_default();
+        let model = settings_hmap
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_string);
         let legacy_configured_dir = settings_hmap
             .get("chat_storage_dir")
             .and_then(|value| value.as_str())
@@ -5017,7 +5062,7 @@ impl Default for Program {
                 current_chat_history_enabled,
                 backend,
                 backend_connections,
-                model: None,
+                model,
                 thinking_level: ThinkingLevel::Off,
                 thinking_levels: vec![ThinkingLevel::Off],
                 thinking_supported: None,
@@ -5127,8 +5172,8 @@ mod tests {
         decode_inference_stream_line, disabled_web_tool_message, ensure_legacy_profile,
         mask_live_code_blocks, merge_generation_chunk_details, model_capabilities,
         normalize_code_fence_languages, parse_live_markdown_items, parse_markdown_items,
-        read_json_with_backup, remote_image_url_is_safe, sidecar_path, split_thinking_text,
-        tokens_per_second, write_json_safely,
+        preferred_or_first_model, read_json_with_backup, remote_image_url_is_safe, sidecar_path,
+        split_thinking_text, tokens_per_second, write_json_safely,
     };
 
     fn test_active_prompt(
@@ -5184,6 +5229,75 @@ mod tests {
     #[test]
     fn content_filter_replaces_entire_inappropriate_words_with_hashes() {
         assert_eq!(censor_text("hello crap"), "hello ####");
+    }
+
+    #[test]
+    fn model_selection_prefers_the_remembered_available_model() {
+        let models = vec!["first-model".to_string(), "remembered-model".to_string()];
+
+        assert_eq!(
+            preferred_or_first_model(Some("remembered-model"), &models).as_deref(),
+            Some("remembered-model")
+        );
+    }
+
+    #[test]
+    fn model_selection_falls_back_to_the_first_available_model() {
+        let models = vec!["first-model".to_string(), "second-model".to_string()];
+
+        assert_eq!(
+            preferred_or_first_model(Some("missing-model"), &models).as_deref(),
+            Some("first-model")
+        );
+        assert_eq!(
+            preferred_or_first_model(None, &models).as_deref(),
+            Some("first-model")
+        );
+        assert_eq!(preferred_or_first_model(None, &[]), None);
+    }
+
+    #[test]
+    fn loaded_models_select_and_persist_the_valid_remembered_model() {
+        let mut program = Program::default();
+        program.user_information.backend = InferenceBackend::OpenVino;
+        program.user_information.model = Some("remembered-model".into());
+        program.pending_settings.clear();
+
+        let _ = program.update(Message::ModelsLoaded(
+            InferenceBackend::OpenVino,
+            Ok(vec!["first-model".into(), "remembered-model".into()]),
+        ));
+
+        assert_eq!(
+            program.user_information.model.as_deref(),
+            Some("remembered-model")
+        );
+        assert_eq!(
+            program.pending_settings.get("model"),
+            Some(&serde_json::json!("remembered-model"))
+        );
+    }
+
+    #[test]
+    fn loaded_models_select_and_persist_the_first_model_as_fallback() {
+        let mut program = Program::default();
+        program.user_information.backend = InferenceBackend::OpenVino;
+        program.user_information.model = Some("missing-model".into());
+        program.pending_settings.clear();
+
+        let _ = program.update(Message::ModelsLoaded(
+            InferenceBackend::OpenVino,
+            Ok(vec!["first-model".into(), "second-model".into()]),
+        ));
+
+        assert_eq!(
+            program.user_information.model.as_deref(),
+            Some("first-model")
+        );
+        assert_eq!(
+            program.pending_settings.get("model"),
+            Some(&serde_json::json!("first-model"))
+        );
     }
 
     #[test]
