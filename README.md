@@ -232,7 +232,9 @@ Educational and shared-device deployments can set a password under **Settings
 → Advanced settings → Password protection**. Advanced settings are always
 covered when protection is enabled; **Protection coverage** can extend the lock
 to the standard Settings page and its compact chat configuration controls.
-Leaving the protected settings area locks it again.
+Choose the coverage first, then select **Save and enable**. Locoryn immediately
+writes the complete password policy and shows the lock screen so the new
+password can be verified. Leaving the protected settings area locks it again.
 
 The configuration is deliberately reproducible: `password_enabled`, `password`,
 and `password_scope` are ordinary top-level values in the local `settings.json`.

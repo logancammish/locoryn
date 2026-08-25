@@ -174,6 +174,18 @@ impl PasswordProtection {
         self.unlock_input.clear();
         self.error = None;
     }
+
+    fn setting_values(&self) -> [(&'static str, serde_json::Value); 3] {
+        [
+            ("password_enabled", serde_json::Value::Bool(self.enabled)),
+            ("password", serde_json::Value::String(self.password.clone())),
+            (
+                "password_scope",
+                serde_json::to_value(self.scope)
+                    .unwrap_or_else(|_| serde_json::Value::String("all_settings".to_string())),
+            ),
+        ]
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -369,6 +381,69 @@ enum Message {
     ChangeProtocol(String),
     ChangeIp(String),
     ChangePort(String),
+}
+
+#[derive(Clone, Copy)]
+enum ProtectedSettingsArea {
+    Standard,
+    Advanced,
+}
+
+impl Message {
+    fn protected_settings_area(&self) -> Option<ProtectedSettingsArea> {
+        match self {
+            Self::ToggleWebSearch
+            | Self::ToggleTools
+            | Self::ToggleMultipleWebSearches
+            | Self::ToggleWebSearchTool
+            | Self::ToggleFetchWebpageTool
+            | Self::ToggleConversationSearchTool
+            | Self::ToggleCodeCheckingTool
+            | Self::WebSearchProviderChange(_)
+            | Self::WebSearchApiKeyChange(_)
+            | Self::WebSearchResultLimitChange(_)
+            | Self::WebSearchMaximumSearchesChange(_)
+            | Self::WebSearchMaximumPageFetchesChange(_)
+            | Self::WebSearchMinimumSuccessfulSearchesChange(_)
+            | Self::WebSearchMinimumIndependentPagesChange(_)
+            | Self::WebSearchToolIterationLimitChange(_)
+            | Self::WebSearchRequestTimeoutChange(_)
+            | Self::WebSearchCustomInstructionsChange(_)
+            | Self::ChooseChatFolder
+            | Self::ChatFolderSelected(_)
+            | Self::SystemPromptChange(_)
+            | Self::UpdateTextSize(_)
+            | Self::FontFamilyChange(_)
+            | Self::UpdateTemperature(_)
+            | Self::UpdateMaxResponseTokens(_)
+            | Self::EditMaxResponseTokens(_)
+            | Self::ApplyMaxResponseTokens
+            | Self::UpdateContextTokens(_)
+            | Self::EditContextTokens(_)
+            | Self::ApplyContextTokens
+            | Self::ToggleDynamicDate
+            | Self::ToggleDynamicTime
+            | Self::DynamicCustomInstructionsChanged(_)
+            | Self::LanguageChange(_)
+            | Self::ThinkingLevelChange(_)
+            | Self::ToggleDarkMode
+            | Self::ToggleChatHistory
+            | Self::WipeChatHistory => Some(ProtectedSettingsArea::Standard),
+            Self::ChangeBatchTokens(_)
+            | Self::ToggleFastStreaming
+            | Self::UpdateInstall(_)
+            | Self::InstallModel(_)
+            | Self::ToggleCodeChecking
+            | Self::ToggleFiltering
+            | Self::ToggleShowTokensPerSecond
+            | Self::ToggleInfoPopupSetting
+            | Self::BackendChange(_)
+            | Self::ChangeProtocol(_)
+            | Self::ChangeIp(_)
+            | Self::ChangePort(_) => Some(ProtectedSettingsArea::Advanced),
+            _ => None,
+        }
+    }
 }
 
 struct ActivePrompt {
@@ -2064,6 +2139,15 @@ impl Program {
             return;
         }
 
+        if let Err(error) = self.flush_pending_settings_now() {
+            self.set_debug_message(DebugMessage {
+                message: format!("Could not save setting: {error}"),
+                is_error: true,
+            });
+        }
+    }
+
+    fn flush_pending_settings_now(&mut self) -> Result<(), String> {
         let pending = std::mem::take(&mut self.pending_settings);
         let mut settings: serde_json::Map<String, serde_json::Value> = load_settings_text()
             .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
@@ -2071,17 +2155,22 @@ impl Program {
             .unwrap_or_default();
         settings.extend(pending.clone());
         let settings_path = user_settings_path();
-        let result = write_json_safely(&settings_path, &settings);
-        if let Err(error) = result {
+        if let Err(error) = write_json_safely(&settings_path, &settings) {
             self.pending_settings.extend(pending);
             self.settings_dirty_at = Some(Instant::now());
-            self.set_debug_message(DebugMessage {
-                message: format!("Could not save setting: {error}"),
-                is_error: true,
-            });
+            Err(error)
         } else {
             self.settings_dirty_at = None;
+            Ok(())
         }
+    }
+
+    fn persist_password_protection_now(&mut self) -> Result<(), String> {
+        for (key, value) in self.password_protection.setting_values() {
+            self.pending_settings.insert(key.to_string(), value);
+        }
+        self.settings_dirty_at = Some(Instant::now());
+        self.flush_pending_settings_now()
     }
 
     fn persist_chat_storage_dir(&mut self) -> Result<(), String> {
@@ -3281,6 +3370,25 @@ impl Program {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        if let Some(area) = message.protected_settings_area() {
+            let locked = match area {
+                ProtectedSettingsArea::Standard => {
+                    self.password_protection.protects_standard_settings()
+                        && !self.password_protection.unlocked
+                }
+                ProtectedSettingsArea::Advanced => {
+                    self.password_protection.is_active() && !self.password_protection.unlocked
+                }
+            };
+            if locked {
+                self.set_debug_message(DebugMessage {
+                    message: "That setting is password protected.".to_string(),
+                    is_error: true,
+                });
+                return Task::none();
+            }
+        }
+
         match message {
             Message::AsyncResult(_result) => Task::none(),
 
@@ -4242,14 +4350,20 @@ impl Program {
 
                 self.password_protection.password =
                     std::mem::take(&mut self.password_protection.new_password_input);
-                // An administrator changing a live password has already reached
-                // the protected page, so do not lock the form out from under them.
-                self.password_protection.unlocked = self.password_protection.enabled;
+                self.password_protection.enabled = true;
+                self.password_protection.unlocked = true;
                 self.password_protection.error = None;
-                self.persist_setting_value(
-                    "password",
-                    serde_json::Value::String(self.password_protection.password.clone()),
-                );
+                match self.persist_password_protection_now() {
+                    Ok(()) => {
+                        // Lock immediately so enabling protection has an obvious,
+                        // testable effect and the new password is verified once.
+                        self.password_protection.lock();
+                    }
+                    Err(error) => {
+                        self.password_protection.error =
+                            Some(format!("Could not save password protection: {error}"));
+                    }
+                }
                 Task::none()
             }
 
@@ -4260,17 +4374,28 @@ impl Program {
 
                 if !self.password_protection.enabled && self.password_protection.password.is_empty()
                 {
-                    self.password_protection.error =
-                        Some("Set a non-empty password before enabling protection.".to_string());
-                    return Task::none();
+                    if self.password_protection.new_password_input.is_empty() {
+                        self.password_protection.error = Some(
+                            "Enter a non-empty password before enabling protection.".to_string(),
+                        );
+                        return Task::none();
+                    }
+                    self.password_protection.password =
+                        std::mem::take(&mut self.password_protection.new_password_input);
                 }
 
                 self.password_protection.enabled = !self.password_protection.enabled;
-                if self.password_protection.enabled {
-                    self.password_protection.unlocked = true;
-                }
+                let enabling = self.password_protection.enabled;
+                self.password_protection.unlocked = true;
                 self.password_protection.error = None;
-                self.persist_boolean_setting("password_enabled", self.password_protection.enabled);
+                match self.persist_password_protection_now() {
+                    Ok(()) if enabling => self.password_protection.lock(),
+                    Ok(()) => self.password_protection.unlocked = false,
+                    Err(error) => {
+                        self.password_protection.error =
+                            Some(format!("Could not save password protection: {error}"));
+                    }
+                }
                 Task::none()
             }
 
@@ -4280,12 +4405,9 @@ impl Program {
                 }
 
                 self.password_protection.scope = scope;
-                match serde_json::to_value(scope) {
-                    Ok(value) => self.persist_setting_value("password_scope", value),
-                    Err(error) => self.set_debug_message(DebugMessage {
-                        message: format!("Could not save password-protection scope: {error}"),
-                        is_error: true,
-                    }),
+                if let Err(error) = self.persist_password_protection_now() {
+                    self.password_protection.error =
+                        Some(format!("Could not save password protection: {error}"));
                 }
                 Task::none()
             }
@@ -5759,34 +5881,76 @@ mod tests {
     }
 
     #[test]
-    fn password_configuration_is_queued_as_plaintext_flat_settings() {
+    fn locked_settings_reject_mutations_beyond_the_view_layer() {
+        let mut program = Program::default();
+        program.password_protection.enabled = true;
+        program.password_protection.password = "teacher".into();
+        program.password_protection.scope = PasswordProtectionScope::AllSettings;
+        program.password_protection.unlocked = false;
+        let original_text_size = program.user_information.text_size;
+        let original_filtering = program.app_state.filtering;
+
+        drop(program.update(Message::UpdateTextSize(original_text_size + 5.0)));
+        drop(program.update(Message::ToggleFiltering));
+
+        assert_eq!(program.user_information.text_size, original_text_size);
+        assert_eq!(program.app_state.filtering, original_filtering);
+
+        program.password_protection.scope = PasswordProtectionScope::AdvancedSettingsOnly;
+        drop(program.update(Message::UpdateTextSize(original_text_size + 5.0)));
+        drop(program.update(Message::ToggleFiltering));
+
+        assert_eq!(program.user_information.text_size, original_text_size + 5.0);
+        assert_eq!(program.app_state.filtering, original_filtering);
+
+        program.password_protection.unlocked = true;
+        drop(program.update(Message::ToggleFiltering));
+        assert_ne!(program.app_state.filtering, original_filtering);
+    }
+
+    #[test]
+    fn password_configuration_is_saved_flat_and_locks_immediately() {
         let mut program = Program::default();
         program.app_state.gui_state = GUIState::AdvancedSettings;
         program.password_protection = PasswordProtection::default();
         program.pending_settings.clear();
 
+        drop(program.update(Message::PasswordProtectionScopeChanged(
+            PasswordProtectionScope::AdvancedSettingsOnly,
+        )));
         drop(program.update(Message::NewPasswordInputChanged(
             "shared-classroom-password".into(),
         )));
         drop(program.update(Message::SavePassword));
-        drop(program.update(Message::TogglePasswordProtection));
-        drop(program.update(Message::PasswordProtectionScopeChanged(
-            PasswordProtectionScope::AdvancedSettingsOnly,
-        )));
 
+        let values = program.password_protection.setting_values();
+        assert_eq!(values[0], ("password_enabled", serde_json::json!(true)));
         assert_eq!(
-            program.pending_settings.get("password"),
-            Some(&serde_json::json!("shared-classroom-password"))
+            values[1],
+            ("password", serde_json::json!("shared-classroom-password"))
         );
         assert_eq!(
-            program.pending_settings.get("password_enabled"),
-            Some(&serde_json::json!(true))
+            values[2],
+            (
+                "password_scope",
+                serde_json::json!("advanced_settings_only")
+            )
         );
-        assert_eq!(
-            program.pending_settings.get("password_scope"),
-            Some(&serde_json::json!("advanced_settings_only"))
+        assert!(program.pending_settings.is_empty());
+        assert!(
+            program
+                .password_protection
+                .page_is_locked(GUIState::AdvancedSettings)
         );
-        assert!(program.password_protection.unlocked);
+
+        // Leave the shared test settings in an unlocked state for tests that
+        // construct Program concurrently in this process.
+        drop(program.update(Message::PasswordUnlockInputChanged(
+            "shared-classroom-password".into(),
+        )));
+        drop(program.update(Message::UnlockSettings));
+        drop(program.update(Message::TogglePasswordProtection));
+        assert!(!program.password_protection.enabled);
     }
 
     #[test]

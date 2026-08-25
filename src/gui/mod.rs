@@ -2907,7 +2907,10 @@ impl Program {
                         .style(text_input_style),
                         Space::new().height(Length::Fixed(8.0)),
                         widget::row![
-                            secondary_button(tr(language, "Save password"), Message::SavePassword),
+                            secondary_button(
+                                tr(language, "Save and enable"),
+                                Message::SavePassword
+                            ),
                             Space::new().width(Length::Fill),
                             widget::text(password_status).size(12).color(text_muted()),
                         ]
