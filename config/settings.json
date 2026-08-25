@@ -1,6 +1,6 @@
 {
     "filtering": false,
-    "dark_mode": true,
+    "theme": "dark",
     "text_size": 15.0,
     "font_family": "sans-serif",
     "inference_backend": "ollama",

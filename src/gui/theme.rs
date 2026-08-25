@@ -4,7 +4,7 @@ pub(super) fn rgb(r: u8, g: u8, b: u8) -> Color {
     Color::from_rgb(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0)
 }
 
-static DARK_MODE: AtomicBool = AtomicBool::new(true);
+static INTERFACE_THEME: AtomicU8 = AtomicU8::new(0);
 
 #[cfg(target_os = "windows")]
 const CHAT_SERIF_FONT: &str = "Times New Roman";
@@ -20,12 +20,25 @@ const CHAT_MONOSPACE_FONT: &str = "Menlo";
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 const CHAT_MONOSPACE_FONT: &str = "DejaVu Sans Mono";
 
-pub(crate) fn set_dark_mode(enabled: bool) {
-    DARK_MODE.store(enabled, Ordering::Relaxed);
+pub(crate) fn set_interface_theme(theme: InterfaceTheme) {
+    let value = match theme {
+        InterfaceTheme::Dark => 0,
+        InterfaceTheme::Light => 1,
+        InterfaceTheme::Modern => 2,
+    };
+    INTERFACE_THEME.store(value, Ordering::Relaxed);
+}
+
+pub(super) fn interface_theme() -> InterfaceTheme {
+    match INTERFACE_THEME.load(Ordering::Relaxed) {
+        1 => InterfaceTheme::Light,
+        2 => InterfaceTheme::Modern,
+        _ => InterfaceTheme::Dark,
+    }
 }
 
 pub(super) fn is_dark_mode() -> bool {
-    DARK_MODE.load(Ordering::Relaxed)
+    interface_theme() != InterfaceTheme::Light
 }
 
 pub(super) fn chat_font(font_family: FontFamily) -> iced::Font {
@@ -37,84 +50,108 @@ pub(super) fn chat_font(font_family: FontFamily) -> iced::Font {
 }
 
 pub(super) fn app_bg() -> Color {
-    if is_dark_mode() {
-        rgb(8, 10, 15)
-    } else {
-        rgb(246, 247, 251)
+    match interface_theme() {
+        InterfaceTheme::Dark => rgb(7, 9, 14),
+        InterfaceTheme::Modern => rgb(8, 10, 15),
+        InterfaceTheme::Light => rgb(246, 247, 251),
     }
 }
 
 pub(super) fn panel() -> Color {
-    if is_dark_mode() {
-        rgb(15, 18, 26)
-    } else {
-        rgb(255, 255, 255)
+    match interface_theme() {
+        InterfaceTheme::Dark => rgb(15, 19, 29),
+        InterfaceTheme::Modern => rgb(15, 18, 26),
+        InterfaceTheme::Light => rgb(255, 255, 255),
     }
 }
 
 pub(super) fn panel_soft() -> Color {
-    if is_dark_mode() {
-        rgb(20, 24, 34)
-    } else {
-        rgb(248, 249, 252)
+    match interface_theme() {
+        InterfaceTheme::Dark => rgb(21, 26, 39),
+        InterfaceTheme::Modern => rgb(20, 24, 34),
+        InterfaceTheme::Light => rgb(248, 249, 252),
     }
 }
 
 pub(super) fn panel_lifted() -> Color {
-    if is_dark_mode() {
-        rgb(25, 30, 42)
-    } else {
-        rgb(252, 252, 254)
+    match interface_theme() {
+        InterfaceTheme::Dark => rgb(28, 34, 49),
+        InterfaceTheme::Modern => rgb(25, 30, 42),
+        InterfaceTheme::Light => rgb(252, 252, 254),
     }
 }
 
 pub(super) fn border_soft() -> Color {
-    if is_dark_mode() {
-        rgb(42, 48, 64)
-    } else {
-        rgb(222, 225, 234)
+    match interface_theme() {
+        InterfaceTheme::Dark => rgb(50, 61, 84),
+        InterfaceTheme::Modern => rgb(42, 48, 64),
+        InterfaceTheme::Light => rgb(222, 225, 234),
     }
 }
 
 pub(super) fn border_bright() -> Color {
-    if is_dark_mode() {
-        rgb(79, 88, 116)
-    } else {
-        rgb(164, 170, 190)
+    match interface_theme() {
+        InterfaceTheme::Dark => rgb(82, 102, 145),
+        InterfaceTheme::Modern => rgb(79, 88, 116),
+        InterfaceTheme::Light => rgb(164, 170, 190),
     }
 }
 
 pub(super) fn text_main() -> Color {
-    if is_dark_mode() {
-        rgb(241, 242, 247)
-    } else {
-        rgb(29, 31, 40)
+    match interface_theme() {
+        InterfaceTheme::Dark => rgb(240, 245, 255),
+        InterfaceTheme::Modern => rgb(241, 242, 247),
+        InterfaceTheme::Light => rgb(29, 31, 40),
     }
 }
 
 pub(super) fn text_muted() -> Color {
-    if is_dark_mode() {
-        rgb(161, 167, 184)
-    } else {
-        rgb(91, 95, 111)
+    match interface_theme() {
+        InterfaceTheme::Dark => rgb(158, 170, 195),
+        InterfaceTheme::Modern => rgb(161, 167, 184),
+        InterfaceTheme::Light => rgb(91, 95, 111),
     }
 }
 
 pub(super) fn text_faint() -> Color {
-    if is_dark_mode() {
-        // 6.1:1 against the dark application background for small metadata.
-        rgb(146, 152, 169)
-    } else {
-        rgb(82, 87, 103)
+    match interface_theme() {
+        InterfaceTheme::Dark => rgb(110, 122, 148),
+        InterfaceTheme::Modern => {
+            // 6.1:1 against the modern application background for small metadata.
+            rgb(146, 152, 169)
+        }
+        InterfaceTheme::Light => rgb(82, 87, 103),
     }
 }
 
 pub(super) fn accent() -> Color {
-    rgb(139, 124, 246)
+    match interface_theme() {
+        InterfaceTheme::Dark => rgb(82, 140, 255),
+        InterfaceTheme::Light | InterfaceTheme::Modern => rgb(139, 124, 246),
+    }
 }
 
 pub(super) fn accent_2() -> Color {
-    rgb(87, 214, 198)
+    match interface_theme() {
+        InterfaceTheme::Dark => rgb(108, 226, 209),
+        InterfaceTheme::Light | InterfaceTheme::Modern => rgb(87, 214, 198),
+    }
+}
+
+/// Accent used by navigation and control labels.
+///
+/// The legacy Dark theme used blue for these affordances. Modern and Light
+/// retain their existing secondary accent so this distinction stays scoped to
+/// the restored colour scheme.
+fn control_accent_for(theme: InterfaceTheme) -> Color {
+    match theme {
+        InterfaceTheme::Dark => rgb(82, 140, 255),
+        InterfaceTheme::Light | InterfaceTheme::Modern => rgb(87, 214, 198),
+    }
+}
+
+pub(super) fn control_accent() -> Color {
+    control_accent_for(interface_theme())
 }
 
 pub(super) fn danger() -> Color {
@@ -122,7 +159,10 @@ pub(super) fn danger() -> Color {
 }
 
 pub(super) fn success() -> Color {
-    rgb(91, 211, 157)
+    match interface_theme() {
+        InterfaceTheme::Dark => rgb(93, 225, 144),
+        InterfaceTheme::Light | InterfaceTheme::Modern => rgb(91, 211, 157),
+    }
 }
 
 pub(super) fn warning() -> Color {
@@ -133,6 +173,86 @@ pub(super) fn shadow_color() -> Color {
     Color {
         a: if is_dark_mode() { 0.30 } else { 0.12 },
         ..rgb(0, 0, 0)
+    }
+}
+
+fn sidebar_background() -> Color {
+    match interface_theme() {
+        InterfaceTheme::Dark => panel(),
+        InterfaceTheme::Modern => rgb(12, 15, 22),
+        InterfaceTheme::Light => rgb(251, 251, 253),
+    }
+}
+
+fn conversation_background() -> Color {
+    match interface_theme() {
+        InterfaceTheme::Dark => panel(),
+        InterfaceTheme::Modern => rgb(11, 14, 20),
+        InterfaceTheme::Light => rgb(252, 252, 254),
+    }
+}
+
+fn active_control_background() -> Color {
+    match interface_theme() {
+        InterfaceTheme::Dark => rgb(34, 49, 80),
+        InterfaceTheme::Modern => rgb(29, 37, 57),
+        InterfaceTheme::Light => rgb(232, 237, 248),
+    }
+}
+
+fn selected_control_background() -> Color {
+    match interface_theme() {
+        InterfaceTheme::Dark => rgb(48, 93, 190),
+        InterfaceTheme::Modern => rgb(49, 67, 122),
+        InterfaceTheme::Light => rgb(75, 99, 205),
+    }
+}
+
+fn active_chat_background() -> Color {
+    match interface_theme() {
+        InterfaceTheme::Dark => rgb(34, 49, 80),
+        InterfaceTheme::Modern => rgb(29, 28, 45),
+        InterfaceTheme::Light => rgb(243, 241, 250),
+    }
+}
+
+fn user_bubble_background() -> Color {
+    match interface_theme() {
+        InterfaceTheme::Dark => rgb(48, 93, 190),
+        InterfaceTheme::Modern => rgb(56, 48, 101),
+        InterfaceTheme::Light => rgb(235, 231, 252),
+    }
+}
+
+fn bot_bubble_background() -> Color {
+    match interface_theme() {
+        InterfaceTheme::Dark => rgb(23, 28, 42),
+        InterfaceTheme::Modern => rgb(17, 21, 29),
+        InterfaceTheme::Light => rgb(255, 255, 255),
+    }
+}
+
+fn primary_button_colors() -> (Color, Color) {
+    match interface_theme() {
+        InterfaceTheme::Dark => (rgb(70, 125, 255), rgb(107, 158, 255)),
+        InterfaceTheme::Modern => (rgb(111, 91, 218), accent()),
+        InterfaceTheme::Light => (rgb(112, 91, 218), accent()),
+    }
+}
+
+fn suggestion_hover_background() -> Color {
+    match interface_theme() {
+        InterfaceTheme::Dark => rgb(34, 49, 80),
+        InterfaceTheme::Modern => rgb(32, 35, 51),
+        InterfaceTheme::Light => rgb(246, 244, 253),
+    }
+}
+
+fn assistant_mark_background() -> Color {
+    match interface_theme() {
+        InterfaceTheme::Dark => rgb(70, 125, 255),
+        InterfaceTheme::Modern => rgb(104, 88, 205),
+        InterfaceTheme::Light => rgb(117, 98, 221),
     }
 }
 
@@ -176,11 +296,7 @@ pub(super) fn sidebar_style(_theme: &Theme) -> Style {
     Style {
         snap: true,
         text_color: Some(text_main()),
-        background: Some(Background::Color(if is_dark_mode() {
-            rgb(12, 15, 22)
-        } else {
-            rgb(251, 251, 253)
-        })),
+        background: Some(Background::Color(sidebar_background())),
         border: Border {
             color: Color::TRANSPARENT,
             width: 0.0,
@@ -229,11 +345,7 @@ pub(super) fn conversation_style(_theme: &Theme) -> Style {
     Style {
         snap: true,
         text_color: Some(text_main()),
-        background: Some(Background::Color(if is_dark_mode() {
-            rgb(11, 14, 20)
-        } else {
-            rgb(252, 252, 254)
-        })),
+        background: Some(Background::Color(conversation_background())),
         border: Border {
             color: Color::TRANSPARENT,
             width: 0.0,
@@ -271,11 +383,7 @@ pub(super) fn pick_list_style(
         placeholder_color: text_faint(),
         handle_color: if active { accent() } else { text_muted() },
         background: Background::Color(if active {
-            if is_dark_mode() {
-                rgb(29, 37, 57)
-            } else {
-                rgb(232, 237, 248)
-            }
+            active_control_background()
         } else {
             panel_soft()
         }),
@@ -297,11 +405,7 @@ pub(super) fn pick_list_menu_style(_theme: &Theme) -> widget::overlay::menu::Sty
         },
         text_color: text_main(),
         selected_text_color: Color::WHITE,
-        selected_background: Background::Color(if is_dark_mode() {
-            rgb(49, 67, 122)
-        } else {
-            rgb(75, 99, 205)
-        }),
+        selected_background: Background::Color(selected_control_background()),
         shadow: Shadow {
             color: shadow_color(),
             offset: Vector::from([0.0, 8.0]),
@@ -329,11 +433,7 @@ pub(super) fn chat_entry_style(active: bool) -> impl Fn(&Theme) -> Style {
         snap: true,
         text_color: Some(text_main()),
         background: Some(Background::Color(if active {
-            if is_dark_mode() {
-                rgb(29, 28, 45)
-            } else {
-                rgb(243, 241, 250)
-            }
+            active_chat_background()
         } else {
             Color::TRANSPARENT
         })),
@@ -352,15 +452,9 @@ pub(super) fn chat_entry_style(active: bool) -> impl Fn(&Theme) -> Style {
 pub(super) fn chat_title_fade_style(active: bool) -> impl Fn(&Theme) -> Style {
     move |_theme| {
         let end_color = if active {
-            if is_dark_mode() {
-                rgb(29, 28, 45)
-            } else {
-                rgb(243, 241, 250)
-            }
-        } else if is_dark_mode() {
-            rgb(12, 15, 22)
+            active_chat_background()
         } else {
-            rgb(251, 251, 253)
+            sidebar_background()
         };
 
         Style {
@@ -401,11 +495,7 @@ pub(super) fn chat_title_button_style(
 
 pub(super) fn user_bubble_style(reveal: f32) -> impl Fn(&Theme) -> Style {
     move |_theme: &Theme| {
-        let target = if is_dark_mode() {
-            rgb(56, 48, 101)
-        } else {
-            rgb(235, 231, 252)
-        };
+        let target = user_bubble_background();
         Style {
             snap: true,
             text_color: Some(if is_dark_mode() {
@@ -430,11 +520,7 @@ pub(super) fn user_bubble_style(reveal: f32) -> impl Fn(&Theme) -> Style {
 
 pub(super) fn bot_bubble_style(reveal: f32) -> impl Fn(&Theme) -> Style {
     move |_theme: &Theme| {
-        let target = if is_dark_mode() {
-            rgb(17, 21, 29)
-        } else {
-            rgb(255, 255, 255)
-        };
+        let target = bot_bubble_background();
         Style {
             snap: true,
             text_color: Some(text_main()),
@@ -556,9 +642,9 @@ pub(super) fn feedback_apply_button<'a>(
         .padding([8.0 + bounce * 0.22, 10.0 + bounce * 0.35])
         .style(move |_theme, status| {
             let mut style = button_visual(panel_soft(), border_soft(), text_muted(), status);
-            style.border.color = mix_color(style.border.color, accent_2(), bounce * 0.24);
+            style.border.color = mix_color(style.border.color, control_accent(), bounce * 0.24);
             style.border.width += bounce * 0.16;
-            style.shadow.color = with_alpha(accent_2(), bounce * 0.10);
+            style.shadow.color = with_alpha(control_accent(), bounce * 0.10);
             style.shadow.offset = Vector::from([0.0, 1.0 + bounce * 0.55]);
             style.shadow.blur_radius += bounce * 2.0;
             style
@@ -617,17 +703,17 @@ pub(super) fn profile_chip_style(
 pub(super) fn profile_popup_style(_theme: &Theme) -> Style {
     Style {
         snap: true,
-        text_color: None,
+        text_color: Some(text_main()),
         background: Some(Background::Color(panel_lifted())),
         border: Border {
-            color: border_soft(),
+            color: border_bright(),
             width: 1.0,
             radius: Radius::from(12.0),
         },
         shadow: Shadow {
-            color: with_alpha(shadow_color(), 0.38),
-            offset: Vector::from([0.0, 6.0]),
-            blur_radius: 16.0,
+            color: with_alpha(shadow_color(), 0.62),
+            offset: Vector::from([0.0, 10.0]),
+            blur_radius: 24.0,
         },
     }
 }
@@ -769,16 +855,8 @@ pub(super) fn primary_button<'a>(label: &'a str, message: Message) -> Element<'a
     widget::button(widget::text(label).size(14).align_x(Horizontal::Center))
         .padding([12, 16])
         .style(|_theme, status| {
-            button_visual(
-                if is_dark_mode() {
-                    rgb(111, 91, 218)
-                } else {
-                    rgb(112, 91, 218)
-                },
-                accent(),
-                Color::WHITE,
-                status,
-            )
+            let (background, border) = primary_button_colors();
+            button_visual(background, border, Color::WHITE, status)
         })
         .height(Length::Fixed(44.0))
         .on_press(message)
@@ -843,7 +921,7 @@ pub(super) fn settings_disclosure_button<'a>(
             Space::new().width(Length::Fill),
             widget::text(if open { "▾" } else { "▸" })
                 .size(13)
-                .color(accent_2()),
+                .color(control_accent()),
         ]
         .align_y(iced::Alignment::Center),
     )
@@ -863,7 +941,7 @@ pub(super) fn toolbar_button<'a>(
         widget::row![
             widget::text(icon)
                 .size(14)
-                .color(accent_2())
+                .color(control_accent())
                 .align_x(Horizontal::Center),
             Space::new().width(Length::Fixed(7.0)),
             widget::text(label).size(13).color(text_main()),
@@ -957,13 +1035,7 @@ pub(super) fn suggestion_button(
     .height(Length::Fixed(58.0))
     .style(|_theme, status| {
         let background = match status {
-            widget::button::Status::Hovered => {
-                if is_dark_mode() {
-                    rgb(32, 35, 51)
-                } else {
-                    rgb(246, 244, 253)
-                }
-            }
+            widget::button::Status::Hovered => suggestion_hover_background(),
             _ => panel_soft(),
         };
         let border = if matches!(status, widget::button::Status::Hovered) {
@@ -1015,28 +1087,18 @@ pub(super) fn suggestion_grid(
     .into()
 }
 
-pub(super) fn send_button<'a>(label: &'a str, message: Option<Message>) -> Element<'a, Message> {
+pub(super) fn send_button<'a>(message: Option<Message>) -> Element<'a, Message> {
     widget::button(
-        widget::row![
-            widget::text(label).size(14),
-            Space::new().width(Length::Fixed(7.0)),
-            widget::text("↑").size(18),
-        ]
-        .align_y(iced::Alignment::Center),
+        container(widget::text("↑").size(20).align_x(Horizontal::Center))
+            .center_x(Length::Fill)
+            .center_y(Length::Fill),
     )
-    .padding([12, 16])
+    .width(Length::Fixed(44.0))
     .height(Length::Fixed(44.0))
+    .padding(0)
     .style(|_theme, status| {
-        button_visual(
-            if is_dark_mode() {
-                rgb(111, 91, 218)
-            } else {
-                rgb(112, 91, 218)
-            },
-            accent(),
-            Color::WHITE,
-            status,
-        )
+        let (background, border) = primary_button_colors();
+        button_visual(background, border, Color::WHITE, status)
     })
     .on_press_maybe(message)
     .into()
@@ -1047,11 +1109,7 @@ pub(super) fn assistant_mark_style(pulse: f32, active: bool) -> impl Fn(&Theme) 
         snap: true,
         text_color: Some(Color::WHITE),
         background: Some(Background::Color(brighten(
-            if is_dark_mode() {
-                rgb(104, 88, 205)
-            } else {
-                rgb(117, 98, 221)
-            },
+            assistant_mark_background(),
             if active { pulse * 0.018 } else { 0.0 },
         ))),
         border: Border {
@@ -1064,5 +1122,20 @@ pub(super) fn assistant_mark_style(pulse: f32, active: bool) -> impl Fn(&Theme) 
             offset: Vector::from([0.0, if active { 4.0 + pulse } else { 4.0 }]),
             blur_radius: if active { 14.0 + pulse * 4.0 } else { 16.0 },
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InterfaceTheme, control_accent_for, rgb};
+
+    #[test]
+    fn only_dark_uses_blue_for_the_control_accent() {
+        assert_eq!(control_accent_for(InterfaceTheme::Dark), rgb(82, 140, 255));
+        assert_eq!(control_accent_for(InterfaceTheme::Light), rgb(87, 214, 198));
+        assert_eq!(
+            control_accent_for(InterfaceTheme::Modern),
+            rgb(87, 214, 198)
+        );
     }
 }

@@ -10,13 +10,13 @@ use iced_selection::markdown as selectable_markdown;
 use iced_widget::{container::Style, core::text::Wrapping, markdown};
 use std::{
     fmt,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicU8, Ordering},
 };
 
 use crate::{
     AppUpdateState, ChatImage, CodeCopyScope, Correspondence, FontFamily, GUIState,
-    InferenceBackend, Language, MarkdownImageState, Message, Program, SettingsFeedbackTarget,
-    ThinkingLevel, cached_character_count, split_thinking_text,
+    InferenceBackend, InterfaceTheme, Language, MarkdownImageState, Message, Program,
+    SettingsFeedbackTarget, ThinkingLevel, cached_character_count, split_thinking_text,
     tools::web_search::{WebSearchState, WebSource},
 };
 
@@ -28,7 +28,7 @@ use theme::*;
 use translation::*;
 use widgets::*;
 
-pub(crate) use theme::set_dark_mode;
+pub(crate) use theme::set_interface_theme;
 
 // Iced scrollbars float above scrollable content. Keep sidebar row actions out
 // of that overlay without making the sidebar itself wider.
@@ -739,7 +739,7 @@ impl Program {
                 let sidebar_width =
                     82.0 + self.sidebar_animation * (self.ui_layout.sidebar_width - 82.0);
                 let show_sidebar_details = self.sidebar_animation > 0.52;
-                let chat_sidebar: Element<Message> = if show_sidebar_details {
+                let chat_menu: Element<Message> = if show_sidebar_details {
                     let mut entries: Vec<Element<Message>> = vec![
                         primary_button(tr(language, "＋ New chat"), Message::NewChat),
                         Space::new().height(Length::Fixed(6.0)).into(),
@@ -875,6 +875,8 @@ impl Program {
                         };
                         let row_menu_open =
                             self.chat_row_menu.as_deref() == Some(saved.id.as_str());
+                        let row_hovered =
+                            self.hovered_chat_row.as_deref() == Some(saved.id.as_str());
                         // Reserve the exact ⋯ footprint while the overlay is open. Keeping
                         // the old button beneath Cancel created a doubled border/shadow that
                         // made two equal compact controls look like different sizes.
@@ -883,12 +885,17 @@ impl Program {
                                 .width(Length::Fixed(36.0))
                                 .height(Length::Fixed(36.0))
                                 .into()
-                        } else {
+                        } else if row_hovered {
                             compact_icon_button(
                                 "⋯",
                                 tr(language, "Chat actions"),
                                 Message::ToggleChatRowMenu(saved.id.clone()),
                             )
+                        } else {
+                            Space::new()
+                                .width(Length::Fixed(36.0))
+                                .height(Length::Fixed(36.0))
+                                .into()
                         };
                         let title_button: Element<Message> = widget::stack![
                             widget::button(
@@ -957,11 +964,15 @@ impl Program {
                             base_row
                         };
                         entries.push(
-                            container(chat_row)
-                                .padding(4)
-                                .width(Length::Fill)
-                                .style(chat_entry_style(selected))
-                                .into(),
+                            container(
+                                widget::mouse_area(chat_row)
+                                    .on_enter(Message::ChatRowHovered(saved.id.clone()))
+                                    .on_exit(Message::ChatRowUnhovered(saved.id.clone())),
+                            )
+                            .padding(4)
+                            .width(Length::Fill)
+                            .style(chat_entry_style(selected))
+                            .into(),
                         );
                     }
                     container(widget::column![
@@ -1000,10 +1011,8 @@ impl Program {
                                 left: 0.0,
                             })
                             .width(Length::Fill)
-                        ),
-                        // Reserve room for the profile switcher overlaid in
-                        // the bottom-left corner.
-                        Space::new().height(Length::Fixed(46.0)),
+                        )
+                        .height(Length::Fill),
                     ])
                     .padding(10)
                     .width(Length::Fixed(sidebar_width))
@@ -1125,10 +1134,8 @@ impl Program {
                                 left: 0.0,
                             })
                             .width(Length::Fill),
-                        ),
-                        // Reserve room for the profile switcher overlaid in
-                        // the bottom-left corner.
-                        Space::new().height(Length::Fixed(46.0)),
+                        )
+                        .height(Length::Fill),
                     ])
                     .padding(8)
                     .width(Length::Fixed(sidebar_width))
@@ -1142,7 +1149,7 @@ impl Program {
                     widget::row![
                         // Use a basic Latin marker rather than a colour emoji: Iced does
                         // not reliably load system emoji fonts on every platform.
-                        widget::text("P").size(13).color(accent_2()),
+                        widget::text("P").size(13).color(control_accent()),
                         widget::text(ellipsize_chat_title(&active_profile_name, 18))
                             .size(14)
                             .wrapping(Wrapping::None),
@@ -1153,7 +1160,7 @@ impl Program {
                     .spacing(7)
                     .into()
                 } else {
-                    widget::text("P").size(14).color(accent_2()).into()
+                    widget::text("P").size(14).color(control_accent()).into()
                 };
                 let profile_chip: Element<Message> = widget::button(profile_chip_label)
                     .on_press(Message::ToggleProfileMenu)
@@ -1162,9 +1169,10 @@ impl Program {
                     } else {
                         [8, 9]
                     })
+                    .width(Length::Fill)
                     .style(profile_chip_style(self.profile_menu_open))
                     .into();
-                let profile_switcher: Element<Message> = if self.profile_menu_open {
+                let profile_popup: Element<Message> = if self.profile_menu_open {
                     let mut rows: Vec<Element<Message>> = Vec::new();
                     for profile in &self.profiles {
                         let is_active = profile.id == self.active_profile_id;
@@ -1260,7 +1268,7 @@ impl Program {
                         widget::column![
                             widget::text(tr(language, "PROFILES"))
                                 .size(11)
-                                .color(accent_2()),
+                                .color(control_accent()),
                             widget::scrollable(
                                 widget::Column::with_children(rows).spacing(iced::Pixels(6.0))
                             )
@@ -1287,27 +1295,42 @@ impl Program {
                         .spacing(9),
                     )
                     .padding(12)
-                    .width(Length::Fixed(290.0))
+                    .width(Length::Fill)
                     .style(profile_popup_style)
                     .into();
-                    widget::column![popup, Space::new().height(Length::Fixed(6.0)), profile_chip,]
-                        .align_x(iced::Alignment::Start)
-                        .into()
+                    popup
                 } else {
-                    profile_chip
+                    widget::column![].into()
                 };
-                // The switcher floats in the bottom-left corner, over the
-                // chat list, so it stays reachable on every page state.
-                let chat_sidebar: Element<Message> = widget::stack![
-                    chat_sidebar,
-                    container(profile_switcher)
+                let profile_section: Element<Message> =
+                    if self.profile_menu_open && show_sidebar_details {
+                        widget::column![
+                            profile_popup,
+                            Space::new().height(Length::Fixed(6.0)),
+                            profile_chip,
+                        ]
                         .width(Length::Fill)
-                        .height(Length::Fill)
-                        .align_x(iced::Alignment::Start)
-                        .align_y(iced::Alignment::End)
-                        .padding(10),
+                        .into()
+                    } else {
+                        profile_chip
+                    };
+                let profile_footer_padding = if show_sidebar_details { 10.0 } else { 8.0 };
+                let profile_footer: Element<Message> = container(profile_section)
+                    .padding(profile_footer_padding)
+                    .width(Length::Fixed(sidebar_width))
+                    .style(sidebar_style)
+                    .into();
+                let sidebar_sections: Element<Message> = widget::column![
+                    chat_menu,
+                    Space::new().height(Length::Fixed(6.0)),
+                    profile_footer,
                 ]
+                .width(Length::Fixed(sidebar_width))
+                .height(Length::Fill)
                 .into();
+                // Profiles consume their own fixed section, so saved chats and their
+                // scrollbar always end above it instead of continuing underneath it.
+                let chat_sidebar = sidebar_sections;
 
                 let composer_active =
                     !self.prompt.prompt.trim().is_empty() || !self.pending_images.is_empty();
@@ -1587,15 +1610,10 @@ impl Program {
                                 Space::new().width(Length::Fixed(5.0)),
                                 web_toggle,
                                 Space::new().width(Length::Fill),
-                                widget::text(tr(language, "Enter to send"))
-                                    .size(11)
-                                    .color(text_faint()),
-                                Space::new().width(Length::Fixed(8.0)),
                                 if is_processing {
                                     danger_button(tr(language, "■ Stop"), Message::StopResponse)
                                 } else {
                                     send_button(
-                                        tr(language, "Send"),
                                         (!self.prompt.prompt.trim().is_empty())
                                             .then(|| Message::Prompt(self.prompt.prompt.clone())),
                                     )
@@ -2315,7 +2333,7 @@ impl Program {
                                         Space::new().width(Length::Fixed(12.0)),
                                         feedback_value_chip(
                                             format!("{:.0}px", self.user_information.text_size),
-                                            accent_2(),
+                                            control_accent(),
                                             self.settings_feedback(
                                                 SettingsFeedbackTarget::TextSize
                                             ),
@@ -2348,12 +2366,19 @@ impl Program {
                             container(
                                 widget::row![
                                     setting_label(
-                                        tr(language, "Dark mode"),
-                                        tr(language, "Switch between the dark and light interface themes.")
+                                        tr(language, "Theme"),
+                                        tr(language, "Choose the interface colour scheme.")
                                     ),
-                                    widget::checkbox(self.app_state.dark_mode)
-                                        .label(tr(language, "Enabled"))
-                                        .on_toggle(|_| Message::ToggleDarkMode),
+                                    widget::pick_list(
+                                        InterfaceTheme::ALL,
+                                        Some(self.app_state.interface_theme),
+                                        Message::InterfaceThemeChange,
+                                    )
+                                    .padding([12, 14])
+                                    .text_size(14)
+                                    .style(pick_list_style)
+                                    .menu_style(pick_list_menu_style)
+                                    .width(Length::Fixed(180.0)),
                                 ]
                             )
                             .padding(16)
@@ -2491,7 +2516,7 @@ impl Program {
                                         Space::new().width(Length::Fixed(12.0)),
                                         feedback_value_chip(
                                             self.web_search_settings.result_limit.to_string(),
-                                            accent_2(),
+                                            control_accent(),
                                             self.settings_feedback(
                                                 SettingsFeedbackTarget::SearchResultLimit
                                             ),
@@ -2534,7 +2559,7 @@ impl Program {
                                         Space::new().width(Length::Fixed(12.0)),
                                         feedback_value_chip(
                                             self.web_search_settings.maximum_searches.to_string(),
-                                            accent_2(),
+                                            control_accent(),
                                             self.settings_feedback(
                                                 SettingsFeedbackTarget::MaximumSearches
                                             ),
@@ -2555,7 +2580,7 @@ impl Program {
                                         Space::new().width(Length::Fixed(12.0)),
                                         feedback_value_chip(
                                             self.web_search_settings.minimum_successful_searches.to_string(),
-                                            accent_2(),
+                                            control_accent(),
                                             self.settings_feedback(
                                                 SettingsFeedbackTarget::RequiredSearches
                                             ),
@@ -2576,7 +2601,7 @@ impl Program {
                                         Space::new().width(Length::Fixed(12.0)),
                                         feedback_value_chip(
                                             self.web_search_settings.maximum_page_fetches.to_string(),
-                                            accent_2(),
+                                            control_accent(),
                                             self.settings_feedback(
                                                 SettingsFeedbackTarget::MaximumPageReads
                                             ),
@@ -2597,7 +2622,7 @@ impl Program {
                                         Space::new().width(Length::Fixed(12.0)),
                                         feedback_value_chip(
                                             self.web_search_settings.minimum_independent_pages.to_string(),
-                                            accent_2(),
+                                            control_accent(),
                                             self.settings_feedback(
                                                 SettingsFeedbackTarget::RequiredPageReads
                                             ),
@@ -2618,7 +2643,7 @@ impl Program {
                                         Space::new().width(Length::Fixed(12.0)),
                                         feedback_value_chip(
                                             self.web_search_settings.tool_iteration_limit.to_string(),
-                                            accent_2(),
+                                            control_accent(),
                                             self.settings_feedback(
                                                 SettingsFeedbackTarget::ToolRounds
                                             ),
@@ -2642,7 +2667,7 @@ impl Program {
                                                 "{}s",
                                                 self.web_search_settings.request_timeout_seconds
                                             ),
-                                            accent_2(),
+                                            control_accent(),
                                             self.settings_feedback(
                                                 SettingsFeedbackTarget::RequestTimeout
                                             ),
@@ -3168,7 +3193,7 @@ impl Program {
                                 .color(text_main())
                             )
                             .padding(10)
-                            .style(chip_style(accent_2())),
+                            .style(chip_style(control_accent())),
                         ])
                         .padding(16)
                         .width(Length::Fill)

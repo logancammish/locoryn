@@ -38,7 +38,7 @@ fn reasoning_slider_style(_theme: &Theme, status: widget::slider::Status) -> wid
                 Color::WHITE
             }),
             border_width: 2.0,
-            border_color: accent_2(),
+            border_color: control_accent(),
         },
     }
 }
@@ -83,7 +83,7 @@ fn reasoning_slider<'a>(
                 )
                 .size(10)
                 .color(if selected_label {
-                    accent_2()
+                    control_accent()
                 } else {
                     text_faint()
                 })
@@ -116,7 +116,7 @@ pub(super) fn compact_thinking_control<'a>(
     let control = widget::column![
         widget::text(label)
             .size(10)
-            .color(accent_2())
+            .color(control_accent())
             .align_x(Horizontal::Center)
             .width(Length::Fill),
         reasoning_slider(selected, levels, language, Length::Fill, false),
@@ -356,8 +356,9 @@ pub(super) fn feedback_text_input_style(
 ) -> impl Fn(&Theme, widget::text_input::Status) -> widget::text_input::Style {
     move |theme, status| {
         let mut style = text_input_style(theme, status);
-        style.background = Background::Color(mix_color(panel_soft(), accent_2(), bounce * 0.05));
-        style.border.color = mix_color(style.border.color, accent_2(), bounce * 0.35);
+        style.background =
+            Background::Color(mix_color(panel_soft(), control_accent(), bounce * 0.05));
+        style.border.color = mix_color(style.border.color, control_accent(), bounce * 0.35);
         style.border.width += bounce * 0.55;
         style
     }
@@ -409,7 +410,7 @@ pub(super) fn setting_label<'a>(title: &'a str, subtitle: &'a str) -> Element<'a
 
 pub(super) fn settings_group_title<'a>(title: &'a str) -> Element<'a, Message> {
     widget::row![
-        widget::text(title).size(11).color(accent_2()),
+        widget::text(title).size(11).color(control_accent()),
         Space::new().width(Length::Fixed(10.0)),
         widget::rule::horizontal(1).style(|_theme| widget::rule::Style {
             color: border_soft(),

@@ -353,7 +353,7 @@ impl CurrentChat {
 // AppState keeps information on certain important information
 pub struct AppState {
     pub filtering: bool,
-    pub dark_mode: bool,
+    pub interface_theme: InterfaceTheme,
     pub backend_state: Arc<Mutex<String>>,
     pub bots_list: Arc<Mutex<Vec<String>>>,
     pub gui_state: GUIState,
@@ -529,6 +529,29 @@ impl fmt::Display for FontFamily {
             Self::SansSerif => "Sans-serif",
             Self::Serif => "Serif",
             Self::Monospace => "Monospace",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum InterfaceTheme {
+    #[default]
+    Dark,
+    Light,
+    Modern,
+}
+
+impl InterfaceTheme {
+    pub const ALL: [Self; 3] = [Self::Dark, Self::Light, Self::Modern];
+}
+
+impl fmt::Display for InterfaceTheme {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Dark => "Dark",
+            Self::Light => "Light",
+            Self::Modern => "Modern",
         })
     }
 }

@@ -24,8 +24,9 @@ mod tools;
 
 use crate::app::{
     AppState, Channels, ChatImage, Correspondence, CurrentChat, DebugMessage,
-    DynamicPromptSettings, FontFamily, LEGACY_PROFILE_ID, LEGACY_PROFILE_NAME, Language, Profile,
-    ProfileRegistry, Prompt, SavedChat, SystemPrompt, ThinkingLevel, UserInformation,
+    DynamicPromptSettings, FontFamily, InterfaceTheme, LEGACY_PROFILE_ID, LEGACY_PROFILE_NAME,
+    Language, Profile, ProfileRegistry, Prompt, SavedChat, SystemPrompt, ThinkingLevel,
+    UserInformation,
 };
 use crate::inference::{
     BackendConnections, EncodedImage, GenerationDetails, InferenceBackend, OpenAiStreamLine,
@@ -262,6 +263,8 @@ enum Message {
     ToggleFastStreaming,
     ToggleChatMenu,
     ToggleConfigDrawer,
+    ChatRowHovered(String),
+    ChatRowUnhovered(String),
     ToggleChatRowMenu(String),
     ToggleWebSearch,
     ToggleTools,
@@ -366,7 +369,7 @@ enum Message {
     ToggleInfoPopup,
     ToggleChatHistory,
     ToggleFiltering,
-    ToggleDarkMode,
+    InterfaceThemeChange(InterfaceTheme),
     ToggleShowTokensPerSecond,
     ToggleInfoPopupSetting,
     WipeChatHistory,
@@ -426,7 +429,7 @@ impl Message {
             | Self::DynamicCustomInstructionsChanged(_)
             | Self::LanguageChange(_)
             | Self::ThinkingLevelChange(_)
-            | Self::ToggleDarkMode
+            | Self::InterfaceThemeChange(_)
             | Self::ToggleChatHistory
             | Self::WipeChatHistory => Some(ProtectedSettingsArea::Standard),
             Self::ChangeBatchTokens(_)
@@ -588,6 +591,7 @@ struct Program {
     show_tokens_per_second: bool,
     chat_menu_open: bool,
     config_drawer_open: bool,
+    hovered_chat_row: Option<String>,
     chat_row_menu: Option<String>,
     /// Normalized sidebar reveal progress. This is animated instead of
     /// switching between two hard-coded widths in a single frame.
@@ -1052,6 +1056,24 @@ fn load_settings_text() -> Option<String> {
             .ok()
             .map(|_| contents)
     })
+}
+
+fn interface_theme_from_settings(
+    settings: &serde_json::Map<String, serde_json::Value>,
+) -> InterfaceTheme {
+    settings
+        .get("theme")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<InterfaceTheme>(value).ok())
+        .unwrap_or_else(
+            || match settings.get("dark_mode").and_then(|value| value.as_bool()) {
+                // Preserve the appearance selected by users of the previous two-theme
+                // release. Fresh installs use the new legacy-inspired Dark default.
+                Some(true) => InterfaceTheme::Modern,
+                Some(false) => InterfaceTheme::Light,
+                None => InterfaceTheme::Dark,
+            },
+        )
 }
 
 fn canonical_code_language(language: &str) -> Option<&'static str> {
@@ -2258,6 +2280,8 @@ impl Program {
         {
             return Task::none();
         }
+        self.hovered_chat_row = None;
+        self.chat_row_menu = None;
         self.save_open_chat();
         self.active_profile_id = profile_id.clone();
         self.persist_profiles();
@@ -3554,11 +3578,29 @@ impl Program {
 
             Message::ToggleChatMenu => {
                 self.chat_menu_open = !self.chat_menu_open;
+                if !self.chat_menu_open {
+                    self.hovered_chat_row = None;
+                    self.chat_row_menu = None;
+                    self.profile_menu_open = false;
+                    self.editing_profile_id = None;
+                }
                 Task::none()
             }
 
             Message::ToggleConfigDrawer => {
                 self.config_drawer_open = !self.config_drawer_open;
+                Task::none()
+            }
+
+            Message::ChatRowHovered(id) => {
+                self.hovered_chat_row = Some(id);
+                Task::none()
+            }
+
+            Message::ChatRowUnhovered(id) => {
+                if self.hovered_chat_row.as_deref() == Some(id.as_str()) {
+                    self.hovered_chat_row = None;
+                }
                 Task::none()
             }
 
@@ -3859,6 +3901,7 @@ impl Program {
 
             Message::DeleteChat(id) => {
                 self.chat_row_menu = None;
+                self.hovered_chat_row = None;
                 if self.active_prompts.contains_key(&id) {
                     self.set_debug_message(DebugMessage {
                         message: "Stop that chat's response before deleting it.".to_string(),
@@ -3895,6 +3938,7 @@ impl Program {
 
             Message::ToggleChatPin(id) => {
                 self.chat_row_menu = None;
+                self.hovered_chat_row = None;
                 if let Some(index) = self.saved_chats.iter().position(|chat| chat.id == id) {
                     let mut chat = self.saved_chats.remove(index);
                     chat.pinned = !chat.pinned;
@@ -4196,10 +4240,16 @@ impl Program {
                 Task::none()
             }
 
-            Message::ToggleDarkMode => {
-                self.app_state.dark_mode = !self.app_state.dark_mode;
-                gui::set_dark_mode(self.app_state.dark_mode);
-                self.persist_boolean_setting("dark_mode", self.app_state.dark_mode);
+            Message::InterfaceThemeChange(interface_theme) => {
+                self.app_state.interface_theme = interface_theme;
+                gui::set_interface_theme(interface_theme);
+                match serde_json::to_value(interface_theme) {
+                    Ok(value) => self.persist_setting_value("theme", value),
+                    Err(error) => self.set_debug_message(DebugMessage {
+                        message: format!("Could not save interface theme: {error}"),
+                        is_error: true,
+                    }),
+                }
                 self.begin_page_transition();
                 Task::none()
             }
@@ -4565,7 +4615,14 @@ impl Program {
             }
 
             Message::ToggleProfileMenu => {
-                self.profile_menu_open = !self.profile_menu_open;
+                self.hovered_chat_row = None;
+                self.chat_row_menu = None;
+                if self.chat_menu_open {
+                    self.profile_menu_open = !self.profile_menu_open;
+                } else {
+                    self.chat_menu_open = true;
+                    self.profile_menu_open = true;
+                }
                 if !self.profile_menu_open {
                     self.editing_profile_id = None;
                 }
@@ -5174,7 +5231,7 @@ impl Default for Program {
                 .unwrap_or(default)
         };
         let filtering = setting_bool("filtering", true);
-        let dark_mode = setting_bool("dark_mode", true);
+        let interface_theme = interface_theme_from_settings(&settings_hmap);
         let info_popup = setting_bool("info_popup", false);
         let fast_streaming = setting_bool("fast_streaming", true);
         let show_tokens_per_second = setting_bool("show_tokens_per_second", false);
@@ -5308,7 +5365,7 @@ impl Default for Program {
                 });
 
         let (chat_notice_sender, chat_notice_receiver) = crossbeam_channel::unbounded();
-        gui::set_dark_mode(dark_mode);
+        gui::set_interface_theme(interface_theme);
 
         Self {
             batch_tokens: 3,
@@ -5316,6 +5373,7 @@ impl Default for Program {
             show_tokens_per_second,
             chat_menu_open: true,
             config_drawer_open: false,
+            hovered_chat_row: None,
             chat_row_menu: None,
             sidebar_animation: 1.0,
             ui_motion: 0.0,
@@ -5416,7 +5474,7 @@ impl Default for Program {
             },
             app_state: AppState {
                 filtering,
-                dark_mode,
+                interface_theme,
                 gui_state: if info_popup {
                     GUIState::InfoPopup
                 } else {
@@ -5470,13 +5528,12 @@ pub fn main() -> iced::Result {
     let application = iced::application(Program::boot, Program::update, Program::view)
         .title("Locoryn")
         .subscription(Program::subscription)
-        .theme(|program: &Program| {
-            if program.app_state.dark_mode {
-                Theme::Dark
-            } else {
-                Theme::Light
-            }
-        })
+        .theme(
+            |program: &Program| match program.app_state.interface_theme {
+                InterfaceTheme::Light => Theme::Light,
+                InterfaceTheme::Dark | InterfaceTheme::Modern => Theme::Dark,
+            },
+        )
         .window_size(Size::new(1100.0, 800.0))
         .window(window_settings)
         .antialiasing(true);
@@ -5499,13 +5556,14 @@ mod tests {
 
     use super::{
         ActivePrompt, Correspondence, CurrentChat, FontFamily, GUIState, InferenceStreamLine,
-        LEGACY_PROFILE_ID, Message, ModelCapabilities, PasswordProtection, PasswordProtectionScope,
-        Point, Profile, ProfileRegistry, Program, SavedChat, SettingsFeedbackTarget, Size,
-        ThinkingLevel, ToolLoopProgress, UiResizeTarget, UserInformation, WebSearchSettings,
-        WebSearchState, app_data_dir, assign_legacy_profile_ids, canonical_code_language,
-        censor_text, chat_profile_id, compare_versions, conversation_context_prompt,
-        decode_generation_line, decode_inference_stream_line, disabled_web_tool_message,
-        ensure_legacy_profile, mask_live_code_blocks, merge_generation_chunk_details,
+        InterfaceTheme, LEGACY_PROFILE_ID, Message, ModelCapabilities, PasswordProtection,
+        PasswordProtectionScope, Point, Profile, ProfileRegistry, Program, SavedChat,
+        SettingsFeedbackTarget, Size, ThinkingLevel, ToolLoopProgress, UiResizeTarget,
+        UserInformation, WebSearchSettings, WebSearchState, app_data_dir,
+        assign_legacy_profile_ids, canonical_code_language, censor_text, chat_profile_id,
+        compare_versions, conversation_context_prompt, decode_generation_line,
+        decode_inference_stream_line, disabled_web_tool_message, ensure_legacy_profile,
+        interface_theme_from_settings, mask_live_code_blocks, merge_generation_chunk_details,
         model_capabilities, normalize_code_fence_languages, parse_live_markdown_items,
         parse_markdown_items, preferred_or_first_model, read_json_with_backup,
         remote_image_url_is_safe, sidecar_path, split_thinking_text, tokens_per_second,
@@ -5738,6 +5796,56 @@ mod tests {
     }
 
     #[test]
+    fn profile_trigger_opens_the_sidebar_before_showing_profiles() {
+        let mut program = Program {
+            chat_menu_open: false,
+            sidebar_animation: 0.0,
+            hovered_chat_row: Some("chat-1".into()),
+            chat_row_menu: Some("chat-1".into()),
+            ..Program::default()
+        };
+
+        drop(program.update(Message::ToggleProfileMenu));
+
+        assert!(program.chat_menu_open);
+        assert!(program.profile_menu_open);
+        assert!(program.hovered_chat_row.is_none());
+        assert!(program.chat_row_menu.is_none());
+
+        drop(program.update(Message::ToggleChatMenu));
+
+        assert!(!program.chat_menu_open);
+        assert!(!program.profile_menu_open);
+    }
+
+    #[test]
+    fn chat_row_hover_only_reveals_actions_until_the_trigger_is_clicked() {
+        let mut program = Program::default();
+        assert!(program.hovered_chat_row.is_none());
+        assert!(program.chat_row_menu.is_none());
+
+        drop(program.update(Message::ChatRowHovered("chat-1".into())));
+        assert_eq!(program.hovered_chat_row.as_deref(), Some("chat-1"));
+        assert!(program.chat_row_menu.is_none());
+
+        // An exit from a different row must not clear the current hover.
+        drop(program.update(Message::ChatRowUnhovered("chat-2".into())));
+        assert_eq!(program.hovered_chat_row.as_deref(), Some("chat-1"));
+        assert!(program.chat_row_menu.is_none());
+
+        drop(program.update(Message::ToggleChatRowMenu("chat-1".into())));
+        assert_eq!(program.chat_row_menu.as_deref(), Some("chat-1"));
+
+        // Leaving hides the trigger state, but not a menu opened by clicking it.
+        drop(program.update(Message::ChatRowUnhovered("chat-1".into())));
+        assert!(program.hovered_chat_row.is_none());
+        assert_eq!(program.chat_row_menu.as_deref(), Some("chat-1"));
+
+        drop(program.update(Message::ToggleChatRowMenu("chat-1".into())));
+        assert!(program.chat_row_menu.is_none());
+    }
+
+    #[test]
     fn frame_timer_stops_after_idle_animations_finish() {
         let mut program = Program {
             page_reveal: 1.0,
@@ -5959,9 +6067,11 @@ mod tests {
 
         let _ = program.update(Message::UpdateTextSize(99.0));
         let _ = program.update(Message::FontFamilyChange(FontFamily::Serif));
+        let _ = program.update(Message::InterfaceThemeChange(InterfaceTheme::Modern));
 
         assert_eq!(program.user_information.text_size, 40.0);
         assert_eq!(program.user_information.font_family, FontFamily::Serif);
+        assert_eq!(program.app_state.interface_theme, InterfaceTheme::Modern);
         assert_eq!(
             program.pending_settings.get("text_size"),
             Some(&serde_json::json!(40.0))
@@ -5969,6 +6079,45 @@ mod tests {
         assert_eq!(
             program.pending_settings.get("font_family"),
             Some(&serde_json::json!("serif"))
+        );
+        assert_eq!(
+            program.pending_settings.get("theme"),
+            Some(&serde_json::json!("modern"))
+        );
+    }
+
+    #[test]
+    fn interface_theme_defaults_and_legacy_settings_migrate_predictably() {
+        assert_eq!(
+            interface_theme_from_settings(&serde_json::Map::new()),
+            InterfaceTheme::Dark
+        );
+
+        let legacy_dark = serde_json::json!({"dark_mode": true})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            interface_theme_from_settings(&legacy_dark),
+            InterfaceTheme::Modern
+        );
+
+        let legacy_light = serde_json::json!({"dark_mode": false})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            interface_theme_from_settings(&legacy_light),
+            InterfaceTheme::Light
+        );
+
+        let explicit_dark = serde_json::json!({"theme": "dark", "dark_mode": true})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            interface_theme_from_settings(&explicit_dark),
+            InterfaceTheme::Dark
         );
     }
 
@@ -6619,6 +6768,8 @@ mod tests {
                 },
             ],
             active_profile_id: LEGACY_PROFILE_ID.to_string(),
+            hovered_chat_row: Some("chat-legacy".into()),
+            chat_row_menu: Some("chat-legacy".into()),
             saved_chats: vec![
                 test_saved_chat("chat-legacy", LEGACY_PROFILE_ID, "2026-01-03T00:00:00Z"),
                 test_saved_chat("chat-b", "profile-1", "2026-01-02T00:00:00Z"),
@@ -6632,6 +6783,8 @@ mod tests {
         assert_eq!(program.active_profile_id, "profile-1");
         assert_eq!(program.current_chat_id, "chat-b");
         assert!(!program.profile_menu_open);
+        assert!(program.hovered_chat_row.is_none());
+        assert!(program.chat_row_menu.is_none());
     }
 
     #[test]

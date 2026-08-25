@@ -49,7 +49,7 @@ experience with it!
 
 
 > [!NOTE]
-> This README describes the current `main` branch (`1.2.1`). Packaged releases
+> This README describes the current `main` branch (`1.2.2`). Packaged releases
 > may trail the source branch; check the release notes for the exact feature set
 > in a download.
 
@@ -91,7 +91,7 @@ and follow the [Linux and Windows OpenVINO setup](#openvino-setup-linux-and-wind
 ### 2. Install Locoryn
 
 - **Windows:** download and run
-  `locoryn-1.2.1-windows-11-x64-setup.exe` from the
+  `locoryn-1.2.2-windows-11-x64-setup.exe` from the
   [latest release](https://github.com/logancammish/locoryn/releases/latest).
   It installs for the current user and does not require administrator access.
 - **Linux:** run these commands in a terminal. The installer downloads the
@@ -220,7 +220,7 @@ Most controls live in **Settings**:
 | Application updates | Current version, latest stable release, and a trusted download link |
 | Chat storage | The folder containing saved conversations |
 | Model conversation context | Whether earlier messages are included in the next request |
-| Interface | Language, theme, text size, and chat font |
+| Interface | Language, Dark/Light/Modern theme, text size, and chat font |
 
 **Advanced settings** contains backend selection, separate Ollama and OpenVINO
 connection details, Ollama model installation, streaming/batching controls,

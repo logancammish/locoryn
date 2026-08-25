@@ -164,8 +164,6 @@ pub(super) fn tr(language: Language, english: &'static str) -> &'static str {
         "REASONING" => "RAZONAMIENTO",
         "Stop" => "Detener",
         "■ Stop" => "■ Detener",
-        "Send" => "Enviar",
-        "Enter to send" => "Intro para enviar",
         "Enter to send · Shift+Enter for a new line" => {
             "Intro para enviar · Mayús+Intro para una línea nueva"
         }
@@ -263,10 +261,8 @@ pub(super) fn tr(language: Language, english: &'static str) -> &'static str {
         "Choose the font family used for prompts, responses, and reasoning." => {
             "Elige la familia tipográfica usada para mensajes, respuestas y razonamiento."
         }
-        "Dark mode" => "Modo oscuro",
-        "Switch between the dark and light interface themes." => {
-            "Cambia entre los temas oscuro y claro de la interfaz."
-        }
+        "Theme" => "Tema",
+        "Choose the interface colour scheme." => "Elige la combinación de colores de la interfaz.",
         "Chat storage" => "Almacenamiento de chats",
         "Saved chats use this folder. The full path is shown so you can always locate them." => {
             "Los chats guardados usan esta carpeta. Se muestra la ruta completa para que puedas encontrarlos."
