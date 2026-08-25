@@ -20,9 +20,9 @@ For an unattended installation:
 ./install-linux.sh --arch arm64 --channel beta --yes
 ```
 
-You can also pin a release with `--tag v1.2.1-pre3`. The installer expects release
+You can also pin a release with `--tag v1.2.1`. The installer expects release
 assets to use the repository's standard names, for example
-`locoryn-1.2.1-pre3-linux-x86_64.tar.gz`.
+`locoryn-1.2.1-linux-x86_64.tar.gz`.
 
 Files are installed to these per-user locations:
 

@@ -2520,7 +2520,7 @@ dependencies = [
 
 [[package]]
 name = "locoryn"
-version = "1.2.1-pre3"
+version = "1.2.1"
 dependencies = [
  "arboard",
  "async-trait",
