@@ -49,7 +49,7 @@ experience with it!
 
 
 > [!NOTE]
-> This README describes the current `main` branch (`1.2.1-pre2`). Packaged releases
+> This README describes the current `main` branch (`1.2.1-pre3`). Packaged releases
 > may trail the source branch; check the release notes for the exact feature set
 > in a download.
 
@@ -91,7 +91,7 @@ and follow the [Linux and Windows OpenVINO setup](#openvino-setup-linux-and-wind
 ### 2. Install Locoryn
 
 - **Windows:** download and run
-  `locoryn-1.2.1-pre2-windows-11-x64-setup.exe` from the
+  `locoryn-1.2.1-pre3-windows-11-x64-setup.exe` from the
   [latest release](https://github.com/logancammish/locoryn/releases/latest).
   It installs for the current user and does not require administrator access.
 - **Linux:** run these commands in a terminal. The installer downloads the
@@ -224,7 +224,25 @@ Most controls live in **Settings**:
 
 **Advanced settings** contains backend selection, separate Ollama and OpenVINO
 connection details, Ollama model installation, streaming/batching controls,
-content filtering, and the local code checker.
+content filtering, the local code checker, and password protection.
+
+### Settings password protection
+
+Educational and shared-device deployments can set a password under **Settings
+→ Advanced settings → Password protection**. Advanced settings are always
+covered when protection is enabled; **Protection coverage** can extend the lock
+to the standard Settings page and its compact chat configuration controls.
+Leaving the protected settings area locks it again.
+
+The configuration is deliberately reproducible: `password_enabled`, `password`,
+and `password_scope` are ordinary top-level values in the local `settings.json`.
+The password is stored as plaintext, so copying the same settings file to
+another installation reproduces the same policy. A missing `password_scope`
+defaults to `all_settings`; the other supported value is
+`advanced_settings_only`.
+
+> [!WARNING]
+> Not intended for high vunerability environments
 
 ### Local code checking
 

@@ -3,6 +3,7 @@
 use std::cmp::Ordering as ComparisonOrdering;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::fmt;
 use std::fs;
 use std::io::{self, Cursor, Write};
 use std::path::{Path, PathBuf};
@@ -87,6 +88,92 @@ pub enum GUIState {
     Settings,
     AdvancedSettings,
     Images,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PasswordProtectionScope {
+    AdvancedSettingsOnly,
+    #[default]
+    AllSettings,
+}
+
+impl PasswordProtectionScope {
+    const ALL: [Self; 2] = [Self::AdvancedSettingsOnly, Self::AllSettings];
+}
+
+impl fmt::Display for PasswordProtectionScope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::AdvancedSettingsOnly => "Advanced settings only",
+            Self::AllSettings => "All settings",
+        })
+    }
+}
+
+#[derive(Default)]
+struct PasswordProtection {
+    enabled: bool,
+    password: String,
+    scope: PasswordProtectionScope,
+    unlocked: bool,
+    unlock_input: String,
+    new_password_input: String,
+    error: Option<String>,
+}
+
+impl PasswordProtection {
+    fn from_settings(settings: &serde_json::Map<String, serde_json::Value>) -> Self {
+        let password = settings
+            .get("password")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let configured_enabled = settings
+            .get("password_enabled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let scope = settings
+            .get("password_scope")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default();
+
+        Self {
+            // A hand-edited settings file must not make the settings UI
+            // impossible to open when no usable password was supplied.
+            enabled: configured_enabled,
+            password,
+            scope,
+            ..Self::default()
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        self.enabled && !self.password.is_empty()
+    }
+
+    fn protects_standard_settings(&self) -> bool {
+        self.is_active() && self.scope == PasswordProtectionScope::AllSettings
+    }
+
+    fn page_is_locked(&self, page: GUIState) -> bool {
+        if self.unlocked || !self.is_active() {
+            return false;
+        }
+
+        match page {
+            GUIState::Settings => self.protects_standard_settings(),
+            GUIState::AdvancedSettings => true,
+            _ => false,
+        }
+    }
+
+    fn lock(&mut self) {
+        self.unlocked = false;
+        self.unlock_input.clear();
+        self.error = None;
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -272,6 +359,12 @@ enum Message {
     ToggleInfoPopupSetting,
     WipeChatHistory,
     ToggleAdvancedSettings,
+    PasswordUnlockInputChanged(String),
+    UnlockSettings,
+    NewPasswordInputChanged(String),
+    SavePassword,
+    TogglePasswordProtection,
+    PasswordProtectionScopeChanged(PasswordProtectionScope),
     BackendChange(InferenceBackend),
     ChangeProtocol(String),
     ChangeIp(String),
@@ -456,6 +549,7 @@ struct Program {
     profile_edit_instructions: String,
     code_checking_enabled: bool,
     dynamic_prompt_settings: DynamicPromptSettings,
+    password_protection: PasswordProtection,
     max_response_tokens_input: String,
     context_tokens_input: String,
     pending_settings: serde_json::Map<String, serde_json::Value>,
@@ -1948,6 +2042,13 @@ impl Program {
                 is_error: true,
             }),
         }
+    }
+
+    fn can_manage_password_protection(&self) -> bool {
+        self.app_state.gui_state == GUIState::AdvancedSettings
+            && !self
+                .password_protection
+                .page_is_locked(GUIState::AdvancedSettings)
     }
 
     fn persist_setting_value(&mut self, key: &str, value: serde_json::Value) {
@@ -4060,7 +4161,9 @@ impl Program {
             Message::ToggleSettings => {
                 if self.app_state.gui_state == GUIState::Settings {
                     self.app_state.gui_state = GUIState::Main;
+                    self.password_protection.lock();
                 } else {
+                    self.password_protection.lock();
                     self.app_state.gui_state = GUIState::Settings;
                 }
                 self.begin_page_transition();
@@ -4071,11 +4174,119 @@ impl Program {
             Message::ToggleAdvancedSettings => {
                 if self.app_state.gui_state == GUIState::AdvancedSettings {
                     self.app_state.gui_state = GUIState::Settings;
+                    if self.password_protection.scope
+                        == PasswordProtectionScope::AdvancedSettingsOnly
+                    {
+                        self.password_protection.lock();
+                    }
                 } else {
+                    if self.password_protection.scope
+                        == PasswordProtectionScope::AdvancedSettingsOnly
+                    {
+                        self.password_protection.lock();
+                    }
                     self.app_state.gui_state = GUIState::AdvancedSettings;
                 }
                 self.begin_page_transition();
 
+                Task::none()
+            }
+
+            Message::PasswordUnlockInputChanged(value) => {
+                if self
+                    .password_protection
+                    .page_is_locked(self.app_state.gui_state)
+                {
+                    self.password_protection.unlock_input = value;
+                    self.password_protection.error = None;
+                }
+                Task::none()
+            }
+
+            Message::UnlockSettings => {
+                if !self
+                    .password_protection
+                    .page_is_locked(self.app_state.gui_state)
+                {
+                    return Task::none();
+                }
+
+                if self.password_protection.unlock_input == self.password_protection.password {
+                    self.password_protection.unlocked = true;
+                    self.password_protection.unlock_input.clear();
+                    self.password_protection.error = None;
+                    self.begin_page_transition();
+                } else {
+                    self.password_protection.error = Some("Incorrect password.".to_string());
+                }
+                Task::none()
+            }
+
+            Message::NewPasswordInputChanged(value) => {
+                if self.can_manage_password_protection() {
+                    self.password_protection.new_password_input = value;
+                    self.password_protection.error = None;
+                }
+                Task::none()
+            }
+
+            Message::SavePassword => {
+                if !self.can_manage_password_protection() {
+                    return Task::none();
+                }
+
+                if self.password_protection.new_password_input.is_empty() {
+                    self.password_protection.error = Some("Password cannot be empty.".to_string());
+                    return Task::none();
+                }
+
+                self.password_protection.password =
+                    std::mem::take(&mut self.password_protection.new_password_input);
+                // An administrator changing a live password has already reached
+                // the protected page, so do not lock the form out from under them.
+                self.password_protection.unlocked = self.password_protection.enabled;
+                self.password_protection.error = None;
+                self.persist_setting_value(
+                    "password",
+                    serde_json::Value::String(self.password_protection.password.clone()),
+                );
+                Task::none()
+            }
+
+            Message::TogglePasswordProtection => {
+                if !self.can_manage_password_protection() {
+                    return Task::none();
+                }
+
+                if !self.password_protection.enabled && self.password_protection.password.is_empty()
+                {
+                    self.password_protection.error =
+                        Some("Set a non-empty password before enabling protection.".to_string());
+                    return Task::none();
+                }
+
+                self.password_protection.enabled = !self.password_protection.enabled;
+                if self.password_protection.enabled {
+                    self.password_protection.unlocked = true;
+                }
+                self.password_protection.error = None;
+                self.persist_boolean_setting("password_enabled", self.password_protection.enabled);
+                Task::none()
+            }
+
+            Message::PasswordProtectionScopeChanged(scope) => {
+                if !self.can_manage_password_protection() {
+                    return Task::none();
+                }
+
+                self.password_protection.scope = scope;
+                match serde_json::to_value(scope) {
+                    Ok(value) => self.persist_setting_value("password_scope", value),
+                    Err(error) => self.set_debug_message(DebugMessage {
+                        message: format!("Could not save password-protection scope: {error}"),
+                        is_error: true,
+                    }),
+                }
                 Task::none()
             }
 
@@ -4847,6 +5058,7 @@ impl Default for Program {
         let show_tokens_per_second = setting_bool("show_tokens_per_second", false);
         let current_chat_history_enabled = setting_bool("current_chat_history_enabled", true);
         let code_checking_enabled = setting_bool("code_checking_enabled", false);
+        let password_protection = PasswordProtection::from_settings(&settings_hmap);
         let dynamic_prompt_settings = settings_hmap
             .get("dynamic_prompt")
             .cloned()
@@ -5008,6 +5220,7 @@ impl Default for Program {
             profile_edit_instructions: String::new(),
             code_checking_enabled,
             dynamic_prompt_settings,
+            password_protection,
             max_response_tokens_input: max_response_tokens.to_string(),
             context_tokens_input: context_tokens.to_string(),
             pending_settings: serde_json::Map::new(),
@@ -5164,16 +5377,17 @@ mod tests {
 
     use super::{
         ActivePrompt, Correspondence, CurrentChat, FontFamily, GUIState, InferenceStreamLine,
-        LEGACY_PROFILE_ID, Message, ModelCapabilities, Point, Profile, ProfileRegistry, Program,
-        SavedChat, SettingsFeedbackTarget, Size, ThinkingLevel, ToolLoopProgress, UiResizeTarget,
-        UserInformation, WebSearchSettings, WebSearchState, app_data_dir,
-        assign_legacy_profile_ids, canonical_code_language, censor_text, chat_profile_id,
-        compare_versions, conversation_context_prompt, decode_generation_line,
-        decode_inference_stream_line, disabled_web_tool_message, ensure_legacy_profile,
-        mask_live_code_blocks, merge_generation_chunk_details, model_capabilities,
-        normalize_code_fence_languages, parse_live_markdown_items, parse_markdown_items,
-        preferred_or_first_model, read_json_with_backup, remote_image_url_is_safe, sidecar_path,
-        split_thinking_text, tokens_per_second, write_json_safely,
+        LEGACY_PROFILE_ID, Message, ModelCapabilities, PasswordProtection, PasswordProtectionScope,
+        Point, Profile, ProfileRegistry, Program, SavedChat, SettingsFeedbackTarget, Size,
+        ThinkingLevel, ToolLoopProgress, UiResizeTarget, UserInformation, WebSearchSettings,
+        WebSearchState, app_data_dir, assign_legacy_profile_ids, canonical_code_language,
+        censor_text, chat_profile_id, compare_versions, conversation_context_prompt,
+        decode_generation_line, decode_inference_stream_line, disabled_web_tool_message,
+        ensure_legacy_profile, mask_live_code_blocks, merge_generation_chunk_details,
+        model_capabilities, normalize_code_fence_languages, parse_live_markdown_items,
+        parse_markdown_items, preferred_or_first_model, read_json_with_backup,
+        remote_image_url_is_safe, sidecar_path, split_thinking_text, tokens_per_second,
+        write_json_safely,
     };
 
     fn test_active_prompt(
@@ -5447,6 +5661,132 @@ mod tests {
             program.settings_feedback,
             Some((SettingsFeedbackTarget::ApplyContextWindow, _))
         ));
+    }
+
+    #[test]
+    fn password_settings_load_from_reproducible_flat_keys() {
+        let settings = serde_json::json!({
+            "password_enabled": true,
+            "password": "classroom-password",
+            "password_scope": "advanced_settings_only"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let protection = PasswordProtection::from_settings(&settings);
+
+        assert!(protection.enabled);
+        assert_eq!(protection.password, "classroom-password");
+        assert_eq!(
+            protection.scope,
+            PasswordProtectionScope::AdvancedSettingsOnly
+        );
+        assert!(!protection.page_is_locked(GUIState::Settings));
+        assert!(protection.page_is_locked(GUIState::AdvancedSettings));
+    }
+
+    #[test]
+    fn missing_password_scope_defaults_to_all_settings() {
+        let settings = serde_json::json!({
+            "password_enabled": true,
+            "password": "teacher"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let protection = PasswordProtection::from_settings(&settings);
+
+        assert_eq!(protection.scope, PasswordProtectionScope::AllSettings);
+        assert!(protection.page_is_locked(GUIState::Settings));
+        assert!(protection.page_is_locked(GUIState::AdvancedSettings));
+    }
+
+    #[test]
+    fn enabled_protection_with_an_empty_password_does_not_lock_out_settings() {
+        let settings = serde_json::json!({
+            "password_enabled": true,
+            "password": ""
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let protection = PasswordProtection::from_settings(&settings);
+
+        assert!(protection.enabled);
+        assert!(!protection.page_is_locked(GUIState::Settings));
+        assert!(!protection.page_is_locked(GUIState::AdvancedSettings));
+    }
+
+    #[test]
+    fn protected_settings_unlock_and_relock_when_closed() {
+        let mut program = Program::default();
+        program.app_state.gui_state = GUIState::Main;
+        program.password_protection.enabled = true;
+        program.password_protection.password = "teacher".into();
+        program.password_protection.scope = PasswordProtectionScope::AllSettings;
+
+        drop(program.update(Message::ToggleSettings));
+        assert!(program.app_state.gui_state == GUIState::Settings);
+        assert!(
+            program
+                .password_protection
+                .page_is_locked(GUIState::Settings)
+        );
+
+        drop(program.update(Message::PasswordUnlockInputChanged("wrong".into())));
+        drop(program.update(Message::UnlockSettings));
+        assert!(!program.password_protection.unlocked);
+        assert_eq!(
+            program.password_protection.error.as_deref(),
+            Some("Incorrect password.")
+        );
+
+        drop(program.update(Message::PasswordUnlockInputChanged("teacher".into())));
+        drop(program.update(Message::UnlockSettings));
+        assert!(program.password_protection.unlocked);
+        assert!(
+            !program
+                .password_protection
+                .page_is_locked(GUIState::Settings)
+        );
+
+        drop(program.update(Message::ToggleSettings));
+        assert!(program.app_state.gui_state == GUIState::Main);
+        assert!(!program.password_protection.unlocked);
+    }
+
+    #[test]
+    fn password_configuration_is_queued_as_plaintext_flat_settings() {
+        let mut program = Program::default();
+        program.app_state.gui_state = GUIState::AdvancedSettings;
+        program.password_protection = PasswordProtection::default();
+        program.pending_settings.clear();
+
+        drop(program.update(Message::NewPasswordInputChanged(
+            "shared-classroom-password".into(),
+        )));
+        drop(program.update(Message::SavePassword));
+        drop(program.update(Message::TogglePasswordProtection));
+        drop(program.update(Message::PasswordProtectionScopeChanged(
+            PasswordProtectionScope::AdvancedSettingsOnly,
+        )));
+
+        assert_eq!(
+            program.pending_settings.get("password"),
+            Some(&serde_json::json!("shared-classroom-password"))
+        );
+        assert_eq!(
+            program.pending_settings.get("password_enabled"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(
+            program.pending_settings.get("password_scope"),
+            Some(&serde_json::json!("advanced_settings_only"))
+        );
+        assert!(program.password_protection.unlocked);
     }
 
     #[test]

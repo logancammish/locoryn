@@ -35,11 +35,96 @@ pub(crate) use theme::set_dark_mode;
 const SIDEBAR_SCROLLBAR_CLEARANCE: f32 = 14.0;
 
 impl Program {
+    fn password_unlock_page<'a>(
+        &'a self,
+        page: GUIState,
+        language: Language,
+    ) -> iced::widget::Container<'a, Message> {
+        let (title, subtitle, back_message) = match page {
+            GUIState::AdvancedSettings => (
+                tr(language, "Advanced settings locked"),
+                tr(
+                    language,
+                    "Enter the administrator password to change advanced settings.",
+                ),
+                Message::ToggleAdvancedSettings,
+            ),
+            _ => (
+                tr(language, "Settings locked"),
+                tr(
+                    language,
+                    "Enter the administrator password to change settings.",
+                ),
+                Message::ToggleSettings,
+            ),
+        };
+        let error: Element<Message> = self
+            .password_protection
+            .error
+            .as_deref()
+            .map(|message| widget::text(message).size(13).color(danger()).into())
+            .unwrap_or_else(|| widget::column![].into());
+
+        let content = widget::column![
+            Space::new().height(Length::Fixed((1.0 - eased(self.page_reveal)) * 4.0)),
+            container(widget::row![
+                section_title(title, subtitle),
+                Space::new().width(Length::Fill),
+                secondary_button(tr(language, "Go back"), back_message),
+            ])
+            .padding(18)
+            .width(Length::Fill)
+            .style(top_bar_style),
+            Space::new().height(Length::Fixed(14.0)),
+            container(widget::column![
+                setting_label(
+                    tr(language, "Password required"),
+                    tr(
+                        language,
+                        "Password protection is configured in the local settings file."
+                    ),
+                ),
+                Space::new().height(Length::Fixed(12.0)),
+                iced::widget::TextInput::<Message>::new(
+                    tr(language, "Password"),
+                    &self.password_protection.unlock_input,
+                )
+                .secure(true)
+                .on_input(Message::PasswordUnlockInputChanged)
+                .on_submit(Message::UnlockSettings)
+                .padding(12)
+                .width(Length::Fill)
+                .style(text_input_style),
+                Space::new().height(Length::Fixed(10.0)),
+                error,
+                Space::new().height(Length::Fixed(10.0)),
+                widget::row![
+                    Space::new().width(Length::Fill),
+                    primary_button(tr(language, "Unlock"), Message::UnlockSettings),
+                ],
+            ])
+            .padding(18)
+            .width(Length::Fill)
+            .max_width(560)
+            .style(conversation_style),
+        ];
+
+        container(widget::scrollable(content).height(Length::Fill))
+            .padding(18)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(iced::Alignment::Center)
+            .style(app_background_style)
+    }
+
     pub fn get_ui_information<'a>(
         &'a self,
         gui_state: &'a GUIState,
     ) -> iced::widget::Container<'a, Message> {
         let language = self.user_information.language;
+        if self.password_protection.page_is_locked(*gui_state) {
+            return self.password_unlock_page(*gui_state, language);
+        }
         match gui_state {
             GUIState::InfoPopup => {
                 let content = container(
@@ -301,34 +386,65 @@ impl Program {
                 } else {
                     success()
                 };
+                let standard_settings_protected =
+                    self.password_protection.protects_standard_settings();
 
-                let model_selector = || -> Element<Message> {
-                    if bots_list.is_empty() {
-                        container(
-                            widget::text(tr(language, "No models installed"))
+                let model_selector =
+                    || -> Element<Message> {
+                        if standard_settings_protected {
+                            container(
+                                widget::text(selected_model.clone().unwrap_or_else(|| {
+                                    tr(language, "No model selected").to_string()
+                                }))
                                 .size(13)
-                                .color(text_muted()),
-                        )
-                        .padding(10)
-                        .style(chip_style(danger()))
-                        .into()
-                    } else {
-                        widget::pick_list(
-                            bots_list.clone(),
-                            selected_model.clone(),
-                            Message::ModelChange,
-                        )
-                        .padding([7, 10])
-                        .text_size(13)
-                        .style(pick_list_style)
-                        .menu_style(pick_list_menu_style)
-                        .width(Length::Fill)
-                        .into()
-                    }
-                };
+                                .color(text_main()),
+                            )
+                            .padding([7, 10])
+                            .style(chip_style(accent_2()))
+                            .into()
+                        } else if bots_list.is_empty() {
+                            container(
+                                widget::text(tr(language, "No models installed"))
+                                    .size(13)
+                                    .color(text_muted()),
+                            )
+                            .padding(10)
+                            .style(chip_style(danger()))
+                            .into()
+                        } else {
+                            widget::pick_list(
+                                bots_list.clone(),
+                                selected_model.clone(),
+                                Message::ModelChange,
+                            )
+                            .padding([7, 10])
+                            .text_size(13)
+                            .style(pick_list_style)
+                            .menu_style(pick_list_menu_style)
+                            .width(Length::Fill)
+                            .into()
+                        }
+                    };
 
                 let thinking_selector = || -> Element<Message> {
-                    if standard_reasoning_slider_available(&self.user_information.thinking_levels) {
+                    if standard_settings_protected {
+                        container(
+                            widget::text(
+                                ThinkingChoice {
+                                    level: self.user_information.thinking_level,
+                                    language,
+                                }
+                                .to_string(),
+                            )
+                            .size(13)
+                            .color(text_main()),
+                        )
+                        .padding([7, 10])
+                        .style(chip_style(accent_2()))
+                        .into()
+                    } else if standard_reasoning_slider_available(
+                        &self.user_information.thinking_levels,
+                    ) {
                         compact_thinking_control(
                             self.user_information.thinking_level,
                             &self.user_information.thinking_levels,
@@ -1278,7 +1394,24 @@ impl Program {
                     .width(token_control_width)
                 };
 
-                let config_drawer: Element<Message> = if self.config_drawer_open {
+                let config_drawer: Element<Message> = if self.config_drawer_open
+                    && standard_settings_protected
+                {
+                    container(widget::row![
+                        widget::text(tr(
+                            language,
+                            "Configuration controls are password protected."
+                        ))
+                        .size(13)
+                        .color(text_muted()),
+                        Space::new().width(Length::Fill),
+                        secondary_button(tr(language, "Open settings"), Message::ToggleSettings),
+                    ])
+                    .padding([8, 10])
+                    .width(Length::Fill)
+                    .style(config_drawer_style)
+                    .into()
+                } else if self.config_drawer_open {
                     let prompt_control = widget::column![
                         widget::text(tr(language, "System prompt"))
                             .size(11)
@@ -1575,13 +1708,30 @@ impl Program {
                 let completed_vision = self.vision_responses.get(&self.current_chat_id);
                 let visible_debug = self.current_debug_message().clone();
                 let pulse = 1.0 - (self.ui_motion * 2.0 - 1.0).abs();
-                let model_selector =
-                    widget::pick_list(bots_list, selected_model, Message::ModelChange)
+                let model_selector: Element<Message> =
+                    if self.password_protection.protects_standard_settings() {
+                        container(
+                            widget::text(
+                                selected_model.unwrap_or_else(|| {
+                                    tr(language, "No model selected").to_string()
+                                }),
+                            )
+                            .size(14)
+                            .color(text_main()),
+                        )
                         .padding([12, 14])
-                        .text_size(14)
-                        .style(pick_list_style)
-                        .menu_style(pick_list_menu_style)
-                        .width(Length::Fill);
+                        .width(Length::Fill)
+                        .style(chip_style(accent_2()))
+                        .into()
+                    } else {
+                        widget::pick_list(bots_list, selected_model, Message::ModelChange)
+                            .padding([12, 14])
+                            .text_size(14)
+                            .style(pick_list_style)
+                            .menu_style(pick_list_menu_style)
+                            .width(Length::Fill)
+                            .into()
+                    };
 
                 let attachment: Element<Message> = if !self.pending_images.is_empty() {
                     image_previews(&self.pending_images, true, language)
@@ -2727,6 +2877,79 @@ impl Program {
                         .on_input(Message::ChangePort)
                         .style(text_input_style);
 
+                let password_status = if self.password_protection.password.is_empty() {
+                    tr(language, "No password is set.")
+                } else {
+                    tr(language, "A password is set.")
+                };
+                let password_error: Element<Message> = self
+                    .password_protection
+                    .error
+                    .as_deref()
+                    .map(|message| widget::text(message).size(12).color(danger()).into())
+                    .unwrap_or_else(|| widget::column![].into());
+                let password_protection_settings: Element<Message> = container(
+                    widget::column![
+                        setting_label(
+                            tr(language, "Settings password"),
+                            tr(language, "Set or replace the password used to unlock protected settings."),
+                        ),
+                        Space::new().height(Length::Fixed(10.0)),
+                        iced::widget::TextInput::<Message>::new(
+                            tr(language, "New password"),
+                            &self.password_protection.new_password_input,
+                        )
+                        .secure(true)
+                        .on_input(Message::NewPasswordInputChanged)
+                        .on_submit(Message::SavePassword)
+                        .padding(11)
+                        .width(Length::Fill)
+                        .style(text_input_style),
+                        Space::new().height(Length::Fixed(8.0)),
+                        widget::row![
+                            secondary_button(tr(language, "Save password"), Message::SavePassword),
+                            Space::new().width(Length::Fill),
+                            widget::text(password_status).size(12).color(text_muted()),
+                        ]
+                        .align_y(iced::Alignment::Center),
+                        Space::new().height(Length::Fixed(14.0)),
+                        widget::row![
+                            setting_label(
+                                tr(language, "Password protection"),
+                                tr(language, "Require the saved password before protected settings can be opened."),
+                            ),
+                            widget::checkbox(self.password_protection.enabled)
+                                .label(tr(language, "Enabled"))
+                                .on_toggle(|_| Message::TogglePasswordProtection),
+                        ]
+                        .align_y(iced::Alignment::Center),
+                        Space::new().height(Length::Fixed(12.0)),
+                        setting_label(
+                            tr(language, "Protection coverage"),
+                            tr(language, "Advanced settings are always protected. You can also protect the standard settings page."),
+                        ),
+                        widget::pick_list(
+                            crate::PasswordProtectionScope::ALL,
+                            Some(self.password_protection.scope),
+                            Message::PasswordProtectionScopeChanged,
+                        )
+                        .padding([12, 14])
+                        .text_size(14)
+                        .style(pick_list_style)
+                        .menu_style(pick_list_menu_style)
+                        .width(Length::Fill),
+                        Space::new().height(Length::Fixed(10.0)),
+                        password_error,
+                        widget::text(tr(language, "Not intended for high vunerability environments"))
+                            .size(12)
+                            .color(warning()),
+                    ],
+                )
+                .padding(16)
+                .width(Length::Fill)
+                .style(flat_card_style)
+                .into();
+
                 let content = widget::column![
                     Space::new().height(Length::Fixed(
                         (1.0 - eased(self.page_reveal)) * 4.0
@@ -2788,6 +3011,10 @@ impl Program {
                         .style(flat_card_style),
                         Space::new().height(Length::Fixed(10.0)),
                         model_management,
+                        Space::new().height(Length::Fixed(14.0)),
+                        settings_group_title(tr(language, "PASSWORD PROTECTION")),
+                        Space::new().height(Length::Fixed(8.0)),
+                        password_protection_settings,
                             ]
                         ]
                         .width(Length::Fill),
