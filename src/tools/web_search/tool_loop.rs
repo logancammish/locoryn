@@ -14,6 +14,8 @@ pub struct ToolLoopRequest {
     pub user_prompt: String,
     pub system_prompt: String,
     pub temperature: f32,
+    pub top_p: f32,
+    pub top_k: u32,
     pub context_tokens: u32,
     pub max_response_tokens: u32,
     pub images: Vec<EncodedImage>,
@@ -889,6 +891,8 @@ async fn request_backend_chat_message(
         tools,
         thinking_override.unwrap_or(&request.thinking),
         request.temperature,
+        request.top_p,
+        request.top_k,
         request.context_tokens,
         request.max_response_tokens,
     );

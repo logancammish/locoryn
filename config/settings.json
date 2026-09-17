@@ -7,11 +7,13 @@
     "model": null,
     "backend_connections": {
         "ollama": {
+            "address": "http://127.0.0.1:11434",
             "protocol": "http",
             "ip": "127.0.0.1",
             "port": "11434"
         },
         "openvino": {
+            "address": "http://127.0.0.1:8000",
             "protocol": "http",
             "ip": "127.0.0.1",
             "port": "8000"
@@ -20,7 +22,7 @@
     "current_chat_history_enabled": true,
     "info_popup": true,
     "password_enabled": false,
-    "password": "",
+    "password_hash": "",
     "password_scope": "all_settings",
     "fast_streaming": true,
     "max_response_tokens": 32768,

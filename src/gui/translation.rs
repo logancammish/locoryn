@@ -238,6 +238,10 @@ pub(super) fn tr(language: Language, english: &'static str) -> &'static str {
         "Select a model and wait while reasoning support is checked." => {
             "Selecciona un modelo mientras se comprueba la compatibilidad con razonamiento."
         }
+        "Top P" => "Top P",
+        "Top K" => "Top K",
+        "Limit tokens by cumulative probability. 1 includes all probabilities." => "Limita los tokens por probabilidad acumulada. 1 incluye todas las probabilidades.",
+        "Limit sampling to this many most likely tokens." => "Limita el muestreo a esta cantidad de tokens más probables.",
         "Temperature" => "Temperatura",
         "Higher values make output more random." => {
             "Los valores altos producen respuestas más aleatorias."
@@ -282,6 +286,10 @@ pub(super) fn tr(language: Language, english: &'static str) -> &'static str {
             "Borra el contexto local o abre opciones de configuración adicionales."
         }
         "Clear current context" => "Borrar contexto actual",
+        "Custom endpoints" => "Endpoints personalizados",
+        "Override endpoint paths. Leave blank to use the defaults." => "Reemplaza las rutas de los endpoints. Deja los campos vacíos para usar los valores predeterminados.",
+        "Models endpoint" => "Endpoint de modelos",
+        "Chat endpoint" => "Endpoint de chat",
         "Advanced settings" => "Configuración avanzada",
         "Model name, e.g. llama3.2:3b" => "Nombre del modelo, p. ej. llama3.2:3b",
         "Install models, change connection settings, and tune rendering." => {
@@ -343,8 +351,8 @@ pub(super) fn tr(language: Language, english: &'static str) -> &'static str {
         "Choose HTTP or HTTPS, then enter the hostname or IP address and port used to connect to Ollama." => {
             "Elige HTTP o HTTPS e introduce el nombre de host o la dirección IP y el puerto para conectar con Ollama."
         }
-        "Choose HTTP or HTTPS, then enter the hostname or IP address and port used by the selected inference server." => {
-            "Elige HTTP o HTTPS e introduce el nombre de host o la dirección IP y el puerto del servidor de inferencia seleccionado."
+        "Enter the full server URL, including http:// or https:// and an optional port or base path." => {
+            "Introduce la URL completa del servidor, incluyendo http:// o https:// y un puerto o ruta base opcionales."
         }
         "Fastest · no extra reasoning" => "Más rápido · sin razonamiento adicional",
         "Use this model's standard reasoning mode" => {
