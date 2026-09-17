@@ -2271,6 +2271,20 @@ impl Program {
                                             ),
                                         ),
                                     ],
+                                    Space::new().height(Length::Fixed(14.0)),
+                                    setting_label(tr(language, "Top P"), tr(language, "Limit tokens by cumulative probability. 1 includes all probabilities.")),
+                                    widget::row![
+                                        widget::slider(0.01..=1.0, self.user_information.top_p, Message::UpdateTopP).step(0.01_f32),
+                                        Space::new().width(Length::Fixed(12.0)),
+                                        feedback_value_chip(format!("{:.2}", self.user_information.top_p), accent(), self.settings_feedback(SettingsFeedbackTarget::TopP)),
+                                    ],
+                                    Space::new().height(Length::Fixed(14.0)),
+                                    setting_label(tr(language, "Top K"), tr(language, "Limit sampling to this many most likely tokens.")),
+                                    widget::row![
+                                        widget::slider(1..=200, self.user_information.top_k, Message::UpdateTopK),
+                                        Space::new().width(Length::Fixed(12.0)),
+                                        feedback_value_chip(self.user_information.top_k.to_string(), accent(), self.settings_feedback(SettingsFeedbackTarget::TopK)),
+                                    ],
                                 ]
                             )
                             .padding(16)
@@ -2824,7 +2838,8 @@ impl Program {
             }
 
             GUIState::AdvancedSettings => {
-                let ip = self.user_information.active_connection().clone();
+                let connection = self.user_information.active_connection().clone();
+                let address = connection.address();
 
                 let prompts_list = self
                     .system_prompt
@@ -2876,33 +2891,49 @@ impl Program {
                         .into()
                 };
 
-                let change_ip = iced::widget::TextInput::<Message>::new(ip.ip.as_str(), &ip.ip)
-                    .padding(12)
-                    .size(15)
-                    .width(Length::FillPortion(3))
-                    .on_submit(Message::ChangeIp(ip.ip.clone()))
-                    .on_input(Message::ChangeIp)
-                    .style(text_input_style);
-
-                let change_protocol =
-                    iced::widget::TextInput::<Message>::new("https", &ip.protocol)
+                let change_address =
+                    iced::widget::TextInput::<Message>::new("http://127.0.0.1:11434", &address)
                         .padding(12)
                         .size(15)
-                        .width(Length::Fixed(88.0))
-                        .on_submit(Message::ChangeProtocol(ip.protocol.clone()))
-                        .on_input(Message::ChangeProtocol)
+                        .width(Length::Fill)
+                        .on_input(Message::ChangeAddress)
                         .style(text_input_style);
 
-                let change_port =
-                    iced::widget::TextInput::<Message>::new(ip.port.as_str(), &ip.port)
-                        .padding(12)
-                        .size(15)
-                        .width(Length::FillPortion(1))
-                        .on_submit(Message::ChangePort(ip.port.clone()))
-                        .on_input(Message::ChangePort)
-                        .style(text_input_style);
+                let custom_endpoints: Element<Message> =
+                    if self.user_information.backend == InferenceBackend::OpenVino {
+                        widget::column![
+                            Space::new().height(Length::Fixed(12.0)),
+                            setting_label(
+                                tr(language, "Custom endpoints"),
+                                tr(
+                                    language,
+                                    "Override endpoint paths. Leave blank to use the defaults."
+                                )
+                            ),
+                            widget::text(tr(language, "Models endpoint")).size(13),
+                            iced::widget::TextInput::<Message>::new(
+                                "/v3/models",
+                                &connection.models_endpoint
+                            )
+                            .on_input(Message::ChangeModelsEndpoint)
+                            .padding(12)
+                            .style(text_input_style),
+                            widget::text(tr(language, "Chat endpoint")).size(13),
+                            iced::widget::TextInput::<Message>::new(
+                                "/v3/chat/completions",
+                                &connection.chat_endpoint
+                            )
+                            .on_input(Message::ChangeChatEndpoint)
+                            .padding(12)
+                            .style(text_input_style),
+                        ]
+                        .spacing(8)
+                        .into()
+                    } else {
+                        widget::column![].into()
+                    };
 
-                let password_status = if self.password_protection.password.is_empty() {
+                let password_status = if self.password_protection.password_hash.is_empty() {
                     tr(language, "No password is set.")
                 } else {
                     tr(language, "A password is set.")
@@ -3160,33 +3191,22 @@ impl Program {
                                         "OpenVINO Model Server address"
                                     }
                                 ),
-                                tr(language, "Choose HTTP or HTTPS, then enter the hostname or IP address and port used by the selected inference server.")
+                                tr(language, "Enter the full server URL, including http:// or https:// and an optional port or base path.")
                             ),
                             Space::new().height(Length::Fixed(12.0)),
-                            widget::row![
-                                change_protocol,
-                                widget::text("://").size(20).color(text_muted()),
-                                change_ip,
-                                Space::new().width(Length::Fixed(8.0)),
-                                widget::text(":").size(20).color(text_muted()),
-                                Space::new().width(Length::Fixed(8.0)),
-                                change_port,
-                            ],
+                            change_address,
+                            custom_endpoints,
                             Space::new().height(Length::Fixed(12.0)),
                             container(
                                 widget::text(if language == Language::Spanish {
                                     format!(
-                                        "Dirección actual: {}://{}:{}",
-                                        ip.protocol,
-                                        ip.ip,
-                                        ip.port
+                                        "Dirección actual: {}",
+                                        address
                                     )
                                 } else {
                                     format!(
-                                        "Current address: {}://{}:{}",
-                                        ip.protocol,
-                                        ip.ip,
-                                        ip.port
+                                        "Current address: {}",
+                                        address
                                     )
                                 })
                                 .size(13)

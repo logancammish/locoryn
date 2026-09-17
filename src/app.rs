@@ -492,6 +492,8 @@ pub struct UserInformation {
     pub max_response_tokens: u32,
     pub context_tokens: u32,
     pub temperature: f32,
+    pub top_p: f32,
+    pub top_k: u32,
     pub text_size: f32,
     pub font_family: FontFamily,
     pub chat_history: Arc<Mutex<CurrentChat>>,

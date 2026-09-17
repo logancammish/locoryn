@@ -20,6 +20,7 @@ use rustrict::{Censor, Type};
 mod app;
 mod gui;
 mod inference;
+mod password;
 mod tools;
 
 use crate::app::{
@@ -115,7 +116,10 @@ impl fmt::Display for PasswordProtectionScope {
 #[derive(Default)]
 struct PasswordProtection {
     enabled: bool,
-    password: String,
+    password_hash: String,
+    // Keep protection active if a legacy password could not be hashed.
+    load_error: Option<String>,
+    needs_migration: bool,
     scope: PasswordProtectionScope,
     unlocked: bool,
     unlock_input: String,
@@ -125,11 +129,19 @@ struct PasswordProtection {
 
 impl PasswordProtection {
     fn from_settings(settings: &serde_json::Map<String, serde_json::Value>) -> Self {
-        let password = settings
-            .get("password")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string();
+        let mut settings = settings.clone();
+        let migration = password::migrate_settings(&mut settings);
+        let mut load_error = migration.as_ref().err().cloned();
+        let needs_migration = migration.unwrap_or(false);
+        let password_hash = match settings.get("password_hash") {
+            Some(serde_json::Value::String(hash)) => hash.clone(),
+            None => String::new(),
+            // A malformed credential must fail verification, not disable the lock.
+            Some(_) => {
+                load_error = Some("The saved password hash is invalid.".to_string());
+                String::new()
+            }
+        };
         let configured_enabled = settings
             .get("password_enabled")
             .and_then(serde_json::Value::as_bool)
@@ -141,17 +153,17 @@ impl PasswordProtection {
             .unwrap_or_default();
 
         Self {
-            // A hand-edited settings file must not make the settings UI
-            // impossible to open when no usable password was supplied.
             enabled: configured_enabled,
-            password,
+            password_hash,
+            load_error,
+            needs_migration,
             scope,
             ..Self::default()
         }
     }
 
     fn is_active(&self) -> bool {
-        self.enabled && !self.password.is_empty()
+        self.enabled && (!self.password_hash.is_empty() || self.load_error.is_some())
     }
 
     fn protects_standard_settings(&self) -> bool {
@@ -179,7 +191,10 @@ impl PasswordProtection {
     fn setting_values(&self) -> [(&'static str, serde_json::Value); 3] {
         [
             ("password_enabled", serde_json::Value::Bool(self.enabled)),
-            ("password", serde_json::Value::String(self.password.clone())),
+            (
+                "password_hash",
+                serde_json::Value::String(self.password_hash.clone()),
+            ),
             (
                 "password_scope",
                 serde_json::to_value(self.scope)
@@ -202,6 +217,8 @@ enum SettingsFeedbackTarget {
     ContextWindow,
     ApplyContextWindow,
     Temperature,
+    TopP,
+    TopK,
     TextSize,
     SearchResultLimit,
     MaximumSearches,
@@ -341,6 +358,8 @@ enum Message {
     InstallModel(String),
     UpdateInstall(String),
     UpdateTemperature(f32),
+    UpdateTopP(f32),
+    UpdateTopK(u32),
     UpdateMaxResponseTokens(f32),
     EditMaxResponseTokens(String),
     ApplyMaxResponseTokens,
@@ -381,9 +400,9 @@ enum Message {
     TogglePasswordProtection,
     PasswordProtectionScopeChanged(PasswordProtectionScope),
     BackendChange(InferenceBackend),
-    ChangeProtocol(String),
-    ChangeIp(String),
-    ChangePort(String),
+    ChangeAddress(String),
+    ChangeModelsEndpoint(String),
+    ChangeChatEndpoint(String),
 }
 
 #[derive(Clone, Copy)]
@@ -417,6 +436,8 @@ impl Message {
             | Self::SystemPromptChange(_)
             | Self::UpdateTextSize(_)
             | Self::FontFamilyChange(_)
+            | Self::UpdateTopP(_)
+            | Self::UpdateTopK(_)
             | Self::UpdateTemperature(_)
             | Self::UpdateMaxResponseTokens(_)
             | Self::EditMaxResponseTokens(_)
@@ -441,9 +462,9 @@ impl Message {
             | Self::ToggleShowTokensPerSecond
             | Self::ToggleInfoPopupSetting
             | Self::BackendChange(_)
-            | Self::ChangeProtocol(_)
-            | Self::ChangeIp(_)
-            | Self::ChangePort(_) => Some(ProtectedSettingsArea::Advanced),
+            | Self::ChangeAddress(_)
+            | Self::ChangeModelsEndpoint(_)
+            | Self::ChangeChatEndpoint(_) => Some(ProtectedSettingsArea::Advanced),
             _ => None,
         }
     }
@@ -741,6 +762,18 @@ fn write_file_safely(path: &Path, contents: &[u8]) -> io::Result<()> {
 fn write_json_safely<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), String> {
     let contents = serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?;
     write_file_safely(path, &contents).map_err(|error| error.to_string())
+}
+
+fn write_settings_safely(
+    path: &Path,
+    settings: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    write_json_safely(path, settings)?;
+    // Settings backups must not retain legacy plaintext or restore a replaced
+    // password. Keep the backup in sync after the atomic primary-file write.
+    fs::copy(path, sidecar_path(path, ".bak"))
+        .map(|_| ())
+        .map_err(|error| format!("Could not update the settings backup: {error}"))
 }
 
 fn read_json_with_backup<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
@@ -2177,7 +2210,9 @@ impl Program {
             .unwrap_or_default();
         settings.extend(pending.clone());
         let settings_path = user_settings_path();
-        if let Err(error) = write_json_safely(&settings_path, &settings) {
+        let result = password::migrate_settings(&mut settings)
+            .and_then(|_| write_settings_safely(&settings_path, &settings));
+        if let Err(error) = result {
             self.pending_settings.extend(pending);
             self.settings_dirty_at = Some(Instant::now());
             Err(error)
@@ -2188,6 +2223,9 @@ impl Program {
     }
 
     fn persist_password_protection_now(&mut self) -> Result<(), String> {
+        if let Some(error) = &self.password_protection.load_error {
+            return Err(error.clone());
+        }
         for (key, value) in self.password_protection.setting_values() {
             self.pending_settings.insert(key.to_string(), value);
         }
@@ -2925,6 +2963,8 @@ impl Program {
                         user_prompt: prompt.clone(),
                         system_prompt: system_prompt.clone(),
                         temperature: user_info.temperature / 10.0,
+                        top_p: user_info.top_p,
+                        top_k: user_info.top_k,
                         context_tokens: user_info.context_tokens,
                         max_response_tokens: user_info.max_response_tokens,
                         images: encoded_images.clone(),
@@ -3041,6 +3081,8 @@ impl Program {
                     &encoded_images,
                     &user_info.thinking_level.api_value(),
                     user_info.temperature / 10.0,
+                    user_info.top_p,
+                    user_info.top_k,
                     user_info.context_tokens,
                     user_info.max_response_tokens,
                 );
@@ -3387,6 +3429,24 @@ impl Program {
 
     fn boot() -> (Program, Task<Message>) {
         let mut program = Program::default();
+        let backup_has_plaintext = fs::read_to_string(sidecar_path(&user_settings_path(), ".bak"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .is_some_and(|settings| settings.get("password").is_some());
+        if program.password_protection.needs_migration || backup_has_plaintext {
+            match program.persist_password_protection_now() {
+                Ok(()) => program.password_protection.needs_migration = false,
+                Err(error) => program.set_debug_message(DebugMessage {
+                    message: format!("Could not migrate the saved password: {error}"),
+                    is_error: true,
+                }),
+            }
+        } else if let Some(error) = program.password_protection.load_error.clone() {
+            program.set_debug_message(DebugMessage {
+                message: error,
+                is_error: true,
+            });
+        }
         program.refresh_chat_markdown_cache();
         let image_task = program.queue_missing_markdown_images();
         let update_task = program.check_for_updates();
@@ -4184,21 +4244,24 @@ impl Program {
                 }
             }
 
-            Message::ChangeIp(ip) => {
-                self.user_information.active_connection_mut().ip = ip;
+            Message::ChangeAddress(address) => {
+                self.user_information
+                    .active_connection_mut()
+                    .set_address(address);
                 self.persist_backend_connections();
                 Task::none()
             }
 
-            Message::ChangeProtocol(protocol) => {
-                self.user_information.active_connection_mut().protocol =
-                    protocol.trim().trim_end_matches("://").to_ascii_lowercase();
+            Message::ChangeModelsEndpoint(endpoint) => {
+                self.user_information
+                    .active_connection_mut()
+                    .models_endpoint = endpoint;
                 self.persist_backend_connections();
                 Task::none()
             }
 
-            Message::ChangePort(port) => {
-                self.user_information.active_connection_mut().port = port;
+            Message::ChangeChatEndpoint(endpoint) => {
+                self.user_information.active_connection_mut().chat_endpoint = endpoint;
                 self.persist_backend_connections();
                 Task::none()
             }
@@ -4369,7 +4432,11 @@ impl Program {
                     return Task::none();
                 }
 
-                if self.password_protection.unlock_input == self.password_protection.password {
+                let entered_password = std::mem::take(&mut self.password_protection.unlock_input);
+                if password::verify_password(
+                    &entered_password,
+                    &self.password_protection.password_hash,
+                ) {
                     self.password_protection.unlocked = true;
                     self.password_protection.unlock_input.clear();
                     self.password_protection.error = None;
@@ -4398,8 +4465,15 @@ impl Program {
                     return Task::none();
                 }
 
-                self.password_protection.password =
-                    std::mem::take(&mut self.password_protection.new_password_input);
+                match password::hash_password(&self.password_protection.new_password_input) {
+                    Ok(hash) => self.password_protection.password_hash = hash,
+                    Err(error) => {
+                        self.password_protection.error = Some(error);
+                        return Task::none();
+                    }
+                }
+                self.password_protection.new_password_input.clear();
+                self.password_protection.load_error = None;
                 self.password_protection.enabled = true;
                 self.password_protection.unlocked = true;
                 self.password_protection.error = None;
@@ -4422,7 +4496,8 @@ impl Program {
                     return Task::none();
                 }
 
-                if !self.password_protection.enabled && self.password_protection.password.is_empty()
+                if !self.password_protection.enabled
+                    && self.password_protection.password_hash.is_empty()
                 {
                     if self.password_protection.new_password_input.is_empty() {
                         self.password_protection.error = Some(
@@ -4430,8 +4505,15 @@ impl Program {
                         );
                         return Task::none();
                     }
-                    self.password_protection.password =
-                        std::mem::take(&mut self.password_protection.new_password_input);
+                    match password::hash_password(&self.password_protection.new_password_input) {
+                        Ok(hash) => self.password_protection.password_hash = hash,
+                        Err(error) => {
+                            self.password_protection.error = Some(error);
+                            return Task::none();
+                        }
+                    }
+                    self.password_protection.new_password_input.clear();
+                    self.password_protection.load_error = None;
                 }
 
                 self.password_protection.enabled = !self.password_protection.enabled;
@@ -4459,6 +4541,22 @@ impl Program {
                     self.password_protection.error =
                         Some(format!("Could not save password protection: {error}"));
                 }
+                Task::none()
+            }
+
+            Message::UpdateTopP(value) => {
+                let value = value.clamp(0.01, 1.0);
+                self.user_information.top_p = value;
+                self.persist_setting_value("top_p", serde_json::json!(value));
+                self.trigger_settings_feedback(SettingsFeedbackTarget::TopP);
+                Task::none()
+            }
+
+            Message::UpdateTopK(value) => {
+                let value = value.clamp(1, 200);
+                self.user_information.top_k = value;
+                self.persist_setting_value("top_k", serde_json::json!(value));
+                self.trigger_settings_feedback(SettingsFeedbackTarget::TopK);
                 Task::none()
             }
 
@@ -5463,6 +5561,8 @@ impl Default for Program {
                 max_response_tokens,
                 context_tokens,
                 temperature: 7.0,
+                top_p: setting_f32("top_p", 1.0).clamp(0.01, 1.0),
+                top_k: setting_u32("top_k", 40, 1, 200),
                 text_size,
                 font_family,
                 language,
@@ -5546,6 +5646,7 @@ pub fn main() -> iced::Result {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -5553,6 +5654,7 @@ mod tests {
     use iced_widget::markdown;
 
     use crate::inference::{GenerationDetails, HostLocation, InferenceBackend, api_url, base_url};
+    use crate::password;
 
     use super::{
         ActivePrompt, Correspondence, CurrentChat, FontFamily, GUIState, InferenceStreamLine,
@@ -5567,7 +5669,7 @@ mod tests {
         model_capabilities, normalize_code_fence_languages, parse_live_markdown_items,
         parse_markdown_items, preferred_or_first_model, read_json_with_backup,
         remote_image_url_is_safe, sidecar_path, split_thinking_text, tokens_per_second,
-        write_json_safely,
+        user_settings_path, write_json_safely, write_settings_safely,
     };
 
     fn test_active_prompt(
@@ -5750,11 +5852,70 @@ mod tests {
     }
 
     #[test]
+    fn backend_address_changes_persist_only_the_selected_connection() {
+        let mut program = Program::default();
+        program.password_protection = PasswordProtection::default();
+        program.user_information.backend = InferenceBackend::Ollama;
+        program.user_information.backend_connections = Default::default();
+        let original_openvino = program
+            .user_information
+            .backend_connections
+            .openvino
+            .clone();
+
+        drop(program.update(Message::ChangeAddress(
+            "https://ollama.example:8443/proxy".into(),
+        )));
+        assert_eq!(
+            program.user_information.active_connection().address(),
+            "https://ollama.example:8443/proxy"
+        );
+        assert_eq!(
+            program.user_information.backend_connections.openvino,
+            original_openvino
+        );
+        let saved = &program.pending_settings["backend_connections"];
+        assert_eq!(
+            saved["ollama"]["address"],
+            "https://ollama.example:8443/proxy"
+        );
+        assert_eq!(saved["ollama"]["protocol"], "https");
+        assert_eq!(saved["ollama"]["ip"], "ollama.example");
+        assert_eq!(saved["ollama"]["port"], "8443");
+
+        drop(program.update(Message::BackendChange(InferenceBackend::OpenVino)));
+        drop(program.update(Message::ChangeAddress("http://ovms.example:8000".into())));
+        assert_eq!(
+            program
+                .user_information
+                .backend_connections
+                .ollama
+                .address(),
+            "https://ollama.example:8443/proxy"
+        );
+        assert_eq!(
+            program.user_information.active_connection().address(),
+            "http://ovms.example:8000"
+        );
+
+        program.password_protection.enabled = true;
+        program.password_protection.password_hash = password::hash_password("teacher").unwrap();
+        drop(program.update(Message::ChangeAddress("http://blocked.example".into())));
+        assert_eq!(
+            program.user_information.active_connection().address(),
+            "http://ovms.example:8000"
+        );
+    }
+
+    #[test]
     fn ollama_address_supports_http_https_and_ipv6() {
         let https = HostLocation {
+            address: None,
             protocol: "https://".into(),
             ip: "ollama.example.com".into(),
             port: "443".into(),
+            models_endpoint: String::new(),
+            chat_endpoint: String::new(),
         };
         assert_eq!(
             api_url(InferenceBackend::Ollama, &https, "/api/chat").unwrap(),
@@ -5762,9 +5923,12 @@ mod tests {
         );
 
         let ipv6 = HostLocation {
+            address: None,
             protocol: "http".into(),
             ip: "::1".into(),
             port: "11434".into(),
+            models_endpoint: String::new(),
+            chat_endpoint: String::new(),
         };
         assert_eq!(
             base_url(InferenceBackend::Ollama, &ipv6).unwrap().as_str(),
@@ -5775,16 +5939,22 @@ mod tests {
     #[test]
     fn ollama_address_rejects_unsupported_schemes_and_bad_ports() {
         let invalid_scheme = HostLocation {
+            address: None,
             protocol: "ftp".into(),
             ip: "ollama.example.com".into(),
             port: "21".into(),
+            models_endpoint: String::new(),
+            chat_endpoint: String::new(),
         };
         assert!(base_url(InferenceBackend::Ollama, &invalid_scheme).is_err());
 
         let invalid_port = HostLocation {
+            address: None,
             protocol: "https".into(),
             ip: "ollama.example.com".into(),
             port: "invalid".into(),
+            models_endpoint: String::new(),
+            chat_endpoint: String::new(),
         };
         assert!(base_url(InferenceBackend::Ollama, &invalid_port).is_err());
     }
@@ -5949,7 +6119,7 @@ mod tests {
     }
 
     #[test]
-    fn password_settings_load_from_reproducible_flat_keys() {
+    fn password_settings_migrate_from_legacy_flat_keys() {
         let settings = serde_json::json!({
             "password_enabled": true,
             "password": "classroom-password",
@@ -5962,7 +6132,11 @@ mod tests {
         let protection = PasswordProtection::from_settings(&settings);
 
         assert!(protection.enabled);
-        assert_eq!(protection.password, "classroom-password");
+        assert!(password::verify_password(
+            "classroom-password",
+            &protection.password_hash
+        ));
+        assert!(protection.needs_migration);
         assert_eq!(
             protection.scope,
             PasswordProtectionScope::AdvancedSettingsOnly
@@ -6010,7 +6184,7 @@ mod tests {
         let mut program = Program::default();
         program.app_state.gui_state = GUIState::Main;
         program.password_protection.enabled = true;
-        program.password_protection.password = "teacher".into();
+        program.password_protection.password_hash = password::hash_password("teacher").unwrap();
         program.password_protection.scope = PasswordProtectionScope::AllSettings;
 
         drop(program.update(Message::ToggleSettings));
@@ -6047,7 +6221,7 @@ mod tests {
     fn locked_settings_reject_mutations_beyond_the_view_layer() {
         let mut program = Program::default();
         program.password_protection.enabled = true;
-        program.password_protection.password = "teacher".into();
+        program.password_protection.password_hash = password::hash_password("teacher").unwrap();
         program.password_protection.scope = PasswordProtectionScope::AllSettings;
         program.password_protection.unlocked = false;
         let original_text_size = program.user_information.text_size;
@@ -6072,6 +6246,116 @@ mod tests {
     }
 
     #[test]
+    fn malformed_password_hash_keeps_settings_locked() {
+        for hash in [
+            serde_json::json!("$argon2id$invalid"),
+            serde_json::json!(123),
+        ] {
+            let settings = serde_json::json!({
+                "password_enabled": true,
+                "password_hash": hash,
+                "password": "old password"
+            });
+            let protection = PasswordProtection::from_settings(settings.as_object().unwrap());
+            assert!(protection.page_is_locked(GUIState::AdvancedSettings));
+            assert!(!password::verify_password(
+                "old password",
+                &protection.password_hash
+            ));
+        }
+    }
+
+    #[test]
+    fn password_migration_updates_the_primary_file_and_backup() {
+        let directory = std::env::temp_dir().join(format!(
+            "locoryn-password-migration-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = directory.join("settings.json");
+        let mut settings = serde_json::json!({
+            "password": "legacy secret", "password_enabled": true, "top_k": 17
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        write_json_safely(&path, &settings).unwrap();
+        write_json_safely(&path, &settings).unwrap();
+        password::migrate_settings(&mut settings).unwrap();
+        write_settings_safely(&path, &settings).unwrap();
+        for saved_path in [&path, &sidecar_path(&path, ".bak")] {
+            let contents = fs::read_to_string(saved_path).unwrap();
+            assert!(!contents.contains("legacy secret"));
+            let saved: serde_json::Value = serde_json::from_str(&contents).unwrap();
+            assert!(!saved.as_object().unwrap().contains_key("password"));
+            let reloaded = PasswordProtection::from_settings(saved.as_object().unwrap());
+            assert!(reloaded.page_is_locked(GUIState::AdvancedSettings));
+            assert!(password::verify_password(
+                "legacy secret",
+                &reloaded.password_hash
+            ));
+            assert!(!reloaded.needs_migration);
+            assert_eq!(saved["top_k"], 17);
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn password_toggle_hashes_input_and_replacement_rejects_the_old_password() {
+        let mut program = Program::default();
+        program.app_state.gui_state = GUIState::AdvancedSettings;
+        program.password_protection = PasswordProtection::default();
+        drop(program.update(Message::NewPasswordInputChanged("first password".into())));
+        drop(program.update(Message::TogglePasswordProtection));
+        assert!(
+            program
+                .password_protection
+                .page_is_locked(GUIState::AdvancedSettings)
+        );
+        assert!(program.password_protection.new_password_input.is_empty());
+        assert!(password::verify_password(
+            "first password",
+            &program.password_protection.password_hash
+        ));
+
+        drop(program.update(Message::PasswordUnlockInputChanged("first password".into())));
+        drop(program.update(Message::UnlockSettings));
+        drop(program.update(Message::NewPasswordInputChanged(
+            "replacement password".into(),
+        )));
+        drop(program.update(Message::SavePassword));
+        assert!(
+            program
+                .password_protection
+                .page_is_locked(GUIState::AdvancedSettings)
+        );
+        assert!(!password::verify_password(
+            "first password",
+            &program.password_protection.password_hash
+        ));
+        for path in [
+            user_settings_path(),
+            sidecar_path(&user_settings_path(), ".bak"),
+        ] {
+            let saved: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            let hash = saved["password_hash"].as_str().unwrap();
+            assert!(password::verify_password("replacement password", hash));
+            assert!(!password::verify_password("first password", hash));
+        }
+
+        drop(program.update(Message::PasswordUnlockInputChanged(
+            "replacement password".into(),
+        )));
+        drop(program.update(Message::UnlockSettings));
+        drop(program.update(Message::TogglePasswordProtection));
+        assert!(!program.password_protection.enabled);
+    }
+
+    #[test]
     fn password_configuration_is_saved_flat_and_locks_immediately() {
         let mut program = Program::default();
         program.app_state.gui_state = GUIState::AdvancedSettings;
@@ -6088,10 +6372,16 @@ mod tests {
 
         let values = program.password_protection.setting_values();
         assert_eq!(values[0], ("password_enabled", serde_json::json!(true)));
-        assert_eq!(
-            values[1],
-            ("password", serde_json::json!("shared-classroom-password"))
-        );
+        assert_eq!(values[1].0, "password_hash");
+        assert!(password::verify_password(
+            "shared-classroom-password",
+            values[1].1.as_str().unwrap()
+        ));
+        assert!(program.password_protection.new_password_input.is_empty());
+        let saved: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(user_settings_path()).unwrap()).unwrap();
+        assert!(!saved.as_object().unwrap().contains_key("password"));
+        assert_eq!(saved["password_hash"], values[1].1);
         assert_eq!(
             values[2],
             (

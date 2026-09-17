@@ -85,19 +85,60 @@ impl fmt::Display for InferenceBackend {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct HostLocation {
-    /// HTTP is suitable for a local server. Use HTTPS for a remote endpoint.
+    /// Preserve the text as entered, including incomplete edits. None means
+    /// this connection was saved by a version using the three legacy fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    // Retained so older Locoryn versions can still read saved connections.
+    #[serde(default)]
     pub protocol: String,
+    #[serde(default)]
     pub ip: String,
+    #[serde(default)]
     pub port: String,
+    #[serde(default)]
+    pub models_endpoint: String,
+    #[serde(default)]
+    pub chat_endpoint: String,
 }
 
 impl HostLocation {
     pub fn new(protocol: &str, ip: &str, port: &str) -> Self {
         Self {
+            address: None,
             protocol: protocol.to_string(),
             ip: ip.to_string(),
             port: port.to_string(),
+            models_endpoint: String::new(),
+            chat_endpoint: String::new(),
         }
+    }
+
+    pub fn address(&self) -> String {
+        self.address.clone().unwrap_or_else(|| {
+            let protocol = self
+                .protocol
+                .trim()
+                .trim_end_matches("://")
+                .to_ascii_lowercase();
+            let host = self.ip.trim();
+            let host = if host.contains(':') && !host.starts_with('[') {
+                format!("[{host}]")
+            } else {
+                host.to_string()
+            };
+            format!("{protocol}://{host}:{}", self.port.trim())
+        })
+    }
+
+    pub fn set_address(&mut self, address: String) {
+        // Keep the last usable legacy address while a new URL is being typed.
+        if let Ok(url) = parse_address(&address) {
+            self.protocol = url.scheme().to_string();
+            self.ip = url.host_str().unwrap_or_default().to_string();
+            self.port = url.port_or_known_default().unwrap_or_default().to_string();
+        }
+        self.address = Some(address);
     }
 }
 
@@ -178,6 +219,9 @@ impl GenerationDetails {
 
 pub fn base_url(backend: InferenceBackend, location: &HostLocation) -> Result<url::Url, String> {
     let server = backend.server_name();
+    if let Some(address) = &location.address {
+        return parse_address(address).map_err(|error| format!("{server}: {error}"));
+    }
     let scheme = location
         .protocol
         .trim()
@@ -212,13 +256,52 @@ pub fn base_url(backend: InferenceBackend, location: &HostLocation) -> Result<ur
     Ok(url)
 }
 
+fn parse_address(address: &str) -> Result<url::Url, String> {
+    let mut url = url::Url::parse(address.trim())
+        .map_err(|_| "Enter a full server URL, including http:// or https://.".to_string())?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err("The server URL must start with http:// or https://.".to_string());
+    }
+    if url.port() == Some(0) {
+        return Err("The server port must be a number from 1 to 65535.".to_string());
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("Enter a server base URL without a query string or fragment.".to_string());
+    }
+    // The Ollama client appends API paths directly to this base URL.
+    if !url.path().ends_with('/') {
+        url.set_path(&format!("{}/", url.path()));
+    }
+    Ok(url)
+}
+
 pub fn api_url(
     backend: InferenceBackend,
     location: &HostLocation,
     path: &str,
 ) -> Result<String, String> {
     let mut url = base_url(backend, location)?;
-    url.set_path(path);
+    let custom_path = if backend == InferenceBackend::OpenVino {
+        if path == backend.models_path() {
+            location.models_endpoint.trim()
+        } else if path == backend.chat_path() {
+            location.chat_endpoint.trim()
+        } else {
+            ""
+        }
+    } else {
+        ""
+    };
+    let path = if custom_path.is_empty() {
+        path
+    } else {
+        custom_path
+    };
+    url.set_path(&format!(
+        "{}/{}",
+        url.path().trim_end_matches('/'),
+        path.trim_start_matches('/')
+    ));
     Ok(url.into())
 }
 
@@ -299,6 +382,8 @@ pub fn chat_request_body(
     tools: Option<&serde_json::Value>,
     thinking: &serde_json::Value,
     temperature: f32,
+    top_p: f32,
+    top_k: u32,
     context_tokens: u32,
     max_response_tokens: u32,
 ) -> serde_json::Value {
@@ -310,6 +395,8 @@ pub fn chat_request_body(
             "think": thinking,
             "options": {
                 "temperature": temperature,
+                "top_p": top_p,
+                "top_k": top_k,
                 "num_ctx": context_tokens,
                 "num_predict": max_response_tokens,
             }
@@ -320,6 +407,8 @@ pub fn chat_request_body(
             "stream": true,
             "stream_options": {"include_usage": true},
             "temperature": temperature,
+                "top_p": top_p,
+                "top_k": top_k,
             "max_tokens": max_response_tokens,
         }),
     };
@@ -344,6 +433,8 @@ pub fn direct_request_body(
     images: &[EncodedImage],
     thinking: &serde_json::Value,
     temperature: f32,
+    top_p: f32,
+    top_k: u32,
     context_tokens: u32,
     max_response_tokens: u32,
 ) -> serde_json::Value {
@@ -357,6 +448,8 @@ pub fn direct_request_body(
                 "think": thinking,
                 "options": {
                     "temperature": temperature,
+                "top_p": top_p,
+                "top_k": top_k,
                     "num_ctx": context_tokens,
                     "num_predict": max_response_tokens,
                 }
@@ -383,6 +476,8 @@ pub fn direct_request_body(
                 None,
                 thinking,
                 temperature,
+                top_p,
+                top_k,
                 context_tokens,
                 max_response_tokens,
             )
@@ -579,6 +674,118 @@ mod tests {
     }
 
     #[test]
+    fn legacy_addresses_load_as_one_url_without_losing_endpoints() {
+        let connections: BackendConnections = serde_json::from_value(serde_json::json!({
+            "ollama": {"protocol": "https://", "ip": "::1", "port": "11434"},
+            "openvino": {
+                "protocol": "http", "ip": "server.example", "port": "8000",
+                "models_endpoint": "/v1/models", "chat_endpoint": "/v1/chat/completions"
+            }
+        }))
+        .unwrap();
+        assert_eq!(connections.ollama.address(), "https://[::1]:11434");
+        assert_eq!(connections.openvino.address(), "http://server.example:8000");
+        assert_eq!(
+            api_url(
+                InferenceBackend::OpenVino,
+                &connections.openvino,
+                "/v3/models"
+            )
+            .unwrap(),
+            "http://server.example:8000/v1/models"
+        );
+        assert_eq!(connections.openvino.chat_endpoint, "/v1/chat/completions");
+    }
+
+    #[test]
+    fn plaintext_addresses_preserve_base_paths_and_custom_endpoints() {
+        for backend in InferenceBackend::ALL {
+            for address in ["https://[::1]:8443/proxy", "https://[::1]:8443/proxy/"] {
+                let mut location: HostLocation = serde_json::from_value(serde_json::json!({
+                    "address": address,
+                    "models_endpoint": "/v1/models",
+                    "chat_endpoint": "/v1/chat/completions"
+                }))
+                .unwrap();
+                let expected_path = if backend == InferenceBackend::Ollama {
+                    "/api/chat"
+                } else {
+                    "/v1/chat/completions"
+                };
+                assert_eq!(
+                    base_url(backend, &location).unwrap().as_str(),
+                    "https://[::1]:8443/proxy/"
+                );
+                assert_eq!(
+                    api_url(backend, &location, backend.chat_path()).unwrap(),
+                    format!("https://[::1]:8443/proxy{expected_path}")
+                );
+                location.set_address("https://server.example".into());
+                assert_eq!(
+                    base_url(backend, &location).unwrap().as_str(),
+                    "https://server.example/"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn address_edits_round_trip_and_remain_readable_by_older_versions() {
+        #[derive(Deserialize)]
+        struct LegacyLocation {
+            protocol: String,
+            ip: String,
+            port: String,
+        }
+
+        for (address, host, port) in [
+            ("  https://server.example:8443  ", "server.example", "8443"),
+            ("https://server.example", "server.example", "443"),
+            ("http://[::1]:11434", "[::1]", "11434"),
+        ] {
+            let mut location = InferenceBackend::Ollama.default_location();
+            location.set_address(address.into());
+            let saved = serde_json::to_value(&location).unwrap();
+            let restored: HostLocation = serde_json::from_value(saved.clone()).unwrap();
+            assert_eq!(restored, location);
+            assert_eq!(restored.address(), address);
+            let legacy: LegacyLocation = serde_json::from_value(saved).unwrap();
+            assert_eq!(legacy.ip, host);
+            assert_eq!(legacy.port, port);
+            let old_location = HostLocation::new(&legacy.protocol, &legacy.ip, &legacy.port);
+            assert_eq!(
+                base_url(InferenceBackend::Ollama, &old_location).unwrap(),
+                base_url(InferenceBackend::Ollama, &location).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_or_cleared_address_does_not_fall_back_to_the_previous_server() {
+        for address in [
+            "",
+            "http://",
+            "server.example:8000",
+            "ftp://server.example",
+            "http://server.example:0",
+            "http://server.example:99999",
+            "http://server.example?key=value",
+            "http://server.example#fragment",
+        ] {
+            let mut location = InferenceBackend::OpenVino.default_location();
+            location.set_address(address.into());
+            let restored: HostLocation =
+                serde_json::from_value(serde_json::to_value(&location).unwrap()).unwrap();
+            assert_eq!(restored.address(), address);
+            assert!(
+                base_url(InferenceBackend::OpenVino, &restored).is_err(),
+                "{address}"
+            );
+            assert_eq!(restored.port, "8000");
+        }
+    }
+
+    #[test]
     fn openvino_models_are_read_from_openai_list_shape() {
         let names = model_names(
             InferenceBackend::OpenVino,
@@ -618,10 +825,14 @@ mod tests {
             Some(&tools),
             &serde_json::json!("high"),
             0.2,
+            0.85,
+            25,
             8_192,
             512,
         );
 
+        assert_eq!(body["top_p"], serde_json::json!(0.85_f32));
+        assert_eq!(body["top_k"], 25);
         assert_eq!(body["model"], "qwen3");
         assert_eq!(body["stream"], true);
         assert_eq!(body["max_tokens"], 512);
@@ -630,6 +841,47 @@ mod tests {
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
         assert_eq!(body["chat_template_kwargs"]["reasoning_effort"], "high");
         assert!(body.get("options").is_none());
+    }
+
+    #[test]
+    fn sampling_controls_reach_direct_and_tool_chat_requests() {
+        for backend in InferenceBackend::ALL {
+            let thinking = serde_json::json!(false);
+            let direct = direct_request_body(
+                backend,
+                "model",
+                "hello".into(),
+                String::new(),
+                &[],
+                &thinking,
+                0.7,
+                0.75,
+                17,
+                8192,
+                512,
+            );
+            let chat = chat_request_body(
+                backend,
+                "model",
+                &[],
+                Some(&serde_json::json!([])),
+                &thinking,
+                0.7,
+                0.75,
+                17,
+                8192,
+                512,
+            );
+            for body in [direct, chat] {
+                let sampling = if backend == InferenceBackend::Ollama {
+                    &body["options"]
+                } else {
+                    &body
+                };
+                assert_eq!(sampling["top_p"], 0.75);
+                assert_eq!(sampling["top_k"], 17);
+            }
+        }
     }
 
     #[test]

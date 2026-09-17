@@ -27,29 +27,11 @@
 
 <sub>Locoryn is a fork of [ollama-gui-interface](https://github.com/logancammish/ollama-gui-interface).</sub>
 
-<sub><b>What's different?</b></sub>
-
-<sub>
-Locoryn builds on ollama-gui-interface, which I originally developed in 2025 as
-a Windows-first, Linux-compatible and x86-exclusive application for running 
-Ollama models locally. However, as the project expanded I realised that limiting
-it to the "ollama-gui-interface" branding was holding it back; people don't 
-exclusively use Ollama to host applications, and the project was quickly becoming 
-very different to what I orignally intended.
-</sub>
-
-<sub>
-This application is different. It has different goals, and a different approach.
-Now supporting macOS, arm, and with a now Linux-first, Windows-compatible design
-approach, it not longer just sticks with Ollama. I hope you will have a positive
-experience with it!
-</sub>
-<br>
 <br>
 
 
 > [!NOTE]
-> This README describes the current `main` branch (`1.2.2`). Packaged releases
+> This README describes the current `main` branch (`1.2.3`). Packaged releases
 > may trail the source branch; check the release notes for the exact feature set
 > in a download.
 
@@ -91,7 +73,7 @@ and follow the [Linux and Windows OpenVINO setup](#openvino-setup-linux-and-wind
 ### 2. Install Locoryn
 
 - **Windows:** download and run
-  `locoryn-1.2.2-windows-11-x64-setup.exe` from the
+  `locoryn-1.2.3-windows-11-x64-setup.exe` from the
   [latest release](https://github.com/logancammish/locoryn/releases/latest).
   It installs for the current user and does not require administrator access.
 - **Linux:** run these commands in a terminal. The installer downloads the
@@ -124,7 +106,9 @@ lists models available from the selected server.
 Locoryn's OpenVINO integration is machine agnostic. The desktop app does not
 link to the OpenVINO runtime, inspect the local processor, or assume an
 instruction-set architecture. It uses OVMS's OpenAI-compatible HTTP endpoints:
-`/v3/models` for discovery and `/v3/chat/completions` for generation. OVMS may
+`/v3/models` for discovery and `/v3/chat/completions` for generation. You can replace
+these paths under **Advanced settings → Custom endpoints**; leave the fields blank
+to use the defaults. OVMS may
 run on the same machine or any reachable Linux or Windows host; that server
 chooses the Intel CPU, GPU, NPU, or heterogeneous device configuration.
 
@@ -182,7 +166,7 @@ curl http://127.0.0.1:8000/v3/models
 
 Then select **OpenVINO** under **Settings → Advanced settings → Inference
 backend**. Keep the default address for a server on the same machine, or enter
-the reachable hostname/IP and REST port of a remote OVMS host. Locoryn retains
+the full URL of a remote OVMS host. Locoryn retains
 separate addresses for Ollama and OpenVINO when you switch between them.
 
 The CPU example works without accelerator-specific container mappings. To use
@@ -236,10 +220,13 @@ Choose the coverage first, then select **Save and enable**. Locoryn immediately
 writes the complete password policy and shows the lock screen so the new
 password can be verified. Leaving the protected settings area locks it again.
 
-The configuration is deliberately reproducible: `password_enabled`, `password`,
-and `password_scope` are ordinary top-level values in the local `settings.json`.
-The password is stored as plaintext, so copying the same settings file to
-another installation reproduces the same policy. A missing `password_scope`
+The configuration uses `password_enabled`, `password_hash`, and `password_scope`
+as top-level values in the local `settings.json`. Passwords are stored as salted
+Argon2id hashes; the full hash string includes the salt and hashing parameters.
+Copying the settings file to another installation preserves the same password
+policy. Existing plaintext `password` values are migrated automatically on startup,
+and the managed settings backup is updated to contain only the hash as well.
+A missing `password_scope`
 defaults to `all_settings`; the other supported value is
 `advanced_settings_only`.
 
@@ -278,12 +265,15 @@ Keep the file as valid JSON. When using an installed build, edit the copy in the
 
 ### Remote inference servers
 
-Open **Settings → Advanced settings**, select the backend, and choose the
-protocol before entering its hostname/IP and port. The protocol field accepts
-`http`, `http://`, `https`, or `https://`. The defaults are
+Open **Settings → Advanced settings**, select the backend, and enter its complete
+URL in the single address field, including `http://` or `https://` and an optional
+port or base path (for example, `https://server.example:8443/inference`). The defaults are
 `http://127.0.0.1:11434` for Ollama and `http://127.0.0.1:8000` for OpenVINO.
 Each backend keeps its own saved address. Other URL schemes are rejected
-because both APIs use HTTP(S).
+because both APIs use HTTP(S). API endpoints are appended to the base path.
+Existing settings with separate `protocol`, `ip`, and `port` fields still load.
+Valid address edits also update those legacy fields so older Locoryn versions can
+read the hostname and port; base paths require this version or later.
 
 Use `https://` for any inference server reached over a network you do not fully
 control. Plain `http://` does not encrypt requests: prompts, model replies,
@@ -438,3 +428,23 @@ cargo build
 Locoryn is an independent open-source project built for people who want a
 configurable, local-first desktop experience with their preferred inference
 backend.
+
+<sub><b>What's different from the original fork?</b></sub>
+
+<sub>
+Locoryn builds on ollama-gui-interface, which I originally developed in 2025 as
+a Windows-first, Linux-compatible and x86-exclusive application for running 
+Ollama models locally. However, as the project expanded I realised that limiting
+it to the "ollama-gui-interface" branding was holding it back; people don't 
+exclusively use Ollama to host applications, and the project was quickly becoming 
+very different to what I orignally intended.
+</sub>
+
+<sub>
+This application is different. It has different goals, and a different approach.
+Now supporting macOS, arm, and with a now Linux-first, Windows-compatible design
+approach, it not longer just sticks with Ollama. I hope you will have a positive
+experience with it!
+</sub>
+<br>
+<br>
