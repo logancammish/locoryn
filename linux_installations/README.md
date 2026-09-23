@@ -6,7 +6,7 @@ per-user installation. It does not use `sudo`.
 From the repository root:
 
 ```sh
-./install-linux.sh
+./install-linux.sh --channel beta
 ```
 
 The interactive flow detects the machine architecture and lets you choose
@@ -20,9 +20,9 @@ For an unattended installation:
 ./install-linux.sh --arch arm64 --channel beta --yes
 ```
 
-You can also pin a release with `--tag v1.2.3`. The installer expects release
-assets to use the repository's standard names, for example
-`locoryn-1.2.3-linux-x86_64.tar.gz`.
+You can also pin a release with `--tag v1.3.0-beta` once it is published. The
+installer expects release assets to use the repository's standard names, for example
+`locoryn-1.3.0-beta-linux-x86_64.tar.gz`.
 
 Files are installed to these per-user locations:
 

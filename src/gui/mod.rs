@@ -270,7 +270,15 @@ impl Program {
                     .clone()
                     .unwrap_or_else(|| tr(language, "No model selected").to_string());
                 let current_chat_title = if self.temporary_chat {
-                    tr(language, "Temporary chat").to_string()
+                    self.current_active_prompt()
+                        .and_then(|job| job.conversation_title.as_ref())
+                        .or_else(|| {
+                            self.temporary_chats
+                                .get(&self.current_chat_id)
+                                .and_then(|chat| chat.title.as_ref())
+                        })
+                        .map(|title| format!("T · {}", ellipsize_chat_title(title, 48)))
+                        .unwrap_or_else(|| tr(language, "Temporary chat").to_string())
                 } else {
                     self.saved_chats
                         .iter()
@@ -774,13 +782,14 @@ impl Program {
                     temporary_jobs.sort_by_key(|(_, job)| job.started_at);
                     for (chat_id, job) in temporary_jobs {
                         let title = job
-                            .chat_history
-                            .lock()
-                            .ok()
-                            .and_then(|chat| {
-                                chat.messages.iter().find_map(|message| match message {
-                                    Correspondence::User { text, .. } => Some(text.clone()),
-                                    Correspondence::Bot { .. } => None,
+                            .conversation_title
+                            .clone()
+                            .or_else(|| {
+                                job.chat_history.lock().ok().and_then(|chat| {
+                                    chat.messages.iter().find_map(|message| match message {
+                                        Correspondence::User { text, .. } => Some(text.clone()),
+                                        Correspondence::Bot { .. } => None,
+                                    })
                                 })
                             })
                             .unwrap_or_else(|| tr(language, "Temporary chat").to_string());
@@ -813,13 +822,14 @@ impl Program {
                     temporary_sessions.sort_by_key(|(chat_id, _)| *chat_id);
                     for (chat_id, session) in temporary_sessions {
                         let title = session
-                            .chat_history
-                            .lock()
-                            .ok()
-                            .and_then(|chat| {
-                                chat.messages.iter().find_map(|message| match message {
-                                    Correspondence::User { text, .. } => Some(text.clone()),
-                                    Correspondence::Bot { .. } => None,
+                            .title
+                            .clone()
+                            .or_else(|| {
+                                session.chat_history.lock().ok().and_then(|chat| {
+                                    chat.messages.iter().find_map(|message| match message {
+                                        Correspondence::User { text, .. } => Some(text.clone()),
+                                        Correspondence::Bot { .. } => None,
+                                    })
                                 })
                             })
                             .unwrap_or_else(|| tr(language, "Temporary chat").to_string());
@@ -2754,6 +2764,23 @@ impl Program {
                                         tr(language, "Choose folder"),
                                         Message::ChooseChatFolder
                                     ),
+                                ]
+                            )
+                            .padding(16)
+                            .width(Length::Fill)
+                            .style(flat_card_style),
+
+                            Space::new().height(Length::Fixed(10.0)),
+
+                            container(
+                                widget::row![
+                                    setting_label(
+                                        tr(language, "Automatic conversation titles"),
+                                        tr(language, "Use the first selected model to create a brief title from your opening prompt after its reply. Off by default.")
+                                    ),
+                                    widget::checkbox(self.automatic_conversation_titles)
+                                        .label(tr(language, "Enabled"))
+                                        .on_toggle(|_| Message::ToggleAutomaticConversationTitles),
                                 ]
                             )
                             .padding(16)

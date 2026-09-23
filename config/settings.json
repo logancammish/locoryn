@@ -20,6 +20,7 @@
         }
     },
     "current_chat_history_enabled": true,
+    "automatic_conversation_titles": false,
     "info_popup": true,
     "password_enabled": false,
     "password_hash": "",

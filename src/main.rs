@@ -18,6 +18,7 @@ use iced_widget::markdown;
 use ollama_rs::Ollama;
 use rustrict::{Censor, Type};
 mod app;
+mod conversation_title;
 mod gui;
 mod inference;
 mod password;
@@ -29,6 +30,7 @@ use crate::app::{
     Language, Profile, ProfileRegistry, Prompt, SavedChat, SystemPrompt, ThinkingLevel,
     UserInformation,
 };
+use crate::conversation_title::TitleRequest;
 use crate::inference::{
     BackendConnections, EncodedImage, GenerationDetails, InferenceBackend, OpenAiStreamLine,
     api_url as backend_api_url, base_url as backend_base_url, decode_openai_stream_line,
@@ -318,6 +320,12 @@ enum Message {
     AsyncResult(()),
     ModelsLoaded(InferenceBackend, Result<Vec<String>, String>),
     PromptFinished(String),
+    ConversationTitleGenerated {
+        chat_id: String,
+        storage_dir: PathBuf,
+        temporary: bool,
+        title: Option<String>,
+    },
     ListPrompt,
     ThinkingLevelChange(ThinkingLevel),
     ToggleImages,
@@ -387,6 +395,7 @@ enum Message {
     LanguageChange(Language),
     ToggleInfoPopup,
     ToggleChatHistory,
+    ToggleAutomaticConversationTitles,
     ToggleFiltering,
     InterfaceThemeChange(InterfaceTheme),
     ToggleShowTokensPerSecond,
@@ -452,6 +461,7 @@ impl Message {
             | Self::ThinkingLevelChange(_)
             | Self::InterfaceThemeChange(_)
             | Self::ToggleChatHistory
+            | Self::ToggleAutomaticConversationTitles
             | Self::WipeChatHistory => Some(ProtectedSettingsArea::Standard),
             Self::ChangeBatchTokens(_)
             | Self::ToggleFastStreaming
@@ -471,6 +481,8 @@ impl Message {
 }
 
 struct ActivePrompt {
+    title_request: Option<TitleRequest>,
+    conversation_title: Option<String>,
     chat_history: Arc<Mutex<CurrentChat>>,
     response_text: String,
     thinking_text: String,
@@ -516,6 +528,7 @@ struct GenerationChunk {
 }
 
 struct TemporaryChatSession {
+    title: Option<String>,
     chat_history: Arc<Mutex<CurrentChat>>,
     web_search_enabled: bool,
     profile_id: String,
@@ -608,6 +621,7 @@ struct Program {
     prompt: Prompt,
     batch_tokens: i32,
     fast_streaming: bool,
+    automatic_conversation_titles: bool,
     /// Persisted setting that shows the generation speed under each reply.
     show_tokens_per_second: bool,
     chat_menu_open: bool,
@@ -2072,6 +2086,7 @@ impl Program {
             .unwrap_or_else(|| "New chat".into());
         let mut saved = SavedChat::from_current(id, title, chat, web_search_enabled, profile);
         if let Some(existing) = self.saved_chats.iter_mut().find(|item| item.id == saved.id) {
+            saved.title.clone_from(&existing.title);
             saved.pinned = existing.pinned;
             // A chat never changes profile when it is updated.
             if existing.profile.is_some() {
@@ -2618,9 +2633,9 @@ impl Program {
         }
     }
 
-    fn finish_prompt(&mut self, chat_id: &str) {
+    fn finish_prompt(&mut self, chat_id: &str) -> Task<Message> {
         let Some(job) = self.active_prompts.remove(chat_id) else {
-            return;
+            return Task::none();
         };
         Self::finalize_response_metadata(&job);
 
@@ -2629,6 +2644,7 @@ impl Program {
             self.temporary_chats.insert(
                 chat_id.to_string(),
                 TemporaryChatSession {
+                    title: job.conversation_title.clone(),
                     chat_history: Arc::clone(&job.chat_history),
                     web_search_enabled: job.web_search_enabled,
                     profile_id: job.profile_id.clone(),
@@ -2669,6 +2685,74 @@ impl Program {
             self.refresh_chat_markdown_cache();
             self.open_chat_dirty = false;
         }
+
+        if self.automatic_conversation_titles
+            && !job.cancel.load(Ordering::Relaxed)
+            && let Some(request) = job.title_request
+        {
+            let chat_id = chat_id.to_string();
+            let storage_dir = self.chat_storage_dir.clone();
+            return Task::perform(request.generate(), move |title| {
+                Message::ConversationTitleGenerated {
+                    chat_id: chat_id.clone(),
+                    storage_dir: storage_dir.clone(),
+                    temporary: job.temporary,
+                    title,
+                }
+            });
+        }
+        Task::none()
+    }
+
+    fn apply_token_limits_before_prompt(&mut self) -> bool {
+        if self.password_protection.protects_standard_settings()
+            && !self.password_protection.unlocked
+        {
+            // Locking settings must not let an unapplied draft change the
+            // protected configuration when an ordinary chat is sent.
+            self.max_response_tokens_input = self.user_information.max_response_tokens.to_string();
+            self.context_tokens_input = self.user_information.context_tokens.to_string();
+            return true;
+        }
+        let limits = [
+            (
+                "Maximum response",
+                self.max_response_tokens_input.trim().parse::<u32>().ok(),
+                MIN_RESPONSE_TOKENS,
+                MAX_RESPONSE_TOKENS,
+            ),
+            (
+                "Context window",
+                self.context_tokens_input.trim().parse::<u32>().ok(),
+                MIN_CONTEXT_TOKENS,
+                MAX_CONTEXT_TOKENS,
+            ),
+        ];
+        let mut parsed = [0; 2];
+        for (index, (name, input, minimum, maximum)) in limits.into_iter().enumerate() {
+            match input {
+                Some(tokens) if (minimum..=maximum).contains(&tokens) => parsed[index] = tokens,
+                _ => {
+                    self.set_debug_message(DebugMessage {
+                        message: format!("{name} must be between {minimum} and {maximum} tokens."),
+                        is_error: true,
+                    });
+                    return false;
+                }
+            }
+        }
+        let [max_response_tokens, context_tokens] = parsed;
+        if self.user_information.max_response_tokens != max_response_tokens {
+            self.user_information.max_response_tokens = max_response_tokens;
+            self.persist_setting_value("max_response_tokens", max_response_tokens.into());
+        }
+        if self.user_information.context_tokens != context_tokens {
+            self.user_information.context_tokens = context_tokens;
+            self.persist_setting_value("context_tokens", context_tokens.into());
+        }
+        self.max_response_tokens_input = max_response_tokens.to_string();
+        self.context_tokens_input = context_tokens.to_string();
+        true
     }
 
     fn prompt(&mut self, mut prompt: String) -> Task<Message> {
@@ -2879,6 +2963,23 @@ impl Program {
             });
             chat.messages.len()
         };
+        let title_request = (self.automatic_conversation_titles
+            && response_start_index == 1
+            && !prompt.trim().is_empty()
+            && !self.saved_chats.iter().any(|chat| chat.id == chat_id))
+            .then(|| {
+                TitleRequest::new(
+                    backend,
+                    backend_chat_url.clone(),
+                    &model_name,
+                    &prompt,
+                    &user_info.thinking_levels,
+                )
+            });
+        let conversation_title = self
+            .temporary_chats
+            .get(&chat_id)
+            .and_then(|chat| chat.title.clone());
         self.open_chat_dirty = true;
 
         self.refresh_chat_markdown_cache();
@@ -2890,6 +2991,8 @@ impl Program {
         self.active_prompts.insert(
             chat_id,
             ActivePrompt {
+                title_request,
+                conversation_title,
                 chat_history: Arc::clone(&user_info.chat_history),
                 response_text: String::new(),
                 thinking_text: String::new(),
@@ -3041,7 +3144,7 @@ impl Program {
                             let api_key = web_search_settings.resolved_api_key();
                             let message = error.detailed_user_message(api_key.as_deref());
                             eprintln!(
-                                "Web-search failure: {}",
+                                "Tool-enabled response failure: {}",
                                 error.diagnostic(api_key.as_deref())
                             );
                             let _ = web_search_state_sender.send(WebSearchState::Failed {
@@ -3057,7 +3160,7 @@ impl Program {
                             );
                             user_info.chat_history.lock().unwrap().push_message(
                                 Correspondence::Bot {
-                                    text: format!("Web search failed: {message}"),
+                                    text: format!("Response failed: {message}"),
                                     model: user_info.model.clone(),
                                     thinking_seconds: None,
                                     tokens_per_second: None,
@@ -3525,9 +3628,48 @@ impl Program {
             }
 
             Message::PromptFinished(chat_id) => {
-                self.finish_prompt(&chat_id);
+                let title_task = self.finish_prompt(&chat_id);
                 self.begin_page_transition();
-                self.queue_missing_markdown_images()
+                Task::batch([title_task, self.queue_missing_markdown_images()])
+            }
+
+            Message::ConversationTitleGenerated {
+                chat_id,
+                storage_dir,
+                temporary,
+                title,
+            } => {
+                if !self.automatic_conversation_titles {
+                    return Task::none();
+                }
+                if let Some(title) = title {
+                    let title = if self.app_state.filtering {
+                        censor_text(&title)
+                    } else {
+                        title
+                    };
+                    if temporary {
+                        if let Some(job) = self
+                            .active_prompts
+                            .get_mut(&chat_id)
+                            .filter(|job| job.temporary)
+                        {
+                            job.conversation_title = Some(title.clone());
+                        }
+                        if let Some(chat) = self.temporary_chats.get_mut(&chat_id) {
+                            chat.title = Some(title);
+                        }
+                    } else if storage_dir == self.chat_storage_dir
+                        && let Some(chat) = self
+                            .saved_chats
+                            .iter_mut()
+                            .find(|chat| chat.id == chat_id)
+                    {
+                        chat.title = title;
+                        self.persist_saved_chats();
+                    }
+                }
+                Task::none()
             }
 
             Message::None => Task::none(),
@@ -4293,6 +4435,15 @@ impl Program {
                 self.persist_boolean_setting(
                     "current_chat_history_enabled",
                     self.user_information.current_chat_history_enabled,
+                );
+                Task::none()
+            }
+
+            Message::ToggleAutomaticConversationTitles => {
+                self.automatic_conversation_titles = !self.automatic_conversation_titles;
+                self.persist_boolean_setting(
+                    "automatic_conversation_titles",
+                    self.automatic_conversation_titles,
                 );
                 Task::none()
             }
@@ -5138,6 +5289,11 @@ impl Program {
                         });
                         return Task::none();
                     }
+                    // The compact Config fields have no Apply button. Commit
+                    // valid edits before snapshotting settings for the request.
+                    if !self.apply_token_limits_before_prompt() {
+                        return Task::none();
+                    }
                     if prompt.is_empty() {
                         prompt = "Describe this image in detail.".to_string();
                     }
@@ -5332,6 +5488,7 @@ impl Default for Program {
         let interface_theme = interface_theme_from_settings(&settings_hmap);
         let info_popup = setting_bool("info_popup", false);
         let fast_streaming = setting_bool("fast_streaming", true);
+        let automatic_conversation_titles = setting_bool("automatic_conversation_titles", false);
         let show_tokens_per_second = setting_bool("show_tokens_per_second", false);
         let current_chat_history_enabled = setting_bool("current_chat_history_enabled", true);
         let code_checking_enabled = setting_bool("code_checking_enabled", false);
@@ -5468,6 +5625,7 @@ impl Default for Program {
         Self {
             batch_tokens: 3,
             fast_streaming,
+            automatic_conversation_titles,
             show_tokens_per_second,
             chat_menu_open: true,
             config_drawer_open: false,
@@ -5681,6 +5839,8 @@ mod tests {
         let (_progress_sender, web_progress_receiver) =
             tokio::sync::watch::channel(ToolLoopProgress::default());
         ActivePrompt {
+            title_request: None,
+            conversation_title: None,
             chat_history,
             response_text: "Background answer".to_string(),
             thinking_text: String::new(),
@@ -6116,6 +6276,66 @@ mod tests {
             program.settings_feedback,
             Some((SettingsFeedbackTarget::ApplyContextWindow, _))
         ));
+    }
+
+    #[test]
+    fn sending_applies_displayed_token_limits_without_a_separate_enter() {
+        let mut program = Program::default();
+        program.clear_open_chat();
+        program.user_information.model = Some("qwen3-4b-npu".into());
+        program.user_information.backend = InferenceBackend::OpenVino;
+        program.user_information.max_response_tokens = 1_048_576;
+        program.max_response_tokens_input = "1048576".into();
+        drop(program.update(Message::EditMaxResponseTokens("512".into())));
+        drop(program.update(Message::EditContextTokens("32768".into())));
+        drop(program.update(Message::Prompt("hello".into())));
+        assert!(program.current_chat_is_processing());
+        assert_eq!(program.user_information.max_response_tokens, 512);
+        assert_eq!(program.user_information.context_tokens, 32_768);
+        assert_eq!(program.pending_settings["max_response_tokens"], 512);
+        let body = crate::inference::direct_request_body(
+            program.user_information.backend,
+            "qwen3-4b-npu",
+            "hello".into(),
+            "Be helpful.".into(),
+            &[],
+            &serde_json::json!(false),
+            0.3, 0.9, 40,
+            program.user_information.context_tokens,
+            program.user_information.max_response_tokens,
+        );
+        assert_eq!(body["max_tokens"], 512);
+    }
+
+    #[test]
+    fn invalid_token_edits_do_not_send_using_the_previous_limit_or_clear_the_prompt() {
+        let mut program = Program::default();
+        program.clear_open_chat();
+        program.user_information.model = Some("test-model".into());
+        program.prompt.prompt = "hello".into();
+        for (response, context) in [("", "32768"), ("0", "32768"), ("512", "invalid")] {
+            drop(program.update(Message::EditMaxResponseTokens(response.into())));
+            drop(program.update(Message::EditContextTokens(context.into())));
+            drop(program.update(Message::Prompt("hello".into())));
+            assert!(!program.current_chat_is_processing());
+            assert!(program.user_information.chat_history.lock().unwrap().messages.is_empty());
+            assert_eq!(program.prompt.prompt, "hello");
+            assert!(program.debug_message.is_error);
+        }
+    }
+
+    #[test]
+    fn sending_does_not_apply_token_drafts_after_settings_are_locked() {
+        let mut program = Program::default();
+        let original = program.user_information.max_response_tokens;
+        drop(program.update(Message::EditMaxResponseTokens("512".into())));
+        program.password_protection.enabled = true;
+        program.password_protection.password_hash = password::hash_password("teacher").unwrap();
+        program.password_protection.scope = PasswordProtectionScope::AllSettings;
+        program.password_protection.unlocked = false;
+        assert!(program.apply_token_limits_before_prompt());
+        assert_eq!(program.user_information.max_response_tokens, original);
+        assert_eq!(program.max_response_tokens_input, original.to_string());
     }
 
     #[test]
@@ -7490,5 +7710,125 @@ mod tests {
 
         drop(program.update(Message::ToggleShowTokensPerSecond));
         assert!(!program.show_tokens_per_second);
+    }
+
+    #[test]
+    fn automatic_titles_default_off_and_are_a_persisted_basic_setting() {
+        let mut program = Program::default();
+        assert!(!program.automatic_conversation_titles);
+        program.password_protection.enabled = true;
+        program.password_protection.password_hash = password::hash_password("teacher").unwrap();
+        program.password_protection.unlocked = false;
+        program.password_protection.scope = PasswordProtectionScope::AllSettings;
+        drop(program.update(Message::ToggleAutomaticConversationTitles));
+        assert!(!program.automatic_conversation_titles);
+
+        program.password_protection.scope = PasswordProtectionScope::AdvancedSettingsOnly;
+        drop(program.update(Message::ToggleAutomaticConversationTitles));
+        assert!(program.automatic_conversation_titles);
+        assert_eq!(program.pending_settings["automatic_conversation_titles"], true);
+        drop(program.update(Message::ToggleAutomaticConversationTitles));
+        assert!(!program.automatic_conversation_titles);
+        assert_eq!(program.pending_settings["automatic_conversation_titles"], false);
+    }
+
+    #[test]
+    fn automatic_titles_are_requested_only_for_an_enabled_first_prompt() {
+        let mut program = Program::default();
+        program.saved_chats.clear();
+        program.clear_open_chat();
+        program.user_information.model = Some("first-model".into());
+        program.automatic_conversation_titles = false;
+        drop(program.prompt("Opening prompt".into()));
+        assert!(
+            program.current_active_prompt().unwrap().title_request.is_none()
+        );
+
+        program.active_prompts.clear();
+        program.clear_open_chat();
+        program.automatic_conversation_titles = true;
+        drop(program.prompt("Opening prompt".into()));
+        assert!(
+            program.current_active_prompt().unwrap().title_request.is_some()
+        );
+        program.active_prompts.clear();
+        program.user_information.model = Some("later-model".into());
+        drop(program.prompt("Follow-up prompt".into()));
+        assert!(
+            program.current_active_prompt().unwrap().title_request.is_none()
+        );
+    }
+
+    #[test]
+    fn generated_titles_stay_with_the_original_chat_and_survive_saving() {
+        let mut program = Program::default();
+        program.saved_chats.clear();
+        program.automatic_conversation_titles = true;
+        program.app_state.filtering = false;
+        program.chat_storage_dir = std::env::temp_dir().join(Program::new_chat_id());
+        let mut chat = empty_current_chat();
+        chat.push_message(Correspondence::User {
+            text: "Please help me learn Rust programming".into(),
+            images: Vec::new(),
+        });
+        program.save_chat_snapshot("original".into(), &chat, false, LEGACY_PROFILE_ID.into());
+        program.saved_chats[0].pinned = true;
+        let apply_title = |title| Message::ConversationTitleGenerated {
+            chat_id: "original".into(),
+            storage_dir: program.chat_storage_dir.clone(),
+            temporary: false,
+            title,
+        };
+        let generated = apply_title(Some("Learning Rust Programming".into()));
+        let failed = apply_title(None);
+        program.current_chat_id = "another-chat".into();
+        drop(program.update(generated.clone()));
+        assert_eq!(program.current_chat_id, "another-chat");
+        drop(program.update(failed));
+        program.save_chat_snapshot("original".into(), &chat, false, "another-profile".into());
+        let stored: Vec<SavedChat> =
+            read_json_with_backup(&program.chat_storage_dir.join("chats.json")).unwrap();
+        assert_eq!(stored[0].title, "Learning Rust Programming");
+        assert_eq!(stored[0].profile.as_deref(), Some(LEGACY_PROFILE_ID));
+        assert!(stored[0].pinned);
+        assert_eq!(stored[0].messages.len(), 1);
+
+        program.saved_chats[0].title = "Other folder title".into();
+        let original_folder = program.chat_storage_dir.clone();
+        program.chat_storage_dir = original_folder.join("other");
+        drop(program.update(generated.clone()));
+        assert_eq!(program.saved_chats[0].title, "Other folder title");
+        program.chat_storage_dir = original_folder;
+        drop(program.update(Message::DeleteChat("original".into())));
+        drop(program.update(generated));
+        assert!(program.saved_chats.is_empty());
+        fs::remove_dir_all(&program.chat_storage_dir).unwrap();
+    }
+
+    #[test]
+    fn temporary_titles_follow_running_chats_without_saving_them() {
+        let mut program = Program::default();
+        program.saved_chats.clear();
+        program.automatic_conversation_titles = true;
+        let history = Arc::new(Mutex::new(empty_current_chat()));
+        let mut job = test_active_prompt(history, Arc::new(AtomicBool::new(false)));
+        job.temporary = true;
+        program.active_prompts.insert("temporary".into(), job);
+        let generated = Message::ConversationTitleGenerated {
+            chat_id: "temporary".into(),
+            storage_dir: program.chat_storage_dir.clone(),
+            temporary: true,
+            title: Some("Learning Rust".into()),
+        };
+        drop(program.update(generated.clone()));
+        drop(program.update(Message::PromptFinished("temporary".into())));
+        assert_eq!(
+            program.temporary_chats["temporary"].title.as_deref(),
+            Some("Learning Rust")
+        );
+        assert!(program.saved_chats.is_empty());
+        drop(program.update(Message::DeleteTemporaryChat("temporary".into())));
+        drop(program.update(generated));
+        assert!(program.temporary_chats.is_empty());
     }
 }

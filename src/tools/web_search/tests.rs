@@ -935,6 +935,245 @@ fn openvino_inference_reads_openai_compatible_sse() {
     server.join().unwrap();
 }
 
+fn fallback_test_server(
+    responses: Vec<(&'static str, String)>,
+) -> (String, thread::JoinHandle<Vec<serde_json::Value>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let server = thread::spawn(move || {
+        let mut requests = Vec::new();
+        for (status, body) in responses {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "expected a fallback request");
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("mock server failed: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let payload = read_http_request_bytes(&mut stream);
+            let header_end = payload
+                .windows(4)
+                .position(|part| part == b"\r\n\r\n")
+                .unwrap();
+            requests.push(serde_json::from_slice(&payload[header_end + 4..]).unwrap());
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            ).unwrap();
+        }
+        requests
+    });
+    (format!("http://{address}/v3/chat/completions"), server)
+}
+
+fn fallback_test_request(chat_url: String) -> ToolLoopRequest {
+    ToolLoopRequest {
+        backend: InferenceBackend::OpenVino,
+        chat_url,
+        model: "qwen3-4b-npu".into(),
+        prompt: "Earlier conversation context\nUser: hello".into(),
+        user_prompt: "hello".into(),
+        system_prompt: "Be helpful and concise.".into(),
+        temperature: 0.3,
+        top_p: 0.9,
+        top_k: 40,
+        context_tokens: 32_768,
+        max_response_tokens: 1_048_576,
+        images: vec![EncodedImage {
+            mime_type: "image/png".into(),
+            data: "attached-image".into(),
+        }],
+        thinking: serde_json::json!("low"),
+        settings: WebSearchSettings::default(),
+        tool_settings: crate::tools::ToolSettings::default().for_chat_web_enabled(false),
+        code_checking_enabled: false,
+        provider: None,
+        state_sender: crossbeam_channel::unbounded().0,
+        progress_sender: progress_sender(),
+        cancel: Arc::new(AtomicBool::new(false)),
+        chat_storage_dir: None,
+        conversation_profile_id: crate::app::LEGACY_PROFILE_ID.into(),
+    }
+}
+
+fn fallback_test_answer() -> String {
+    concat!(
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Brief thought\",\"content\":\"Hello!\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3}}\n\n",
+        "data: [DONE]\n\n"
+    ).into()
+}
+
+#[test]
+#[ignore = "requires LOCORYN_TEST_OPENVINO_URL and LOCORYN_TEST_OPENVINO_MODEL"]
+fn live_openvino_hello_with_default_local_tools() {
+    let url = std::env::var("LOCORYN_TEST_OPENVINO_URL").expect("set the chat endpoint URL");
+    let mut request = fallback_test_request(url);
+    request.model =
+        std::env::var("LOCORYN_TEST_OPENVINO_MODEL").expect("set a deployed model name");
+    request.prompt = "hello".into();
+    request.images.clear();
+    request.max_response_tokens = 512;
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let result = runtime
+        .block_on(async {
+            tokio::time::timeout(Duration::from_secs(45), run_tool_loop(request)).await
+        })
+        .expect("live OpenVINO request timed out")
+        .expect("live OpenVINO request failed");
+    assert!(!result.answer.trim().is_empty());
+    assert!(result.sources.is_empty());
+    println!(
+        "OpenVINO returned a visible answer; prompt tokens: {:?}, output tokens: {:?}",
+        result.generation_details.prompt_tokens, result.eval_count
+    );
+}
+
+#[test]
+fn openvino_with_web_off_recovers_from_rejected_or_empty_tool_requests() {
+    let _loopback_guard = LOOPBACK_TEST_LOCK.lock().unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    for (status, rejection) in [
+        (
+            "400 Bad Request",
+            r#"{"error":{"message":"Tool parser is not configured"}}"#,
+        ),
+        (
+            "400 Bad Request",
+            r#"{"error":{"message":"Invalid tools parameter"}}"#,
+        ),
+        (
+            "400 Bad Request",
+            r#"{"error":{"message":"Input length exceeds the maximum allowed length"}}"#,
+        ),
+        (
+            "200 OK",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        ),
+    ] {
+        let (url, server) = fallback_test_server(vec![
+            (status, rejection.into()),
+            ("200 OK", fallback_test_answer()),
+        ]);
+        let mut request = fallback_test_request(url);
+        let provider = Arc::new(CountingProvider(AtomicUsize::new(0)));
+        request.provider = Some(provider.clone());
+        let (progress_sender, progress_receiver) =
+            tokio::sync::watch::channel(ToolLoopProgress::default());
+        request.progress_sender = progress_sender;
+        let (state_sender, state_receiver) = crossbeam_channel::unbounded();
+        request.state_sender = state_sender;
+        let result = runtime.block_on(run_tool_loop(request)).unwrap();
+        let requests = server.join().unwrap();
+
+        assert!(
+            requests[0]["tools"]
+                .as_array()
+                .is_some_and(|tools| tools.len() == 1)
+        );
+        assert_eq!(
+            requests[0]["tools"][0]["function"]["name"],
+            "search_locoryn_conversations"
+        );
+        let fallback = &requests[1];
+        assert!(fallback.get("tools").is_none());
+        assert!(fallback.get("tool_choice").is_none());
+        assert_eq!(fallback["model"], "qwen3-4b-npu");
+        assert_eq!(
+            fallback["messages"][0]["content"],
+            "Be helpful and concise."
+        );
+        assert_eq!(
+            fallback["messages"][1]["content"][0]["text"],
+            "Earlier conversation context\nUser: hello"
+        );
+        assert_eq!(
+            fallback["messages"][1]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,attached-image"
+        );
+        assert_eq!(fallback["chat_template_kwargs"]["reasoning_effort"], "low");
+        assert_eq!(fallback["max_tokens"], 1_048_576);
+        assert_eq!(result.answer, "Hello!");
+        assert_eq!(result.thinking, "Brief thought");
+        assert_eq!(result.generation_details.prompt_tokens, Some(12));
+        assert_eq!(result.eval_count, Some(3));
+        assert!(result.sources.is_empty());
+        assert_eq!(provider.0.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(progress_receiver.borrow().answer, "Hello!");
+        assert_eq!(
+            state_receiver.try_iter().last(),
+            Some(WebSearchState::Completed)
+        );
+    }
+}
+
+#[test]
+fn openvino_fallback_preserves_real_server_errors_and_does_not_loop() {
+    let _loopback_guard = LOOPBACK_TEST_LOCK.lock().unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let detail = "max_tokens exceeds the server's generation limit";
+    let error = serde_json::json!({"error": {"message": detail}}).to_string();
+    let (url, server) = fallback_test_server(vec![
+        ("400 Bad Request", error.clone()),
+        ("400 Bad Request", error),
+    ]);
+    let result = runtime.block_on(run_tool_loop(fallback_test_request(url)));
+    assert!(
+        matches!(result, Err(WebSearchError::InferenceUnavailable(message)) if message.contains(detail))
+    );
+    assert_eq!(server.join().unwrap().len(), 2);
+}
+
+#[test]
+fn openvino_authentication_errors_do_not_retry_without_tools() {
+    let _loopback_guard = LOOPBACK_TEST_LOCK.lock().unwrap();
+    let (url, server) = fallback_test_server(vec![(
+        "401 Unauthorized",
+        r#"{"error":{"message":"invalid credentials"}}"#.into(),
+    )]);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let result = runtime.block_on(run_tool_loop(fallback_test_request(url)));
+    assert!(
+        matches!(result, Err(WebSearchError::InferenceUnavailable(message)) if message.contains("invalid credentials"))
+    );
+    assert_eq!(server.join().unwrap().len(), 1);
+}
+
+#[test]
+fn openvino_tool_rejection_keeps_explicit_web_search_available() {
+    let _loopback_guard = LOOPBACK_TEST_LOCK.lock().unwrap();
+    let (url, server) = fallback_test_server(vec![
+        (
+            "400 Bad Request",
+            r#"{"error":{"message":"Tool parser is not configured"}}"#.into(),
+        ),
+        ("200 OK", fallback_test_answer()),
+    ]);
+    let mut request = fallback_test_request(url);
+    request.settings.enabled = true;
+    request.tool_settings = crate::tools::ToolSettings::default();
+    request.user_prompt = "Search the web for the latest release".into();
+    let provider = Arc::new(QueryRecordingProvider {
+        queries: Mutex::new(Vec::new()),
+        pages: Mutex::new(Vec::new()),
+    });
+    request.provider = Some(provider.clone());
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let result = runtime.block_on(run_tool_loop(request)).unwrap();
+    assert_eq!(result.sources.len(), 1);
+    assert_eq!(provider.queries.lock().unwrap().len(), 1);
+    assert_eq!(server.join().unwrap().len(), 2);
+}
+
 #[test]
 fn transient_ollama_rate_limits_are_retried() {
     let _loopback_guard = LOOPBACK_TEST_LOCK.lock().unwrap();

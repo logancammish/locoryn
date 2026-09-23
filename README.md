@@ -9,14 +9,14 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/logancammish/locoryn/actions/workflows/rust.yml"><img src="https://github.com/logancammish/locoryn/actions/workflows/rust.yml/badge.svg" alt="Build"></a>
-  <a href="https://github.com/logancammish/locoryn/releases/latest"><img src="https://img.shields.io/github/v/release/logancammish/locoryn?display_name=tag" alt="Latest release"></a>
+  <a href="https://github.com/logancammish/locoryn/actions/workflows/rust.yml?query=branch%3Abeta"><img src="https://github.com/logancammish/locoryn/actions/workflows/rust.yml/badge.svg?branch=beta" alt="Beta branch build"></a>
+  <a href="https://github.com/logancammish/locoryn/releases"><img src="https://img.shields.io/github/v/release/logancammish/locoryn?include_prereleases&display_name=tag" alt="Latest release including betas"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/logancammish/locoryn" alt="License"></a>
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/built_with-Rust-dca282?logo=rust" alt="Rust"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/logancammish/locoryn/releases/latest">Download</a>
+  <a href="https://github.com/logancammish/locoryn/releases">Download beta</a>
   ·
   <a href="https://ollama.com/search">Browse Ollama models</a>
   ·
@@ -31,7 +31,7 @@
 
 
 > [!NOTE]
-> This README describes the current `main` branch (`1.2.3`). Packaged releases
+> This README describes the `beta` branch (`1.3.0-beta`). Packaged releases
 > may trail the source branch; check the release notes for the exact feature set
 > in a download.
 
@@ -73,20 +73,20 @@ and follow the [Linux and Windows OpenVINO setup](#openvino-setup-linux-and-wind
 ### 2. Install Locoryn
 
 - **Windows:** download and run
-  `locoryn-1.2.3-windows-11-x64-setup.exe` from the
-  [latest release](https://github.com/logancammish/locoryn/releases/latest).
+  `locoryn-1.3.0-beta-windows-11-x64-setup.exe` from the
+  [beta release](https://github.com/logancammish/locoryn/releases), when published.
   It installs for the current user and does not require administrator access.
 - **Linux:** run these commands in a terminal. The installer downloads the
   right published package, installs it for the current user, and adds it to
   your desktop launcher. It does not use `sudo`.
 
   ```sh
-  git clone --depth 1 https://github.com/logancammish/locoryn.git
+  git clone --depth 1 --branch beta https://github.com/logancammish/locoryn.git
   cd locoryn
-  sh install-linux.sh
+  sh install-linux.sh --channel beta
   ```
 
-  To choose a beta build or architecture manually, see the
+  For release channel and architecture options, see the
   [Linux installer options](linux_installations/README.md).
 
 ### 3. Open Locoryn
@@ -204,6 +204,7 @@ Most controls live in **Settings**:
 | Application updates | Current version, latest stable release, and a trusted download link |
 | Chat storage | The folder containing saved conversations |
 | Model conversation context | Whether earlier messages are included in the next request |
+| Automatic conversation titles | Off by default; after the first reply, the initially selected model creates a short title from the opening prompt. If naming fails, the opening-prompt title is kept. |
 | Interface | Language, Dark/Light/Modern theme, text size, and chat font |
 
 **Advanced settings** contains backend selection, separate Ollama and OpenVINO
@@ -371,7 +372,7 @@ required only when building Locoryn from source.
 Install the [Rust toolchain](https://rustup.rs/), then:
 
 ```bash
-git clone https://github.com/logancammish/locoryn.git
+git clone --branch beta https://github.com/logancammish/locoryn.git
 cd locoryn
 cargo build --release
 ```
@@ -414,7 +415,7 @@ cargo build
 
 ## Project links
 
-- [Download the latest release](https://github.com/logancammish/locoryn/releases/latest)
+- [Download beta releases](https://github.com/logancammish/locoryn/releases)
 - [Browse Ollama models](https://ollama.com/search)
 - [Install Ollama](https://ollama.com/download)
 - [Deploy OpenVINO Model Server](https://docs.openvino.ai/2026/model-server/ovms_docs_deploying_server.html)

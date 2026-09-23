@@ -268,6 +268,10 @@ pub(super) fn tr(language: Language, english: &'static str) -> &'static str {
         "Theme" => "Tema",
         "Choose the interface colour scheme." => "Elige la combinación de colores de la interfaz.",
         "Chat storage" => "Almacenamiento de chats",
+        "Automatic conversation titles" => "Títulos automáticos de conversaciones",
+        "Use the first selected model to create a brief title from your opening prompt after its reply. Off by default." => {
+            "Usa el primer modelo seleccionado para crear un título breve a partir de tu mensaje inicial después de su respuesta. Desactivado de forma predeterminada."
+        }
         "Saved chats use this folder. The full path is shown so you can always locate them." => {
             "Los chats guardados usan esta carpeta. Se muestra la ruta completa para que puedas encontrarlos."
         }
