@@ -19,6 +19,7 @@ pub struct ToolLoopRequest {
     pub context_tokens: u32,
     pub max_response_tokens: u32,
     pub images: Vec<EncodedImage>,
+    pub attached_files: Vec<Arc<crate::file_usage::AttachedFile>>,
     pub thinking: serde_json::Value,
     pub settings: WebSearchSettings,
     pub tool_settings: crate::tools::ToolSettings,
@@ -1205,7 +1206,7 @@ pub(super) fn explicitly_requests_web_search(prompt: &str) -> bool {
     .any(|phrase| prompt.contains(phrase))
 }
 
-fn compact_web_synthesis_messages(
+pub(super) fn compact_web_synthesis_messages(
     request: &ToolLoopRequest,
     results: &[WebSearchResult],
     evidence_character_limit: usize,
@@ -1241,6 +1242,14 @@ fn compact_web_synthesis_messages(
     let prompt = format!(
         "User request:\n{user_request}\n\nWeb search results:\n{evidence}\n\
          Give the user a direct answer now. Do not request a tool."
+    );
+    let prompt = format!(
+        "{prompt}{}",
+        crate::file_usage::context::prompt_context(
+            &request.attached_files,
+            &request.user_prompt,
+            evidence_character_limit as u32,
+        )
     );
     vec![
         serde_json::json!({"role": "system", "content": system}),
@@ -1377,6 +1386,12 @@ async fn run_compact_web_compatibility(
 }
 
 pub async fn run_tool_loop(request: ToolLoopRequest) -> Result<ToolLoopResponse, WebSearchError> {
+    if !request.tool_settings.enabled && !request.attached_files.is_empty() {
+        let client = Client::builder()
+            .build()
+            .map_err(|error| WebSearchError::InferenceUnavailable(error.to_string()))?;
+        return answer_without_tools(&client, &request, &[], Vec::new()).await;
+    }
     match run_native_tool_loop(request.clone()).await {
         Err(error) if web_compatibility_available(&request, &error) => {
             run_compact_web_compatibility(&request).await
@@ -1419,8 +1434,39 @@ async fn answer_without_tools(
             websites: sources.clone(),
         },
     );
-    let streamed =
-        request_backend_chat_message(client, request, &messages, None, None, "", "").await?;
+    let streamed = match request_backend_chat_message(
+        client, request, &messages, None, None, "", "",
+    )
+    .await
+    {
+        Err(WebSearchError::ContextLengthExceeded(_)) if !request.attached_files.is_empty() => {
+            // Some local backends enforce a smaller context than the configured
+            // window. Retry once using relevant document excerpts and the current
+            // question, retaining system instructions and available tool evidence.
+            let mut prompt = format!(
+                "{}{}\n\nThe backend could only accept shortened document excerpts. Earlier conversation context is omitted here; do not claim to have read omitted content.",
+                request.user_prompt,
+                crate::file_usage::context::prompt_context(
+                    &request.attached_files,
+                    &request.user_prompt,
+                    2_048
+                )
+            );
+            if !evidence.is_empty() {
+                prompt.push_str(&format!(
+                    "\nUntrusted tool evidence: {}",
+                    compact_chars(&evidence, 1_000)
+                ));
+            }
+            let compact_messages = [
+                serde_json::json!({"role":"system","content":request.system_prompt}),
+                user_message(request.backend, prompt, &request.images),
+            ];
+            request_backend_chat_message(client, request, &compact_messages, None, None, "", "")
+                .await?
+        }
+        result => result?,
+    };
     let answer = streamed.message["content"]
         .as_str()
         .map(str::trim)
@@ -1484,6 +1530,8 @@ async fn run_native_tool_loop(
     ];
     let mut sources = Vec::<WebSource>::new();
     let mut budget = ToolBudget::new(&settings);
+    let file_tools_enabled = request.tool_settings.enabled && !request.attached_files.is_empty();
+    let mut file_calls = 0;
     let mut latest_query = String::new();
     let mut used_queries = Vec::<String>::new();
     let mut successful_searches = 0;
@@ -1525,12 +1573,18 @@ async fn run_native_tool_loop(
             accumulated_thinking.clone(),
             accumulated_answer.clone(),
         );
-        let tools = available_tool_definitions(
+        let mut tools = available_tool_definitions(
             &settings,
             &request.tool_settings,
             request.code_checking_enabled,
             &budget,
         );
+        if file_tools_enabled && file_calls < crate::file_usage::tools::MAX_CALLS {
+            tools
+                .as_array_mut()
+                .expect("tool definitions are an array")
+                .extend(crate::file_usage::tools::definitions());
+        }
         if tools
             .as_array()
             .map(|definitions| definitions.is_empty())
@@ -1695,6 +1749,21 @@ async fn run_native_tool_loop(
                 }
             };
             let result = match name {
+                "list_attached_files" | "read_attached_file" | "search_attached_files" => {
+                    if !file_tools_enabled {
+                        serde_json::json!({"error":"File tools are disabled or no files are attached to this conversation."})
+                    } else if file_calls >= crate::file_usage::tools::MAX_CALLS {
+                        serde_json::json!({"error":"File reading limit reached for this response."})
+                    } else {
+                        file_calls += 1;
+                        crate::file_usage::tools::execute(
+                            name,
+                            &arguments,
+                            &request.attached_files,
+                            request.context_tokens,
+                        )
+                    }
+                }
                 "web_search" => {
                     let search_arguments = (|| {
                         Ok::<_, WebSearchError>((
@@ -2031,7 +2100,9 @@ async fn run_native_tool_loop(
                 result.to_string(),
             ));
         }
-        if !budget.has_tool_capacity(&request.tool_settings, request.code_checking_enabled) {
+        if !(budget.has_tool_capacity(&request.tool_settings, request.code_checking_enabled)
+            || file_tools_enabled && file_calls < crate::file_usage::tools::MAX_CALLS)
+        {
             return finish_after_tool_limit(
                 &client,
                 &request,

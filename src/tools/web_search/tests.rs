@@ -710,6 +710,7 @@ fn conversation_search_can_retry_with_a_broader_query_and_then_answer() {
         context_tokens: 4_096,
         max_response_tokens: 512,
         images: Vec::new(),
+        attached_files: Vec::new(),
         thinking: serde_json::Value::Bool(false),
         settings: WebSearchSettings::default(),
         tool_settings: crate::tools::ToolSettings {
@@ -832,6 +833,7 @@ fn ollama_inference_does_not_use_the_external_web_timeout() {
         context_tokens: 4_096,
         max_response_tokens: 512,
         images: Vec::new(),
+        attached_files: Vec::new(),
         thinking: serde_json::Value::Bool(false),
         settings: WebSearchSettings {
             enabled: true,
@@ -903,6 +905,7 @@ fn openvino_inference_reads_openai_compatible_sse() {
         context_tokens: 4_096,
         max_response_tokens: 512,
         images: Vec::new(),
+        attached_files: Vec::new(),
         thinking: serde_json::Value::Bool(true),
         settings: WebSearchSettings {
             enabled: true,
@@ -992,6 +995,7 @@ fn fallback_test_request(chat_url: String) -> ToolLoopRequest {
             mime_type: "image/png".into(),
             data: "attached-image".into(),
         }],
+        attached_files: Vec::new(),
         thinking: serde_json::json!("low"),
         settings: WebSearchSettings::default(),
         tool_settings: crate::tools::ToolSettings::default().for_chat_web_enabled(false),
@@ -1011,6 +1015,149 @@ fn fallback_test_answer() -> String {
         "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3}}\n\n",
         "data: [DONE]\n\n"
     ).into()
+}
+
+#[test]
+fn document_tools_read_a_pdf_page_and_preserve_call_ids() {
+    let _loopback_guard = LOOPBACK_TEST_LOCK.lock().unwrap();
+    let call = serde_json::json!({"choices":[{"delta":{"tool_calls":[{
+        "index":0,"id":"read-page-2","type":"function","function":{
+            "name":"read_attached_file","arguments":r#"{"file_id":"guide.pdf","page":2}"#
+        }
+    }]},"finish_reason":"tool_calls"}]})
+    .to_string();
+    let (url, server) = fallback_test_server(vec![
+        ("200 OK", format!("data: {call}\n\ndata: [DONE]\n\n")),
+        ("200 OK", fallback_test_answer()),
+    ]);
+    let mut request = fallback_test_request(url);
+    request.images.clear();
+    request.tool_settings.conversation_search = false;
+    request.attached_files = vec![crate::file_usage::fixture(
+        "guide.pdf",
+        &["First page", "Second page secret: MAPLE"],
+    )];
+    request
+        .prompt
+        .push_str(&crate::file_usage::context::prompt_context(
+            &request.attached_files,
+            "Read page 2",
+            4096,
+        ));
+    let result = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(run_tool_loop(request))
+        .unwrap();
+    assert!(!result.answer.is_empty());
+    assert!(result.sources.is_empty());
+    let requests = server.join().unwrap();
+    assert_eq!(requests[0]["tools"].as_array().unwrap().len(), 3);
+    let message = requests[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .unwrap();
+    assert_eq!(message["tool_call_id"], "read-page-2");
+    let content: serde_json::Value =
+        serde_json::from_str(message["content"].as_str().unwrap()).unwrap();
+    assert_eq!(content["page"], 2);
+    assert_eq!(content["text"], "Second page secret: MAPLE");
+}
+
+#[test]
+fn unsupported_document_tools_fall_back_to_plain_text() {
+    let _loopback_guard = LOOPBACK_TEST_LOCK.lock().unwrap();
+    let (url, server) = fallback_test_server(vec![
+        (
+            "400 Bad Request",
+            r#"{"error":{"message":"Tool parser is not configured"}}"#.into(),
+        ),
+        ("200 OK", fallback_test_answer()),
+    ]);
+    let mut request = fallback_test_request(url);
+    request.images.clear();
+    request.attached_files = vec![crate::file_usage::fixture(
+        "main.rs",
+        &["fn unique_marker() {}"],
+    )];
+    request
+        .prompt
+        .push_str(&crate::file_usage::context::prompt_context(
+            &request.attached_files,
+            "Explain this code",
+            4096,
+        ));
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(run_tool_loop(request))
+        .unwrap();
+    let requests = server.join().unwrap();
+    assert!(requests[1].get("tools").is_none());
+    assert!(
+        requests[1]["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("fn unique_marker() {}")
+    );
+}
+
+#[test]
+fn compact_web_fallback_preserves_attached_file_text() {
+    let mut request = fallback_test_request("http://unused".into());
+    request.images.clear();
+    request.attached_files = vec![crate::file_usage::fixture(
+        "notes.md",
+        &["Local document marker"],
+    )];
+    let messages = super::tool_loop::compact_web_synthesis_messages(&request, &[], 700);
+    assert!(
+        messages[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Local document marker")
+    );
+}
+
+#[test]
+fn documents_work_with_tools_disabled_and_retry_a_smaller_context_once() {
+    let _loopback_guard = LOOPBACK_TEST_LOCK.lock().unwrap();
+    let overflow =
+        r#"{"error":{"message":"Input length exceeds the maximum allowed length"}}"#.to_string();
+    let (url, server) = fallback_test_server(vec![
+        ("400 Bad Request", overflow),
+        ("200 OK", fallback_test_answer()),
+    ]);
+    let mut request = fallback_test_request(url);
+    request.images.clear();
+    request.tool_settings.enabled = false;
+    request.attached_files = vec![crate::file_usage::fixture(
+        "notes.md",
+        &[&"marker in local file\n".repeat(4_000)],
+    )];
+    request
+        .prompt
+        .push_str(&crate::file_usage::context::prompt_context(
+            &request.attached_files,
+            "Explain marker",
+            32_768,
+        ));
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(run_tool_loop(request))
+        .unwrap();
+    let requests = server.join().unwrap();
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.get("tools").is_none())
+    );
+    let first = requests[0]["messages"][1]["content"].as_str().unwrap();
+    let compact = requests[1]["messages"][1]["content"].as_str().unwrap();
+    assert!(compact.len() < first.len());
+    assert!(compact.contains("marker in local file"));
+    assert!(compact.contains("shortened document excerpts"));
+    assert_eq!(requests[1]["messages"][0], requests[0]["messages"][0]);
 }
 
 #[test]
@@ -1279,6 +1426,7 @@ fn openvino_prompt_overflow_retries_with_compact_web_synthesis() {
         context_tokens: 131_072,
         max_response_tokens: 32_768,
         images: Vec::new(),
+        attached_files: Vec::new(),
         thinking: serde_json::Value::Bool(true),
         settings: WebSearchSettings {
             enabled: true,
@@ -1413,6 +1561,7 @@ fn tool_round_limit_forces_final_synthesis_without_losing_progress() {
         context_tokens: 4_096,
         max_response_tokens: 512,
         images: Vec::new(),
+        attached_files: Vec::new(),
         thinking: serde_json::Value::Bool(false),
         settings: WebSearchSettings {
             enabled: true,
@@ -1514,6 +1663,7 @@ fn empty_limit_synthesis_gets_a_clean_no_tools_recovery() {
         context_tokens: 4_096,
         max_response_tokens: 512,
         images: Vec::new(),
+        attached_files: Vec::new(),
         thinking: serde_json::Value::String("high".into()),
         settings: WebSearchSettings {
             enabled: true,
@@ -1696,6 +1846,7 @@ fn follow_up_research_rejects_one_broad_search_and_cross_references_sources() {
         context_tokens: 4_096,
         max_response_tokens: 512,
         images: Vec::new(),
+        attached_files: Vec::new(),
         thinking: serde_json::Value::Bool(false),
         settings: WebSearchSettings {
             enabled: true,

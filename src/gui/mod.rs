@@ -20,10 +20,13 @@ use crate::{
     tools::web_search::{WebSearchState, WebSource},
 };
 
+mod conversation_shortcuts;
+mod file_attachments;
 mod theme;
 mod translation;
 mod widgets;
 
+use conversation_shortcuts::conversation_shortcuts;
 use theme::*;
 use translation::*;
 use widgets::*;
@@ -1342,8 +1345,9 @@ impl Program {
                 // scrollbar always end above it instead of continuing underneath it.
                 let chat_sidebar = sidebar_sections;
 
-                let composer_active =
-                    !self.prompt.prompt.trim().is_empty() || !self.pending_images.is_empty();
+                let composer_active = !self.prompt.prompt.trim().is_empty()
+                    || !self.pending_images.is_empty()
+                    || !self.pending_files.is_empty();
                 let prompt_input: Element<Message> = prompt.into();
                 let composer_input: Element<Message> = if self.pending_images.is_empty() {
                     prompt_input
@@ -1354,6 +1358,17 @@ impl Program {
                         prompt_input,
                     ]
                     .align_y(iced::Alignment::Center)
+                    .height(Length::Fill)
+                    .into()
+                };
+                let composer_input: Element<Message> = if self.pending_files.is_empty() {
+                    composer_input
+                } else {
+                    widget::column![
+                        file_attachments::file_chips(&self.pending_files, true, language),
+                        composer_input
+                    ]
+                    .spacing(3)
                     .height(Length::Fill)
                     .into()
                 };
@@ -1516,6 +1531,29 @@ impl Program {
                     widget::column![].into()
                 };
 
+                let clone_button = || {
+                    compact_icon_button(
+                        "⧉",
+                        tr(
+                            language,
+                            if is_processing {
+                                "Wait for the response before cloning"
+                            } else if chat_is_empty {
+                                "Send a message before cloning"
+                            } else {
+                                "Clone conversation"
+                            },
+                        ),
+                        (!is_processing && !chat_is_empty).then_some(Message::CloneChat),
+                    )
+                };
+                let transcript_button = || {
+                    compact_icon_button(
+                        "⎘",
+                        tr(language, "Copy chat transcript"),
+                        (!chat_is_empty).then_some(Message::CopyChatTranscript),
+                    )
+                };
                 let header_controls: Element<Message> = if self.window_size.width < 980.0 {
                     widget::column![
                         container(
@@ -1530,6 +1568,10 @@ impl Program {
                             container(model_selector()).width(Length::Fill),
                             Space::new().width(Length::Fixed(8.0)),
                             thinking_selector(),
+                            Space::new().width(Length::Fixed(6.0)),
+                            transcript_button(),
+                            Space::new().width(Length::Fixed(6.0)),
+                            clone_button(),
                             Space::new().width(Length::Fixed(6.0)),
                             compact_icon_button(
                                 "▣",
@@ -1561,6 +1603,10 @@ impl Program {
                         )
                         .clip(true)
                         .width(Length::FillPortion(3)),
+                        Space::new().width(Length::Fixed(6.0)),
+                        transcript_button(),
+                        Space::new().width(Length::Fixed(6.0)),
+                        clone_button(),
                         Space::new().width(Length::Fixed(12.0)),
                         container(model_selector()).width(Length::FillPortion(4)),
                         Space::new().width(Length::Fixed(8.0)),
@@ -1607,14 +1653,28 @@ impl Program {
                     .padding([14, 12])
                     .width(Length::Fill)
                     .height(Length::Fill)
-                    .style(conversation_style),
+                    .style(|theme| {
+                        let mut style = conversation_style(theme);
+                        if self.conversation_selected {
+                            style.border.color = control_accent();
+                            style.border.width = 2.0;
+                        }
+                        style
+                    }),
                     composer_resize_handle(),
                     container(
                         widget::column![
                             composer_input,
                             Space::new().height(Length::Fixed(9.0)),
                             widget::row![
-                                mini_button(tr(language, "＋ Attach"), Message::PickImage),
+                                if self.loading_files.is_some() {
+                                    mini_button(
+                                        tr(language, "Reading files… Cancel"),
+                                        Message::CancelFileLoad,
+                                    )
+                                } else {
+                                    mini_button(tr(language, "＋ Attach"), Message::PickFiles)
+                                },
                                 Space::new().width(Length::Fixed(5.0)),
                                 mini_button(tr(language, "Paste"), Message::PasteImage),
                                 Space::new().width(Length::Fixed(5.0)),
@@ -1624,7 +1684,7 @@ impl Program {
                                     danger_button(tr(language, "■ Stop"), Message::StopResponse)
                                 } else {
                                     send_button(
-                                        (!self.prompt.prompt.trim().is_empty())
+                                        (composer_active && self.loading_files.is_none())
                                             .then(|| Message::Prompt(self.prompt.prompt.clone())),
                                     )
                                 },
@@ -1720,6 +1780,22 @@ impl Program {
                             }),
                     ]
                     .into()
+                };
+                let workspace: Element<Message> =
+                    conversation_shortcuts(workspace, self.conversation_selected);
+                let workspace = if let Some(preview) = &self.file_preview {
+                    widget::stack![
+                        workspace,
+                        file_attachments::file_preview(
+                            preview,
+                            self.window_size.width,
+                            self.window_size.height,
+                            language
+                        )
+                    ]
+                    .into()
+                } else {
+                    workspace
                 };
                 container(workspace)
                     .padding(6)

@@ -204,7 +204,7 @@ Most controls live in **Settings**:
 | Application updates | Current version, latest stable release, and a trusted download link |
 | Chat storage | The folder containing saved conversations |
 | Model conversation context | Whether earlier messages are included in the next request |
-| Automatic conversation titles | Off by default; after the first reply, the initially selected model creates a short title from the opening prompt. If naming fails, the opening-prompt title is kept. |
+| Automatic conversation titles | Off by default; after the first reply, the initially selected model creates a short descriptive title from the opening prompt. An echoed prompt or empty title is retried once. If naming fails, a notice explains why and the current title is kept. |
 | Interface | Language, Dark/Light/Modern theme, text size, and chat font |
 
 **Advanced settings** contains backend selection, separate Ollama and OpenVINO
@@ -335,7 +335,58 @@ and are not printed in logs.
 > request. The update manager sends a version-check request to GitHub at startup
 > and when you select **Check now**.
 
+## File attachments
+
+Use **＋ Attach** or drag files into the window to attach Markdown, source code,
+plain text, configuration/data files, PDFs, and supported images. Document files
+are converted to plain text locally, so they also work with models that have no
+native document support. Text files accept UTF-8 and UTF-16 with a byte-order mark.
+Binary formats such as Word documents and archives must first be exported as text
+or PDF. Images still require a vision-capable model.
+
+Click a document chip to preview its extracted text. PDF previews retain page
+numbers and have previous/next page controls; long pages also have excerpt
+controls. With **Settings → Tools → Enable Tools** enabled, models can list,
+search, and read attached documents by file ID, page, and character offset.
+These tools only see documents attached to the conversation. Without tool
+support, the model receives bounded text excerpts selected for the current
+question; ask about a specific filename, topic, or page for larger documents.
+
+Searchable PDFs use the built-in Rust reader. Pages with no extractable text also
+try local OCR when **Poppler** (`pdftoppm`) and **Tesseract** are installed on
+`PATH`. Tesseract uses its default English language data. For example, on
+Debian/Ubuntu, install `poppler-utils tesseract-ocr`; on Windows, install both
+tools and add their executable folders to `PATH`. OCR pages are labelled in the
+preview. Unreadable pages show an explanation, and PDFs with no readable pages
+are rejected. OCR reads text; it does not interpret diagrams or preserve layout.
+
+Up to eight attachments can be sent per message. Documents are limited to 16 MiB,
+2 MiB of extracted text, and 200 PDF pages. OCR has a 30-second page limit and a
+two-minute document limit; split larger scans into sections. File reading runs
+in the background and can be cancelled from the composer.
+
+Extracted documents are saved with normal chats and retained when cloning or
+reopening them, even if the originals move. Temporary-chat documents stay in
+memory. Previous attachments are available to follow-up questions while chat
+history is enabled. Text is sent to the selected inference backend with the
+conversation; local extraction and OCR do not use a cloud conversion service.
+
 ## Local data and privacy
+
+Use **Clone conversation** (⧉) beside the current chat title to open an independent
+copy named `Conversation name (1)`, `(2)`, and so on. Cloning a copy continues the
+same numbering sequence, skipping names already used in that profile. Messages,
+conversation context, and the chat's web-search choice are copied. The action is
+available after the conversation has a message and any response has finished.
+Temporary conversations produce temporary copies.
+
+Select **Copy chat transcript** (⎘) in the chat header to copy the entire open
+conversation. You can also click outside the message input, press **Ctrl+A** to
+select the conversation, then **Ctrl+C** to copy it (**Cmd+A**, **Cmd+C** on macOS).
+The selected conversation is outlined; **Esc** or a click clears the selection.
+The plain-text transcript includes speaker/model labels, original Markdown and
+reasoning, source links, attachment names, and any reply currently streaming.
+Shortcuts inside text inputs continue to select and copy their text.
 
 Chats, settings, and diagnostics are stored on your machine.
 Temporary chats are not added to `chats.json`.

@@ -44,6 +44,23 @@ pub(super) fn tr(language: Language, english: &'static str) -> &'static str {
         "No model selected" => "Ningún modelo seleccionado",
         "Ask something..." => "Escribe algo...",
         "New conversation" => "Nueva conversación",
+        "Clone conversation" => "Clonar conversación",
+        "Copy chat transcript" => "Copiar transcripción del chat",
+        "Remove file" => "Quitar archivo",
+        "Reading files… Cancel" => "Leyendo archivos… Cancelar",
+        "Extracted text" => "Texto extraído",
+        "OCR text — recognition may contain errors." => {
+            "Texto OCR: el reconocimiento puede contener errores."
+        }
+        "Page" => "Página",
+        "Previous page" => "Página anterior",
+        "Next page" => "Página siguiente",
+        "Previous excerpt" => "Fragmento anterior",
+        "Next excerpt" => "Fragmento siguiente",
+        "Wait for the response before cloning" => {
+            "Espera a que termine la respuesta antes de clonar"
+        }
+        "Send a message before cloning" => "Envía un mensaje antes de clonar",
         "What can I help you make?" => "¿Qué te gustaría crear?",
         "Choose a starting point below, or write your own message." => {
             "Elige un punto de partida o escribe tu propio mensaje."
@@ -240,8 +257,12 @@ pub(super) fn tr(language: Language, english: &'static str) -> &'static str {
         }
         "Top P" => "Top P",
         "Top K" => "Top K",
-        "Limit tokens by cumulative probability. 1 includes all probabilities." => "Limita los tokens por probabilidad acumulada. 1 incluye todas las probabilidades.",
-        "Limit sampling to this many most likely tokens." => "Limita el muestreo a esta cantidad de tokens más probables.",
+        "Limit tokens by cumulative probability. 1 includes all probabilities." => {
+            "Limita los tokens por probabilidad acumulada. 1 incluye todas las probabilidades."
+        }
+        "Limit sampling to this many most likely tokens." => {
+            "Limita el muestreo a esta cantidad de tokens más probables."
+        }
         "Temperature" => "Temperatura",
         "Higher values make output more random." => {
             "Los valores altos producen respuestas más aleatorias."
@@ -291,7 +312,9 @@ pub(super) fn tr(language: Language, english: &'static str) -> &'static str {
         }
         "Clear current context" => "Borrar contexto actual",
         "Custom endpoints" => "Endpoints personalizados",
-        "Override endpoint paths. Leave blank to use the defaults." => "Reemplaza las rutas de los endpoints. Deja los campos vacíos para usar los valores predeterminados.",
+        "Override endpoint paths. Leave blank to use the defaults." => {
+            "Reemplaza las rutas de los endpoints. Deja los campos vacíos para usar los valores predeterminados."
+        }
         "Models endpoint" => "Endpoint de modelos",
         "Chat endpoint" => "Endpoint de chat",
         "Advanced settings" => "Configuración avanzada",
