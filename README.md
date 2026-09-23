@@ -335,6 +335,38 @@ and are not printed in logs.
 > request. The update manager sends a version-check request to GitHub at startup
 > and when you select **Check now**.
 
+## Local image editing for selected models
+
+Select a model, then enable **Settings → Tools → Image Editing for selected
+model** and **Enable Tools**. Permission is saved separately for each backend
+and model; all models start with image editing disabled. Choose a model that
+supports both vision and native tool calls, and attach a photo to your message.
+
+The model can use `list_images` and `edit_image` to crop, enlarge or stretch,
+rotate/deskew, adjust contrast/brightness/gamma, sharpen, convert to grayscale,
+invert, threshold, or correct perspective. Perspective correction maps four
+source corners to a rectangle using FFmpeg's
+[perspective filter](https://ffmpeg.org/ffmpeg-filters.html#perspective).
+Each result is sent back as an image for the model to inspect and optionally
+edit again. Image editing works with the chat's **Web** switch off.
+
+Install **FFmpeg** and make `ffmpeg` available on `PATH` (for example,
+`sudo apt install ffmpeg` on Debian/Ubuntu); restart Locoryn after changing
+`PATH`. Missing FFmpeg or an invalid edit returns feedback to the model.
+Edits run locally, but the configured inference server receives the resulting
+images just as it receives original attachments. Originals remain unchanged;
+edited copies exist only for the current response and temporary files are
+removed after processing. These tools use photos attached to the current turn,
+not PDF pages or photos from previous messages.
+
+Calls accept image IDs and bounded numeric parameters, without arbitrary
+paths, shell commands, or filter scripts. Each response allows eight image
+tool calls. Input images are limited to 12 MiB and 32 megapixels; output is
+limited to 12 MiB, 4096 pixels per side, and 16 megapixels, with a 32 MiB total
+encoded-result budget. FFmpeg has a 15-second limit per edit and stops when the
+response is cancelled. Enhancement can introduce artifacts and cannot recover
+missing detail.
+
 ## File attachments
 
 Use **＋ Attach** or drag files into the window to attach Markdown, source code,

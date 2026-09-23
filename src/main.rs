@@ -294,6 +294,7 @@ enum Message {
     ToggleFetchWebpageTool,
     ToggleConversationSearchTool,
     ToggleCodeCheckingTool,
+    ToggleImageEditingModel,
     ToggleDeepResearchControls,
     ToggleChatWebSearch,
     WebSearchProviderChange(WebSearchProviderKind),
@@ -447,6 +448,7 @@ impl Message {
             | Self::ToggleFetchWebpageTool
             | Self::ToggleConversationSearchTool
             | Self::ToggleCodeCheckingTool
+            | Self::ToggleImageEditingModel
             | Self::WebSearchProviderChange(_)
             | Self::WebSearchApiKeyChange(_)
             | Self::WebSearchResultLimitChange(_)
@@ -3157,6 +3159,15 @@ impl Program {
         if !code_checking_enabled {
             tool_settings.code_checking = false;
         }
+        // Scope image editing to an explicitly selected bot and an image-bearing turn.
+        // Unknown vision capability is allowed for OpenVINO servers that do not advertise it.
+        if !had_image
+            || user_info.vision_supported == Some(false)
+            || !tool_settings
+                .image_editing_allowed(backend, user_info.model.as_deref().unwrap_or_default())
+        {
+            tool_settings.image_editing_models.clear();
+        }
         let (web_search_state_sender, web_search_state_receiver) = crossbeam_channel::unbounded();
         let (web_progress_sender, web_progress_receiver) =
             tokio::sync::watch::channel(ToolLoopProgress::default());
@@ -4260,6 +4271,24 @@ impl Program {
             Message::ToggleConversationSearchTool => {
                 self.tool_settings.conversation_search = !self.tool_settings.conversation_search;
                 self.persist_tool_settings();
+                Task::none()
+            }
+
+            Message::ToggleImageEditingModel => {
+                if let Some(model) = &self.user_information.model {
+                    let key = crate::tools::ToolSettings::image_model_key(
+                        self.user_information.backend,
+                        model,
+                    );
+                    if self.tool_settings.image_editing_models.contains(&key) {
+                        self.tool_settings
+                            .image_editing_models
+                            .retain(|entry| entry != &key);
+                    } else {
+                        self.tool_settings.image_editing_models.push(key);
+                    }
+                    self.persist_tool_settings();
+                }
                 Task::none()
             }
 

@@ -2172,3 +2172,205 @@ fn registrable_domain_handles_single_label() {
     assert_eq!(registrable_domain("localhost"), "localhost");
     assert_eq!(registrable_domain("myhost"), "myhost");
 }
+
+fn image_tool_response(backend: InferenceBackend, calls: Vec<serde_json::Value>) -> String {
+    if backend == InferenceBackend::Ollama {
+        serde_json::json!({"message":{"role":"assistant","content":"","tool_calls":calls},"done":true}).to_string()
+    } else {
+        let calls: Vec<_> = calls
+            .into_iter()
+            .enumerate()
+            .map(|(index, mut call)| {
+                call["index"] = serde_json::json!(index);
+                call["function"]["arguments"] =
+                    serde_json::Value::String(call["function"]["arguments"].to_string());
+                call
+            })
+            .collect();
+        let delta = serde_json::json!({"choices":[{"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}]});
+        format!("data: {delta}\n\ndata: [DONE]\n\n")
+    }
+}
+
+fn image_tool_call(id: &str, name: &str, arguments: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"id":id,"type":"function","function":{"name":name,"arguments":arguments}})
+}
+
+#[test]
+fn image_tool_loop_returns_pixels_after_all_tool_results_for_both_backends() {
+    use crate::tools::image_editing::tests::{ffmpeg_available, fixture};
+    if !ffmpeg_available() {
+        eprintln!("Skipping image tool integration: FFmpeg is not installed.");
+        return;
+    }
+    let _guard = LOOPBACK_TEST_LOCK.lock().unwrap();
+    for backend in InferenceBackend::ALL {
+        let calls = vec![
+            image_tool_call(
+                "crop",
+                "edit_image",
+                serde_json::json!({"image_id":"image-1","operation":"crop","x":2,"y":1,"width":3,"height":4}),
+            ),
+            image_tool_call("list", "list_images", serde_json::json!({})),
+        ];
+        let second_calls = vec![image_tool_call(
+            "resize",
+            "edit_image",
+            serde_json::json!({"image_id":"image-2","operation":"resize","width":6,"height":8}),
+        )];
+        let answer = if backend == InferenceBackend::Ollama {
+            serde_json::json!({"message":{"role":"assistant","content":"Read the enlarged photo."},"done":true}).to_string()
+        } else {
+            fallback_test_answer()
+        };
+        let (url, server) = fallback_test_server(vec![
+            ("200 OK", image_tool_response(backend, calls)),
+            ("200 OK", image_tool_response(backend, second_calls)),
+            ("200 OK", answer),
+        ]);
+        let mut request = fallback_test_request(url);
+        request.backend = backend;
+        request.images = vec![fixture()];
+        request.tool_settings.conversation_search = false;
+        request.tool_settings.image_editing_models =
+            vec![crate::tools::ToolSettings::image_model_key(
+                backend,
+                &request.model,
+            )];
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(run_tool_loop(request))
+            .unwrap();
+        assert!(!result.answer.is_empty());
+        let requests = server.join().unwrap();
+        let names: Vec<_> = requests[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["list_images", "edit_image"]);
+        let messages = requests[1]["messages"].as_array().unwrap();
+        let roles: Vec<_> = messages
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            roles,
+            vec!["system", "user", "assistant", "tool", "tool", "user"]
+        );
+        let crop: serde_json::Value =
+            serde_json::from_str(messages[3]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(crop["image_id"], "image-2");
+        assert_eq!(crop["width"], 3);
+        if backend == InferenceBackend::OpenVino {
+            assert_eq!(messages[3]["tool_call_id"], "crop");
+        }
+        let image = &messages[5];
+        match backend {
+            InferenceBackend::Ollama => assert!(!image["images"][0].as_str().unwrap().is_empty()),
+            InferenceBackend::OpenVino => assert!(
+                image["content"][1]["image_url"]["url"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("data:image/png;base64,")
+            ),
+        }
+        let last = requests[2]["messages"].as_array().unwrap();
+        let resized: serde_json::Value =
+            serde_json::from_str(last[last.len() - 2]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(resized["image_id"], "image-3");
+        assert_eq!(resized["source_image_id"], "image-2");
+        assert_eq!(resized["width"], 6);
+    }
+}
+
+#[test]
+fn image_tool_loop_rejects_unapproved_models_and_missing_images() {
+    let _guard = LOOPBACK_TEST_LOCK.lock().unwrap();
+    for with_images in [true, false] {
+        let call = image_tool_response(
+            InferenceBackend::OpenVino,
+            vec![image_tool_call(
+                "unauthorized",
+                "edit_image",
+                serde_json::json!({"image_id":"image-1","operation":"invert"}),
+            )],
+        );
+        let (url, server) =
+            fallback_test_server(vec![("200 OK", call), ("200 OK", fallback_test_answer())]);
+        let mut request = fallback_test_request(url);
+        if with_images {
+            request.tool_settings.image_editing_models = vec!["OpenVINO/different-bot".into()];
+        } else {
+            request.images.clear();
+            request.tool_settings.image_editing_models =
+                vec![crate::tools::ToolSettings::image_model_key(
+                    request.backend,
+                    &request.model,
+                )];
+        }
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(run_tool_loop(request))
+            .unwrap();
+        let requests = server.join().unwrap();
+        assert!(!requests[0]["tools"].to_string().contains("edit_image"));
+        let messages = requests[1]["messages"].as_array().unwrap();
+        let error = messages.iter().find(|m| m["role"] == "tool").unwrap();
+        assert!(error["content"].as_str().unwrap().contains("disabled"));
+        assert_eq!(messages.iter().filter(|m| m["role"] == "user").count(), 1);
+    }
+}
+
+#[test]
+fn image_tool_fallback_keeps_latest_edited_pixels() {
+    use crate::tools::image_editing::tests::{ffmpeg_available, fixture};
+    if !ffmpeg_available() {
+        return;
+    }
+    let _guard = LOOPBACK_TEST_LOCK.lock().unwrap();
+    let call = image_tool_response(
+        InferenceBackend::OpenVino,
+        vec![image_tool_call(
+            "edit",
+            "edit_image",
+            serde_json::json!({"image_id":"image-1","operation":"invert"}),
+        )],
+    );
+    let (url, server) = fallback_test_server(vec![
+        ("200 OK", call),
+        (
+            "400 Bad Request",
+            r#"{"error":{"message":"Tool parser is not configured"}}"#.into(),
+        ),
+        ("200 OK", fallback_test_answer()),
+    ]);
+    let mut request = fallback_test_request(url);
+    request.images = vec![fixture()];
+    request.tool_settings.conversation_search = false;
+    request.tool_settings.image_editing_models = vec![crate::tools::ToolSettings::image_model_key(
+        request.backend,
+        &request.model,
+    )];
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(run_tool_loop(request))
+        .unwrap();
+    let requests = server.join().unwrap();
+    assert!(requests[2].get("tools").is_none());
+    let messages = requests[2]["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 3);
+    assert!(
+        messages[2]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("image-2")
+    );
+    assert!(
+        messages[2]["content"][1]["image_url"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,")
+    );
+}

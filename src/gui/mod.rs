@@ -2549,6 +2549,15 @@ impl Program {
                                     ]
                                     .spacing(iced::Pixels(0.0)),
                                     Space::new().height(Length::Fixed(8.0)),
+                                    widget::checkbox(user_information.model.as_deref().is_some_and(|model| {
+                                        self.tool_settings.image_editing_models.contains(&crate::tools::ToolSettings::image_model_key(user_information.backend, model))
+                                    }))
+                                        .label(format!("{} ({})", tr(language, "Image Editing for selected model"), user_information.model.as_deref().unwrap_or("No model selected")))
+                                        .on_toggle_maybe(user_information.model.as_ref().map(|_| |_| Message::ToggleImageEditingModel)),
+                                    widget::text(tr(language, "Allow this model to crop, enlarge, enhance, and correct attached photos locally. Requires FFmpeg on PATH and a model that supports images and tools. Edits are temporary; originals are preserved."))
+                                        .size(12)
+                                        .color(text_muted()),
+                                    Space::new().height(Length::Fixed(8.0)),
                                     widget::text(tr(language, "Code Checking also requires Local code checking in Advanced settings."))
                                         .size(12)
                                         .color(text_muted()),
