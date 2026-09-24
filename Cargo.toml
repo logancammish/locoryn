@@ -22,9 +22,12 @@ chrono = "0.4.45"
 image = "0.25.10"
 iced_selection = { version = "0.5", features = ["markdown"] }
 base64 = "0.23.1"
-arboard = "3.6.1"
+arboard = { version = "3.6.1", features = ["wayland-data-control"] }
 rfd = "0.17.2"
 pdf-extract = "0.12.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+wl-clipboard-rs = "0.9.3"
 
 [build-dependencies]
 winresource = "0.1.31"

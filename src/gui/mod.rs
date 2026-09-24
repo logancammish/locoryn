@@ -20,12 +20,14 @@ use crate::{
     tools::web_search::{WebSearchState, WebSource},
 };
 
+mod composer;
 mod conversation_shortcuts;
 mod file_attachments;
 mod theme;
 mod translation;
 mod widgets;
 
+use composer::prompt_key_binding;
 use conversation_shortcuts::conversation_shortcuts;
 use theme::*;
 use translation::*;
@@ -36,6 +38,12 @@ pub(crate) use theme::set_interface_theme;
 // Iced scrollbars float above scrollable content. Keep sidebar row actions out
 // of that overlay without making the sidebar itself wider.
 const SIDEBAR_SCROLLBAR_CLEARANCE: f32 = 14.0;
+
+// A bare zero-height Space is omitted by Iced's row/column builders. Keep a
+// shrink-sized wrapper so finishing an animation cannot shift widget state.
+fn reveal_space(height: f32) -> Element<'static, Message> {
+    container(Space::new().height(height)).into()
+}
 
 impl Program {
     fn password_unlock_page<'a>(
@@ -69,7 +77,7 @@ impl Program {
             .unwrap_or_else(|| widget::column![].into());
 
         let content = widget::column![
-            Space::new().height(Length::Fixed((1.0 - eased(self.page_reveal)) * 4.0)),
+            reveal_space((1.0 - eased(self.page_reveal)) * 4.0),
             container(widget::row![
                 section_title(title, subtitle),
                 Space::new().width(Length::Fill),
@@ -132,9 +140,7 @@ impl Program {
             GUIState::InfoPopup => {
                 let content = container(
                     widget::column![
-                        Space::new().height(Length::Fixed(
-                            (1.0 - eased(self.page_reveal)) * 4.0
-                        )),
+                        reveal_space((1.0 - eased(self.page_reveal)) * 4.0),
                         container(
                             widget::row![
                                 widget::column![
@@ -306,19 +312,7 @@ impl Program {
                     .height(Length::Fill)
                     .min_height(52)
                     .on_action(Message::EditPrompt)
-                    .key_binding(move |key_press| {
-                        if matches!(
-                            key_press.key.as_ref(),
-                            iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter)
-                        ) && !key_press.modifiers.shift()
-                        {
-                            Some(widget::text_editor::Binding::Custom(Message::Prompt(
-                                prompt_to_send.clone(),
-                            )))
-                        } else {
-                            widget::text_editor::Binding::from_key_press(key_press)
-                        }
-                    })
+                    .key_binding(move |key_press| prompt_key_binding(key_press, &prompt_to_send))
                     .style(text_editor_style);
                 let web_toggle: Element<Message> = if is_processing {
                     container(
@@ -1348,30 +1342,30 @@ impl Program {
                 let composer_active = !self.prompt.prompt.trim().is_empty()
                     || !self.pending_images.is_empty()
                     || !self.pending_files.is_empty();
-                let prompt_input: Element<Message> = prompt.into();
-                let composer_input: Element<Message> = if self.pending_images.is_empty() {
-                    prompt_input
+                // Keep the editor at the same tree position as attachments come
+                // and go, preserving focus and selection during image paste.
+                let image_previews: Element<Message> = if self.pending_images.is_empty() {
+                    Space::new().width(0).into()
                 } else {
-                    widget::row![
-                        composer_image_previews(&self.pending_images),
-                        Space::new().width(Length::Fixed(8.0)),
-                        prompt_input,
-                    ]
-                    .align_y(iced::Alignment::Center)
-                    .height(Length::Fill)
-                    .into()
+                    container(composer_image_previews(&self.pending_images))
+                        .padding(iced::Padding {
+                            right: 8.0,
+                            ..iced::Padding::ZERO
+                        })
+                        .into()
                 };
-                let composer_input: Element<Message> = if self.pending_files.is_empty() {
-                    composer_input
-                } else {
-                    widget::column![
-                        file_attachments::file_chips(&self.pending_files, true, language),
-                        composer_input
-                    ]
-                    .spacing(3)
-                    .height(Length::Fill)
-                    .into()
-                };
+                let composer_input: Element<Message> = widget::Column::from_vec(vec![
+                    file_attachments::file_chips(&self.pending_files, true, language),
+                    widget::Row::from_vec(vec![image_previews, prompt.into()])
+                        .align_y(iced::Alignment::Center)
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .into(),
+                ])
+                .spacing(if self.pending_files.is_empty() { 0 } else { 3 })
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into();
 
                 let system_prompt_selector = || {
                     widget::pick_list(
@@ -1629,7 +1623,7 @@ impl Program {
                 };
 
                 let content = widget::column![
-                    Space::new().height(Length::Fixed((1.0 - eased(self.page_reveal)) * 4.0)),
+                    reveal_space((1.0 - eased(self.page_reveal)) * 4.0),
                     container(
                         widget::column![header_controls, config_drawer].spacing(iced::Pixels(4.0))
                     )
@@ -1757,13 +1751,11 @@ impl Program {
                         .into(),
                     );
                 }
-                let workspace: Element<Message> = if floating_notices.is_empty() {
-                    workspace
-                } else {
+                let mut workspace = widget::stack![workspace];
+                if !floating_notices.is_empty() {
                     let notices =
                         widget::Column::with_children(floating_notices).spacing(iced::Pixels(8.0));
-                    widget::stack![
-                        workspace,
+                    workspace = workspace.push(
                         container(notices)
                             .width(Length::Fill)
                             .height(Length::Fill)
@@ -1778,25 +1770,19 @@ impl Program {
                                 bottom: self.ui_layout.composer_height + 18.0,
                                 left: 20.0,
                             }),
-                    ]
-                    .into()
-                };
+                    );
+                }
                 let workspace: Element<Message> =
                     conversation_shortcuts(workspace, self.conversation_selected);
-                let workspace = if let Some(preview) = &self.file_preview {
-                    widget::stack![
-                        workspace,
-                        file_attachments::file_preview(
-                            preview,
-                            self.window_size.width,
-                            self.window_size.height,
-                            language
-                        )
-                    ]
-                    .into()
-                } else {
-                    workspace
-                };
+                let mut workspace = widget::stack![workspace];
+                if let Some(preview) = &self.file_preview {
+                    workspace = workspace.push(file_attachments::file_preview(
+                        preview,
+                        self.window_size.width,
+                        self.window_size.height,
+                        language,
+                    ));
+                }
                 container(workspace)
                     .padding(6)
                     .width(Length::Fill)
@@ -1900,17 +1886,7 @@ impl Program {
                     .max_height(180)
                     .on_action(Message::EditPrompt)
                     .key_binding(move |key_press| {
-                        if matches!(
-                            key_press.key.as_ref(),
-                            iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter)
-                        ) && !key_press.modifiers.shift()
-                        {
-                            Some(widget::text_editor::Binding::Custom(Message::Prompt(
-                                vision_prompt_to_send.clone(),
-                            )))
-                        } else {
-                            widget::text_editor::Binding::from_key_press(key_press)
-                        }
+                        prompt_key_binding(key_press, &vision_prompt_to_send)
                     })
                     .style(text_editor_style);
 
@@ -1981,9 +1957,7 @@ impl Program {
                 };
 
                 let content = widget::column![
-                    Space::new().height(Length::Fixed(
-                        (1.0 - eased(self.page_reveal)) * 4.0
-                    )),
+                    reveal_space((1.0 - eased(self.page_reveal)) * 4.0),
                     container(widget::row![
                         section_title(
                             tr(language, "Images"),
@@ -2091,9 +2065,7 @@ impl Program {
                     };
 
                 let content = widget::column![
-                    Space::new().height(Length::Fixed(
-                        (1.0 - eased(self.page_reveal)) * 4.0
-                    )),
+                    reveal_space((1.0 - eased(self.page_reveal)) * 4.0),
                     container(
                         widget::row![
                             section_title(
@@ -2113,9 +2085,7 @@ impl Program {
                     container(
                         widget::row![
                             widget::column![
-                                Space::new().height(Length::Fixed(
-                                    (1.0 - eased(self.page_reveal * 1.12)) * 14.0
-                                )),
+                                reveal_space((1.0 - eased(self.page_reveal * 1.12)) * 14.0),
                                 widget::column![
                             settings_group_title(tr(language, "PERSONALIZATION")),
                             Space::new().height(Length::Fixed(8.0)),
@@ -2410,9 +2380,7 @@ impl Program {
                             Space::new().width(Length::Fixed(14.0)),
 
                             widget::column![
-                                Space::new().height(Length::Fixed(
-                                    (1.0 - eased(self.page_reveal * 1.18 - 0.08)) * 22.0
-                                )),
+                                reveal_space((1.0 - eased(self.page_reveal * 1.18 - 0.08)) * 22.0),
                                 widget::column![
                             settings_group_title(tr(language, "APPEARANCE")),
                             Space::new().height(Length::Fixed(8.0)),
@@ -3119,9 +3087,7 @@ impl Program {
                 .into();
 
                 let content = widget::column![
-                    Space::new().height(Length::Fixed(
-                        (1.0 - eased(self.page_reveal)) * 4.0
-                    )),
+                    reveal_space((1.0 - eased(self.page_reveal)) * 4.0),
                     container(widget::row![
                         section_title(
                             tr(language, "Advanced settings"),
@@ -3136,9 +3102,7 @@ impl Program {
                     Space::new().height(Length::Fixed(14.0)),
                     container(widget::row![
                         widget::column![
-                            Space::new().height(Length::Fixed(
-                                (1.0 - eased(self.page_reveal * 1.12)) * 14.0
-                            )),
+                            reveal_space((1.0 - eased(self.page_reveal * 1.12)) * 14.0),
                             settings_group_title(tr(language, "MODELS & SAFETY")),
                             Space::new().height(Length::Fixed(8.0)),
                             widget::column![
@@ -3190,9 +3154,7 @@ impl Program {
                         Space::new().width(Length::Fixed(14.0)),
 
                         widget::column![
-                            Space::new().height(Length::Fixed(
-                                (1.0 - eased(self.page_reveal * 1.18 - 0.08)) * 22.0
-                            )),
+                            reveal_space((1.0 - eased(self.page_reveal * 1.18 - 0.08)) * 22.0),
                             settings_group_title(tr(language, "RUNTIME & CONNECTION")),
                             Space::new().height(Length::Fixed(8.0)),
                         widget::column![
@@ -3348,7 +3310,81 @@ impl Program {
 
 #[cfg(test)]
 mod tests {
-    use super::ellipsize_chat_title;
+    use super::*;
+    use iced::advanced::widget::{Tree, operation::Focusable, tree};
+
+    type EditorState = widget::text_editor::State<iced::advanced::text::highlighter::PlainText>;
+
+    fn editor_state(tree: &mut Tree) -> Option<&mut EditorState> {
+        if tree.tag == tree::Tag::of::<EditorState>() {
+            Some(tree.state.downcast_mut())
+        } else {
+            tree.children.iter_mut().find_map(editor_state)
+        }
+    }
+
+    fn focused_composer(program: &Program) -> Tree {
+        let mut tree = Tree::new(program.view().as_widget());
+        editor_state(&mut tree).expect("composer exists").focus();
+        tree
+    }
+
+    fn assert_composer_stays_focused(program: &Program, tree: &mut Tree) {
+        tree.diff(program.view().as_widget());
+        assert!(editor_state(tree).expect("composer exists").is_focused());
+    }
+
+    #[test]
+    fn composer_keeps_focus_when_opening_animation_finishes() {
+        for page in [GUIState::Main, GUIState::Images] {
+            let mut program = Program::default();
+            program.app_state.gui_state = page;
+            program.page_reveal = 0.0;
+            let mut tree = focused_composer(&program);
+            for progress in [0.5, 0.99, 1.0] {
+                program.page_reveal = progress;
+                assert_composer_stays_focused(&program, &mut tree);
+            }
+        }
+    }
+
+    #[test]
+    fn composer_keeps_focus_as_notifications_and_attachments_change() {
+        let mut program = Program::default();
+        program.app_state.gui_state = GUIState::Main;
+        program.debug_message.message.clear();
+        let mut tree = focused_composer(&program);
+        program.set_debug_message(crate::DebugMessage {
+            message: "Ready".into(),
+            is_error: false,
+        });
+        assert_composer_stays_focused(&program, &mut tree);
+        program.debug_message.message.clear();
+        assert_composer_stays_focused(&program, &mut tree);
+
+        program
+            .pending_images
+            .push(crate::load_chat_image(std::path::Path::new("assets/icon.png")).unwrap());
+        assert_composer_stays_focused(&program, &mut tree);
+        program
+            .pending_files
+            .push(std::sync::Arc::new(crate::file_usage::AttachedFile {
+                id: "focus-test".into(),
+                name: "notes.txt".into(),
+                kind: crate::file_usage::FileKind::Text,
+                size_bytes: 5,
+                pages: vec![crate::file_usage::FilePage {
+                    text: "notes".into(),
+                    ocr: false,
+                    notice: None,
+                }],
+            }));
+        assert_composer_stays_focused(&program, &mut tree);
+        program.pending_images.clear();
+        assert_composer_stays_focused(&program, &mut tree);
+        program.pending_files.clear();
+        assert_composer_stays_focused(&program, &mut tree);
+    }
 
     #[test]
     fn chat_title_ellipsis_is_unicode_safe() {

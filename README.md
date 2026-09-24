@@ -381,6 +381,11 @@ native document support. Text files accept UTF-8 and UTF-16 with a byte-order ma
 Binary formats such as Word documents and archives must first be exported as text
 or PDF. Images still require a vision-capable model.
 
+Paste images directly into the message input with **Ctrl+V** (**Cmd+V** on macOS),
+or use **Paste**. On Linux, this supports copied image data and image files copied
+from a file manager, with native Wayland clipboard support where the compositor
+provides data-control and an X11 fallback. Plain text still pastes into the input.
+
 Click a document chip to preview its extracted text. PDF previews retain page
 numbers and have previous/next page controls; long pages also have excerpt
 controls. With **Settings → Tools → Enable Tools** enabled, models can list,

@@ -19,6 +19,7 @@ use ollama_rs::Ollama;
 use rustrict::{Censor, Type};
 mod app;
 mod chat_transcript;
+mod clipboard_images;
 mod conversation_title;
 mod file_usage;
 mod gui;
@@ -347,7 +348,13 @@ enum Message {
     FilePreviewOffset(usize),
     CloseFilePreview,
     PasteImage,
-    ImageLoaded(Result<ChatImage, String>),
+    PastePrompt,
+    ClipboardPasted {
+        chat_id: String,
+        text: Option<String>,
+        images: Result<Vec<ChatImage>, String>,
+        explicit_image: bool,
+    },
     ImagesLoaded(Result<Vec<ChatImage>, String>),
     MarkdownImageLoaded {
         url: String,
@@ -362,8 +369,6 @@ enum Message {
     EditPrompt(iced::widget::text_editor::Action),
     UseSuggestion(String),
     None,
-    KeyPressed(keyboard::Key, keyboard::Modifiers),
-    KeyReleased(keyboard::Key),
     StartUiResize(UiResizeTarget),
     UiResizeMoved(Point),
     StopUiResize,
@@ -1765,34 +1770,6 @@ fn load_chat_image(path: &Path) -> Result<ChatImage, String> {
             .unwrap_or("image")
             .to_string(),
         mime_type: mime_type.to_string(),
-        bytes,
-        preview_handle,
-    })
-}
-
-fn paste_chat_image() -> Result<ChatImage, String> {
-    let mut clipboard =
-        arboard::Clipboard::new().map_err(|error| format!("Could not open clipboard: {error}"))?;
-    let image_data = clipboard
-        .get_image()
-        .map_err(|_| "The clipboard does not contain an image.".to_string())?;
-    let rgba = image::RgbaImage::from_raw(
-        image_data.width as u32,
-        image_data.height as u32,
-        image_data.bytes.into_owned(),
-    )
-    .ok_or_else(|| "Clipboard image data was invalid.".to_string())?;
-    let mut bytes = Vec::new();
-    image::DynamicImage::ImageRgba8(rgba)
-        .write_to(
-            &mut std::io::Cursor::new(&mut bytes),
-            image::ImageFormat::Png,
-        )
-        .map_err(|error| format!("Could not prepare clipboard image: {error}"))?;
-    let preview_handle = decoded_image_handle(&bytes)?;
-    Ok(ChatImage {
-        name: "Pasted image.png".to_string(),
-        mime_type: "image/png".to_string(),
         bytes,
         preview_handle,
     })
@@ -4036,38 +4013,70 @@ impl Program {
                 Task::none()
             }
 
-            Message::PasteImage => {
-                Task::perform(async { paste_chat_image() }, Message::ImageLoaded)
+            Message::PasteImage | Message::PastePrompt => {
+                if !matches!(self.app_state.gui_state, GUIState::Main | GUIState::Images)
+                    || self.file_preview.is_some()
+                {
+                    return Task::none();
+                }
+                let explicit_image = matches!(message, Message::PasteImage);
+                let chat_id = self.current_chat_id.clone();
+                Task::perform(clipboard_images::read(), std::convert::identity).then(
+                    move |images| {
+                        let chat_id = chat_id.clone();
+                        if explicit_image || images.is_ok() {
+                            Task::done(Message::ClipboardPasted {
+                                chat_id,
+                                text: None,
+                                images,
+                                explicit_image,
+                            })
+                        } else {
+                            // Iced reads text synchronously on the window thread. Only
+                            // request it as a fallback; image paste must never wait on
+                            // a second, unrelated clipboard transfer before starting.
+                            clipboard::read().map(move |text| Message::ClipboardPasted {
+                                chat_id: chat_id.clone(),
+                                text,
+                                images: images.clone(),
+                                explicit_image,
+                            })
+                        }
+                    },
+                )
             }
 
-            Message::ImageLoaded(result) => {
-                match result {
-                    Ok(image) => {
-                        if self.pending_images.len() + self.pending_files.len()
-                            >= file_usage::MAX_ATTACHMENTS
-                        {
-                            self.set_debug_message(DebugMessage {
-                                message: "Attach at most 8 files per message.".into(),
-                                is_error: true,
-                            });
-                            return Task::none();
-                        }
-                        let name = image.name.clone();
-                        self.pending_images.push(image);
-                        self.set_debug_message(DebugMessage {
-                            message: format!("Attached {name}."),
-                            is_error: false,
-                        });
+            Message::ClipboardPasted {
+                chat_id,
+                text,
+                images,
+                explicit_image,
+            } => {
+                if chat_id != self.current_chat_id
+                    || !matches!(self.app_state.gui_state, GUIState::Main | GUIState::Images)
+                {
+                    return Task::none();
+                }
+                match images {
+                    Ok(images) => self.update(Message::ImagesLoaded(Ok(images))),
+                    Err(_)
+                        if !explicit_image
+                            && text.as_ref().is_some_and(|text| !text.is_empty()) =>
+                    {
+                        self.update(Message::EditPrompt(
+                            iced::widget::text_editor::Action::Edit(
+                                iced::widget::text_editor::Edit::Paste(Arc::new(text.unwrap())),
+                            ),
+                        ))
                     }
-                    Err(error) if error != "No image selected." => {
+                    Err(error) => {
                         self.set_debug_message(DebugMessage {
                             message: error,
                             is_error: true,
-                        })
+                        });
+                        Task::none()
                     }
-                    Err(_) => {}
                 }
-                Task::none()
             }
 
             Message::ImagesLoaded(result) => {
@@ -5659,16 +5668,6 @@ impl Program {
                 self.copy_code_block(scope, code_block_index)
             }
 
-            Message::KeyPressed(keyboard::Key::Character(key), modifiers)
-                if modifiers.control() && key.eq_ignore_ascii_case("v") =>
-            {
-                Task::perform(async { paste_chat_image() }, Message::ImageLoaded)
-            }
-
-            Message::KeyPressed(_, _) => Task::none(),
-
-            Message::KeyReleased(_key) => Task::none(),
-
             Message::Prompt(prompt) => {
                 if !self.current_chat_is_processing() {
                     let mut prompt = prompt.trim().to_string();
@@ -5788,18 +5787,11 @@ impl Program {
                     modifiers,
                     ..
                 }) if modifiers.command()
+                    && !modifiers.alt()
                     && (key == keyboard::Key::Character("v".into())
                         || physical_key == keyboard::key::Code::KeyV) =>
                 {
                     Some(Message::PasteImage)
-                }
-                iced::event::Event::Keyboard(keyboard::Event::KeyPressed {
-                    key,
-                    modifiers,
-                    ..
-                }) => Some(Message::KeyPressed(key, modifiers)),
-                iced::event::Event::Keyboard(keyboard::Event::KeyReleased { key, .. }) => {
-                    Some(Message::KeyReleased(key))
                 }
                 _ => None,
             }),
@@ -6954,6 +6946,78 @@ mod tests {
         )))));
 
         assert_eq!(program.prompt.prompt, "first line\nsecond line");
+    }
+
+    #[test]
+    fn composer_pastes_text_when_native_image_clipboard_is_unavailable() {
+        let mut program = Program::default();
+        program.app_state.gui_state = GUIState::Main;
+        program.debug_message.message.clear();
+        let _ = program.update(Message::ClipboardPasted {
+            chat_id: program.current_chat_id.clone(),
+            text: Some("first line\nsecond line".into()),
+            images: Err("Clipboard backend unavailable".into()),
+            explicit_image: false,
+        });
+        assert_eq!(program.prompt.prompt, "first line\nsecond line");
+        assert!(program.pending_images.is_empty());
+        assert!(program.debug_message.message.is_empty());
+    }
+
+    #[test]
+    fn composer_pastes_image_once_without_its_alternative_text() {
+        let mut program = Program::default();
+        program.app_state.gui_state = GUIState::Main;
+        let image = super::load_chat_image(std::path::Path::new("assets/icon.png")).unwrap();
+        let _ = program.update(Message::ClipboardPasted {
+            chat_id: program.current_chat_id.clone(),
+            text: Some("file:///tmp/image.png".into()),
+            images: Ok(vec![image]),
+            explicit_image: false,
+        });
+        assert_eq!(program.pending_images.len(), 1);
+        assert!(program.prompt.prompt.is_empty());
+    }
+
+    #[test]
+    fn clipboard_result_does_not_modify_another_chat_or_settings() {
+        let mut program = Program::default();
+        program.app_state.gui_state = GUIState::Main;
+        let _ = program.update(Message::ClipboardPasted {
+            chat_id: "previous-chat".into(),
+            text: Some("old paste".into()),
+            images: Err("No image".into()),
+            explicit_image: false,
+        });
+        program.app_state.gui_state = GUIState::Settings;
+        let _ = program.update(Message::ClipboardPasted {
+            chat_id: program.current_chat_id.clone(),
+            text: Some("old paste".into()),
+            images: Err("No image".into()),
+            explicit_image: false,
+        });
+        assert!(program.prompt.prompt.is_empty());
+        assert!(program.pending_images.is_empty());
+    }
+
+    #[test]
+    fn explicit_image_paste_reports_failures_without_inserting_text() {
+        let mut program = Program::default();
+        program.app_state.gui_state = GUIState::Images;
+        let _ = program.update(Message::ClipboardPasted {
+            chat_id: program.current_chat_id.clone(),
+            text: Some("plain text".into()),
+            images: Err("The clipboard does not contain an image.".into()),
+            explicit_image: true,
+        });
+        assert!(program.prompt.prompt.is_empty());
+        assert!(program.debug_message.is_error);
+        assert!(
+            program
+                .debug_message
+                .message
+                .contains("does not contain an image")
+        );
     }
 
     #[test]
