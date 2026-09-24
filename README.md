@@ -9,14 +9,14 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/logancammish/locoryn/actions/workflows/rust.yml?query=branch%3Abeta"><img src="https://github.com/logancammish/locoryn/actions/workflows/rust.yml/badge.svg?branch=beta" alt="Beta branch build"></a>
+  <a href="https://github.com/logancammish/locoryn/actions/workflows/rust.yml?query=branch%3Amain"><img src="https://github.com/logancammish/locoryn/actions/workflows/rust.yml/badge.svg?branch=main" alt="Build"></a>
   <a href="https://github.com/logancammish/locoryn/releases"><img src="https://img.shields.io/github/v/release/logancammish/locoryn?include_prereleases&display_name=tag" alt="Latest release including betas"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/logancammish/locoryn" alt="License"></a>
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/built_with-Rust-dca282?logo=rust" alt="Rust"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/logancammish/locoryn/releases">Download beta</a>
+  <a href="https://github.com/logancammish/locoryn/releases">Download</a>
   ·
   <a href="https://ollama.com/search">Browse Ollama models</a>
   ·
@@ -31,7 +31,7 @@
 
 
 > [!NOTE]
-> This README describes the `beta` branch (`1.3.0-beta`). Packaged releases
+> This README describes the `main` branch (`1.3.0`). Packaged releases
 > may trail the source branch; check the release notes for the exact feature set
 > in a download.
 
@@ -73,17 +73,17 @@ and follow the [Linux and Windows OpenVINO setup](#openvino-setup-linux-and-wind
 ### 2. Install Locoryn
 
 - **Windows:** download and run
-  `locoryn-1.3.0-beta-windows-11-x64-setup.exe` from the
-  [beta release](https://github.com/logancammish/locoryn/releases), when published.
+  `locoryn-1.3.0-windows-11-x64-setup.exe` from the
+  [release](https://github.com/logancammish/locoryn/releases), when published.
   It installs for the current user and does not require administrator access.
 - **Linux:** run these commands in a terminal. The installer downloads the
   right published package, installs it for the current user, and adds it to
   your desktop launcher. It does not use `sudo`.
 
   ```sh
-  git clone --depth 1 --branch beta https://github.com/logancammish/locoryn.git
+  git clone --depth 1 --branch main https://github.com/logancammish/locoryn.git
   cd locoryn
-  sh install-linux.sh --channel beta
+  sh install-linux.sh --channel main
   ```
 
   For release channel and architecture options, see the
@@ -465,7 +465,7 @@ required only when building Locoryn from source.
 Install the [Rust toolchain](https://rustup.rs/), then:
 
 ```bash
-git clone --branch beta https://github.com/logancammish/locoryn.git
+git clone --branch main https://github.com/logancammish/locoryn.git
 cd locoryn
 cargo build --release
 ```
@@ -508,7 +508,7 @@ cargo build
 
 ## Project links
 
-- [Download beta releases](https://github.com/logancammish/locoryn/releases)
+- [Download releases](https://github.com/logancammish/locoryn/releases)
 - [Browse Ollama models](https://ollama.com/search)
 - [Install Ollama](https://ollama.com/download)
 - [Deploy OpenVINO Model Server](https://docs.openvino.ai/2026/model-server/ovms_docs_deploying_server.html)
