@@ -34,7 +34,7 @@ use crate::app::{
 };
 use crate::conversation_title::{TitleRequest, next_clone_title};
 use crate::inference::{
-    BackendConnections, EncodedImage, GenerationDetails, InferenceBackend, OpenAiStreamLine,
+    BackendConnections, GenerationDetails, InferenceBackend, OpenAiStreamLine,
     api_url as backend_api_url, base_url as backend_base_url, decode_openai_stream_line,
     direct_request_body, model_names,
 };
@@ -3132,14 +3132,6 @@ impl Program {
         // preview while the async request is being prepared.
         let attached_images = self.pending_images.clone();
         let attached_files = self.pending_files.clone();
-        let encoded_images = attached_images
-            .iter()
-            .map(|image| EncodedImage {
-                mime_type: image.mime_type.clone(),
-                data: BASE64.encode(&image.bytes),
-            })
-            .collect::<Vec<_>>();
-        let had_image = !attached_images.is_empty();
         let filtering = self.app_state.filtering;
         let code_checking_enabled = self.code_checking_enabled;
         let user_info = self.user_information.clone();
@@ -3159,15 +3151,6 @@ impl Program {
         if !code_checking_enabled {
             tool_settings.code_checking = false;
         }
-        // Scope image editing to an explicitly selected bot and an image-bearing turn.
-        // Unknown vision capability is allowed for OpenVINO servers that do not advertise it.
-        if !had_image
-            || user_info.vision_supported == Some(false)
-            || !tool_settings
-                .image_editing_allowed(backend, user_info.model.as_deref().unwrap_or_default())
-        {
-            tool_settings.image_editing_models.clear();
-        }
         let (web_search_state_sender, web_search_state_receiver) = crossbeam_channel::unbounded();
         let (web_progress_sender, web_progress_receiver) =
             tokio::sync::watch::channel(ToolLoopProgress::default());
@@ -3183,15 +3166,20 @@ impl Program {
         let chat_storage_dir = self.chat_storage_dir.clone();
         self.chat_notices.remove(&chat_id);
 
-        let response_start_index = {
+        let (response_start_index, encoded_images) = {
             let mut chat = user_info.chat_history.lock().unwrap();
             chat.push_message(Correspondence::User {
                 text: prompt.clone(),
                 images: attached_images.clone(),
                 files: attached_files,
             });
-            chat.messages.len()
+            let images = crate::tools::image_editing::conversation_images(
+                &chat.messages,
+                user_info.current_chat_history_enabled && user_info.vision_supported != Some(false),
+            );
+            (chat.messages.len(), images)
         };
+        let had_image = !encoded_images.is_empty();
         let title_request = (self.automatic_conversation_titles
             && response_start_index == 1
             && !prompt.trim().is_empty()

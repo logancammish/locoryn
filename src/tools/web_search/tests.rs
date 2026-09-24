@@ -2198,7 +2198,10 @@ fn image_tool_call(id: &str, name: &str, arguments: serde_json::Value) -> serde_
 
 #[test]
 fn image_tool_loop_returns_pixels_after_all_tool_results_for_both_backends() {
-    use crate::tools::image_editing::tests::{ffmpeg_available, fixture};
+    use crate::tools::image_editing::{
+        conversation_images,
+        tests::{ffmpeg_available, fixture, image_message},
+    };
     if !ffmpeg_available() {
         eprintln!("Skipping image tool integration: FFmpeg is not installed.");
         return;
@@ -2230,7 +2233,10 @@ fn image_tool_loop_returns_pixels_after_all_tool_results_for_both_backends() {
         ]);
         let mut request = fallback_test_request(url);
         request.backend = backend;
-        request.images = vec![fixture()];
+        // A text-only follow-up must still supply the prior attachment to both
+        // the model and the image editor.
+        request.images =
+            conversation_images(&[image_message(&[fixture()]), image_message(&[])], true);
         request.tool_settings.conversation_search = false;
         request.tool_settings.image_editing_models =
             vec![crate::tools::ToolSettings::image_model_key(
@@ -2286,9 +2292,9 @@ fn image_tool_loop_returns_pixels_after_all_tool_results_for_both_backends() {
 }
 
 #[test]
-fn image_tool_loop_rejects_unapproved_models_and_missing_images() {
+fn image_tool_loop_rejects_unapproved_models_and_disabled_tools() {
     let _guard = LOOPBACK_TEST_LOCK.lock().unwrap();
-    for with_images in [true, false] {
+    for master_enabled in [true, false] {
         let call = image_tool_response(
             InferenceBackend::OpenVino,
             vec![image_tool_call(
@@ -2297,13 +2303,17 @@ fn image_tool_loop_rejects_unapproved_models_and_missing_images() {
                 serde_json::json!({"image_id":"image-1","operation":"invert"}),
             )],
         );
-        let (url, server) =
-            fallback_test_server(vec![("200 OK", call), ("200 OK", fallback_test_answer())]);
+        let responses = if master_enabled {
+            vec![("200 OK", call), ("200 OK", fallback_test_answer())]
+        } else {
+            vec![("200 OK", fallback_test_answer())]
+        };
+        let (url, server) = fallback_test_server(responses);
         let mut request = fallback_test_request(url);
-        if with_images {
+        if master_enabled {
             request.tool_settings.image_editing_models = vec!["OpenVINO/different-bot".into()];
         } else {
-            request.images.clear();
+            request.tool_settings.enabled = false;
             request.tool_settings.image_editing_models =
                 vec![crate::tools::ToolSettings::image_model_key(
                     request.backend,
@@ -2316,9 +2326,71 @@ fn image_tool_loop_rejects_unapproved_models_and_missing_images() {
             .unwrap();
         let requests = server.join().unwrap();
         assert!(!requests[0]["tools"].to_string().contains("edit_image"));
+        let messages = requests.last().unwrap()["messages"].as_array().unwrap();
+        if master_enabled {
+            let error = messages.iter().find(|m| m["role"] == "tool").unwrap();
+            assert!(error["content"].as_str().unwrap().contains("disabled"));
+        }
+        assert_eq!(messages.iter().filter(|m| m["role"] == "user").count(), 1);
+    }
+}
+
+#[test]
+fn image_tools_are_discoverable_without_attachments_for_both_backends() {
+    let _guard = LOOPBACK_TEST_LOCK.lock().unwrap();
+    for backend in InferenceBackend::ALL {
+        let calls = vec![
+            image_tool_call("list", "list_images", serde_json::json!({})),
+            image_tool_call(
+                "edit",
+                "edit_image",
+                serde_json::json!({"image_id":"image-1","operation":"invert"}),
+            ),
+        ];
+        let answer = if backend == InferenceBackend::Ollama {
+            serde_json::json!({"message":{"role":"assistant","content":"Please attach an image to edit."},"done":true}).to_string()
+        } else {
+            fallback_test_answer()
+        };
+        let (url, server) = fallback_test_server(vec![
+            ("200 OK", image_tool_response(backend, calls)),
+            ("200 OK", answer),
+        ]);
+        let mut request = fallback_test_request(url);
+        request.backend = backend;
+        request.images.clear();
+        request.tool_settings.conversation_search = false;
+        request.tool_settings.image_editing_models =
+            vec![crate::tools::ToolSettings::image_model_key(
+                backend,
+                &request.model,
+            )];
+        assert!(request.tool_settings.any_tool_enabled());
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(run_tool_loop(request))
+            .unwrap();
+        let requests = server.join().unwrap();
+        let names: Vec<_> = requests[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["list_images", "edit_image"]);
+        assert!(
+            requests[0]["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Image editing is enabled")
+        );
         let messages = requests[1]["messages"].as_array().unwrap();
-        let error = messages.iter().find(|m| m["role"] == "tool").unwrap();
-        assert!(error["content"].as_str().unwrap().contains("disabled"));
+        let listed: serde_json::Value =
+            serde_json::from_str(messages[3]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(listed, serde_json::json!({"images":[]}));
+        let edit: serde_json::Value =
+            serde_json::from_str(messages[4]["content"].as_str().unwrap()).unwrap();
+        assert!(edit["error"].as_str().unwrap().contains("attach an image"));
         assert_eq!(messages.iter().filter(|m| m["role"] == "user").count(), 1);
     }
 }

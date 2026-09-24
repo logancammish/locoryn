@@ -1543,8 +1543,7 @@ async fn run_native_tool_loop(
     };
     let image_tools_enabled = request
         .tool_settings
-        .image_editing_allowed(request.backend, &request.model)
-        && !request.images.is_empty();
+        .image_editing_allowed(request.backend, &request.model);
     let mut image_session =
         crate::tools::image_editing::ImageSession::new(if image_tools_enabled {
             &request.images
@@ -1798,7 +1797,7 @@ async fn run_native_tool_loop(
             let result = match name {
                 "list_images" | "edit_image" => {
                     if !image_tools_enabled {
-                        serde_json::json!({"error":"Image editing is disabled for this model or no images are attached to this turn."})
+                        serde_json::json!({"error":"Image editing is disabled for this model."})
                     } else {
                         let result = image_session
                             .execute(name, &arguments, Arc::clone(&request.cancel))

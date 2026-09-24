@@ -337,8 +337,8 @@ and are not printed in logs.
 
 ## Local image editing for selected models
 
-Select a model, then enable **Settings → Tools → Image Editing for selected
-model** and **Enable Tools**. Permission is saved separately for each backend
+Select a model, then enable **Settings → Tools → Image Editing** and
+**Enable Tools**. Permission is saved separately for each backend
 and model; all models start with image editing disabled. Choose a model that
 supports both vision and native tool calls, and attach a photo to your message.
 
@@ -349,6 +349,10 @@ source corners to a rectangle using FFmpeg's
 [perspective filter](https://ffmpeg.org/ffmpeg-filters.html#perspective).
 Each result is sent back as an image for the model to inspect and optionally
 edit again. Image editing works with the chat's **Web** switch off.
+Enabled image tools remain visible before a photo is attached, so the model
+can explain its capabilities and ask for an image when needed. With chat
+history enabled, follow-up requests reuse the latest attached image or batch
+of images in the active conversation.
 
 Install **FFmpeg** and make `ffmpeg` available on `PATH` (for example,
 `sudo apt install ffmpeg` on Debian/Ubuntu); restart Locoryn after changing
@@ -356,8 +360,9 @@ Install **FFmpeg** and make `ffmpeg` available on `PATH` (for example,
 Edits run locally, but the configured inference server receives the resulting
 images just as it receives original attachments. Originals remain unchanged;
 edited copies exist only for the current response and temporary files are
-removed after processing. These tools use photos attached to the current turn,
-not PDF pages or photos from previous messages.
+removed after processing. These tools use image attachments, not PDF pages.
+Images are not restored when reopening a saved chat; attach them again to edit
+them. With chat history off, only the current message's images are available.
 
 Calls accept image IDs and bounded numeric parameters, without arbitrary
 paths, shell commands, or filter scripts. Each response allows eight image
