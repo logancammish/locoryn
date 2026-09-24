@@ -9,14 +9,14 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/logancammish/locoryn/actions/workflows/rust.yml"><img src="https://github.com/logancammish/locoryn/actions/workflows/rust.yml/badge.svg" alt="Build"></a>
-  <a href="https://github.com/logancammish/locoryn/releases/latest"><img src="https://img.shields.io/github/v/release/logancammish/locoryn?display_name=tag" alt="Latest release"></a>
+  <a href="https://github.com/logancammish/locoryn/actions/workflows/rust.yml?query=branch%3Abeta"><img src="https://github.com/logancammish/locoryn/actions/workflows/rust.yml/badge.svg?branch=beta" alt="Beta branch build"></a>
+  <a href="https://github.com/logancammish/locoryn/releases"><img src="https://img.shields.io/github/v/release/logancammish/locoryn?include_prereleases&display_name=tag" alt="Latest release including betas"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/logancammish/locoryn" alt="License"></a>
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/built_with-Rust-dca282?logo=rust" alt="Rust"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/logancammish/locoryn/releases/latest">Download</a>
+  <a href="https://github.com/logancammish/locoryn/releases">Download beta</a>
   ·
   <a href="https://ollama.com/search">Browse Ollama models</a>
   ·
@@ -31,7 +31,7 @@
 
 
 > [!NOTE]
-> This README describes the current `main` branch (`1.2.3`). Packaged releases
+> This README describes the `beta` branch (`1.3.0-beta`). Packaged releases
 > may trail the source branch; check the release notes for the exact feature set
 > in a download.
 
@@ -73,20 +73,20 @@ and follow the [Linux and Windows OpenVINO setup](#openvino-setup-linux-and-wind
 ### 2. Install Locoryn
 
 - **Windows:** download and run
-  `locoryn-1.2.3-windows-11-x64-setup.exe` from the
-  [latest release](https://github.com/logancammish/locoryn/releases/latest).
+  `locoryn-1.3.0-beta-windows-11-x64-setup.exe` from the
+  [beta release](https://github.com/logancammish/locoryn/releases), when published.
   It installs for the current user and does not require administrator access.
 - **Linux:** run these commands in a terminal. The installer downloads the
   right published package, installs it for the current user, and adds it to
   your desktop launcher. It does not use `sudo`.
 
   ```sh
-  git clone --depth 1 https://github.com/logancammish/locoryn.git
+  git clone --depth 1 --branch beta https://github.com/logancammish/locoryn.git
   cd locoryn
-  sh install-linux.sh
+  sh install-linux.sh --channel beta
   ```
 
-  To choose a beta build or architecture manually, see the
+  For release channel and architecture options, see the
   [Linux installer options](linux_installations/README.md).
 
 ### 3. Open Locoryn
@@ -204,6 +204,7 @@ Most controls live in **Settings**:
 | Application updates | Current version, latest stable release, and a trusted download link |
 | Chat storage | The folder containing saved conversations |
 | Model conversation context | Whether earlier messages are included in the next request |
+| Automatic conversation titles | Off by default; after the first reply, the initially selected model creates a short descriptive title from the opening prompt. An echoed prompt or empty title is retried once. If naming fails, a notice explains why and the current title is kept. |
 | Interface | Language, Dark/Light/Modern theme, text size, and chat font |
 
 **Advanced settings** contains backend selection, separate Ollama and OpenVINO
@@ -334,7 +335,100 @@ and are not printed in logs.
 > request. The update manager sends a version-check request to GitHub at startup
 > and when you select **Check now**.
 
+## Local image editing for selected models
+
+Select a model, then enable **Settings → Tools → Image Editing** and
+**Enable Tools**. Permission is saved separately for each backend
+and model; all models start with image editing disabled. Choose a model that
+supports both vision and native tool calls, and attach a photo to your message.
+
+The model can use `list_images` and `edit_image` to crop, enlarge or stretch,
+rotate/deskew, adjust contrast/brightness/gamma, sharpen, convert to grayscale,
+invert, threshold, or correct perspective. Perspective correction maps four
+source corners to a rectangle using FFmpeg's
+[perspective filter](https://ffmpeg.org/ffmpeg-filters.html#perspective).
+Each result is sent back as an image for the model to inspect and optionally
+edit again. Image editing works with the chat's **Web** switch off.
+Enabled image tools remain visible before a photo is attached, so the model
+can explain its capabilities and ask for an image when needed. With chat
+history enabled, follow-up requests reuse the latest attached image or batch
+of images in the active conversation.
+
+Install **FFmpeg** and make `ffmpeg` available on `PATH` (for example,
+`sudo apt install ffmpeg` on Debian/Ubuntu); restart Locoryn after changing
+`PATH`. Missing FFmpeg or an invalid edit returns feedback to the model.
+Edits run locally, but the configured inference server receives the resulting
+images just as it receives original attachments. Originals remain unchanged;
+edited copies exist only for the current response and temporary files are
+removed after processing. These tools use image attachments, not PDF pages.
+Images are not restored when reopening a saved chat; attach them again to edit
+them. With chat history off, only the current message's images are available.
+
+Calls accept image IDs and bounded numeric parameters, without arbitrary
+paths, shell commands, or filter scripts. Each response allows eight image
+tool calls. Input images are limited to 12 MiB and 32 megapixels; output is
+limited to 12 MiB, 4096 pixels per side, and 16 megapixels, with a 32 MiB total
+encoded-result budget. FFmpeg has a 15-second limit per edit and stops when the
+response is cancelled. Enhancement can introduce artifacts and cannot recover
+missing detail.
+
+## File attachments
+
+Use **＋ Attach** or drag files into the window to attach Markdown, source code,
+plain text, configuration/data files, PDFs, and supported images. Document files
+are converted to plain text locally, so they also work with models that have no
+native document support. Text files accept UTF-8 and UTF-16 with a byte-order mark.
+Binary formats such as Word documents and archives must first be exported as text
+or PDF. Images still require a vision-capable model.
+
+Paste images directly into the message input with **Ctrl+V** (**Cmd+V** on macOS),
+or use **Paste**. On Linux, this supports copied image data and image files copied
+from a file manager, with native Wayland clipboard support where the compositor
+provides data-control and an X11 fallback. Plain text still pastes into the input.
+
+Click a document chip to preview its extracted text. PDF previews retain page
+numbers and have previous/next page controls; long pages also have excerpt
+controls. With **Settings → Tools → Enable Tools** enabled, models can list,
+search, and read attached documents by file ID, page, and character offset.
+These tools only see documents attached to the conversation. Without tool
+support, the model receives bounded text excerpts selected for the current
+question; ask about a specific filename, topic, or page for larger documents.
+
+Searchable PDFs use the built-in Rust reader. Pages with no extractable text also
+try local OCR when **Poppler** (`pdftoppm`) and **Tesseract** are installed on
+`PATH`. Tesseract uses its default English language data. For example, on
+Debian/Ubuntu, install `poppler-utils tesseract-ocr`; on Windows, install both
+tools and add their executable folders to `PATH`. OCR pages are labelled in the
+preview. Unreadable pages show an explanation, and PDFs with no readable pages
+are rejected. OCR reads text; it does not interpret diagrams or preserve layout.
+
+Up to eight attachments can be sent per message. Documents are limited to 16 MiB,
+2 MiB of extracted text, and 200 PDF pages. OCR has a 30-second page limit and a
+two-minute document limit; split larger scans into sections. File reading runs
+in the background and can be cancelled from the composer.
+
+Extracted documents are saved with normal chats and retained when cloning or
+reopening them, even if the originals move. Temporary-chat documents stay in
+memory. Previous attachments are available to follow-up questions while chat
+history is enabled. Text is sent to the selected inference backend with the
+conversation; local extraction and OCR do not use a cloud conversion service.
+
 ## Local data and privacy
+
+Use **Clone conversation** (⧉) beside the current chat title to open an independent
+copy named `Conversation name (1)`, `(2)`, and so on. Cloning a copy continues the
+same numbering sequence, skipping names already used in that profile. Messages,
+conversation context, and the chat's web-search choice are copied. The action is
+available after the conversation has a message and any response has finished.
+Temporary conversations produce temporary copies.
+
+Select **Copy chat transcript** (⎘) in the chat header to copy the entire open
+conversation. You can also click outside the message input, press **Ctrl+A** to
+select the conversation, then **Ctrl+C** to copy it (**Cmd+A**, **Cmd+C** on macOS).
+The selected conversation is outlined; **Esc** or a click clears the selection.
+The plain-text transcript includes speaker/model labels, original Markdown and
+reasoning, source links, attachment names, and any reply currently streaming.
+Shortcuts inside text inputs continue to select and copy their text.
 
 Chats, settings, and diagnostics are stored on your machine.
 Temporary chats are not added to `chats.json`.
@@ -371,7 +465,7 @@ required only when building Locoryn from source.
 Install the [Rust toolchain](https://rustup.rs/), then:
 
 ```bash
-git clone https://github.com/logancammish/locoryn.git
+git clone --branch beta https://github.com/logancammish/locoryn.git
 cd locoryn
 cargo build --release
 ```
@@ -414,7 +508,7 @@ cargo build
 
 ## Project links
 
-- [Download the latest release](https://github.com/logancammish/locoryn/releases/latest)
+- [Download beta releases](https://github.com/logancammish/locoryn/releases)
 - [Browse Ollama models](https://ollama.com/search)
 - [Install Ollama](https://ollama.com/download)
 - [Deploy OpenVINO Model Server](https://docs.openvino.ai/2026/model-server/ovms_docs_deploying_server.html)

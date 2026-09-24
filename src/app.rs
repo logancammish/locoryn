@@ -6,6 +6,7 @@ use std::{
 
 use crate::{
     GUIState, Program,
+    file_usage::AttachedFile,
     inference::{BackendConnections, GenerationDetails, InferenceBackend},
     tools::web_search::WebSource,
 };
@@ -30,6 +31,7 @@ pub enum Correspondence {
     User {
         text: String,
         images: Vec<ChatImage>,
+        files: Vec<Arc<AttachedFile>>,
     },
 }
 
@@ -49,6 +51,9 @@ pub struct SavedChat {
     pub pinned: bool,
     pub context: Vec<String>,
     pub messages: Vec<StoredMessage>,
+    /// Extracted document snapshots, indexed by message. Older chats have none.
+    #[serde(default)]
+    pub files: Vec<Vec<Arc<AttachedFile>>>,
     /// Metadata is kept separately so older `role`/`text` chat files remain readable.
     #[serde(default)]
     pub models: Vec<Option<String>>,
@@ -89,6 +94,14 @@ impl SavedChat {
             updated_at: Local::now().to_rfc3339(),
             pinned: false,
             context: chat.chats.clone(),
+            files: chat
+                .messages
+                .iter()
+                .map(|message| match message {
+                    Correspondence::User { files, .. } => files.clone(),
+                    Correspondence::Bot { .. } => Vec::new(),
+                })
+                .collect(),
             messages: chat
                 .messages
                 .iter()
@@ -172,6 +185,7 @@ impl SavedChat {
                     StoredMessage::User(text) => Correspondence::User {
                         text: text.clone(),
                         images: Vec::new(),
+                        files: self.files.get(index).cloned().unwrap_or_default(),
                     },
                     StoredMessage::Bot(text) => Correspondence::Bot {
                         text: text.clone(),
@@ -206,6 +220,7 @@ mod saved_chat_tests {
         let chat: SavedChat = serde_json::from_str(json).unwrap();
         assert!(!chat.pinned);
         assert!(chat.models.is_empty());
+        assert!(chat.files.is_empty());
         assert!(chat.thinking_seconds.is_empty());
         assert!(chat.tokens_per_second.is_empty());
         assert!(chat.generation_details.is_empty());
@@ -223,6 +238,10 @@ mod saved_chat_tests {
                 Correspondence::User {
                     text: "Question".into(),
                     images: Vec::new(),
+                    files: vec![crate::file_usage::fixture(
+                        "guide.pdf",
+                        &["Page one", "Page two"],
+                    )],
                 },
                 Correspondence::Bot {
                     text: "<think>Work</think>Answer".into(),
@@ -257,7 +276,13 @@ mod saved_chat_tests {
         assert_eq!(saved.profile.as_deref(), Some("profile-1"));
         assert_eq!(saved.tokens_per_second, vec![None, Some(18.75)]);
         assert_eq!(saved.generation_details[1].unwrap().output_tokens, Some(75));
+        let saved: SavedChat =
+            serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
         let reopened = saved.to_current();
+        assert!(
+            matches!(&reopened.messages[0], Correspondence::User { files, .. }
+            if files.len() == 1 && files[0].pages[1].text == "Page two")
+        );
         assert!(matches!(
             &reopened.messages[1],
             Correspondence::Bot {

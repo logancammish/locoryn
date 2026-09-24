@@ -710,6 +710,7 @@ fn conversation_search_can_retry_with_a_broader_query_and_then_answer() {
         context_tokens: 4_096,
         max_response_tokens: 512,
         images: Vec::new(),
+        attached_files: Vec::new(),
         thinking: serde_json::Value::Bool(false),
         settings: WebSearchSettings::default(),
         tool_settings: crate::tools::ToolSettings {
@@ -832,6 +833,7 @@ fn ollama_inference_does_not_use_the_external_web_timeout() {
         context_tokens: 4_096,
         max_response_tokens: 512,
         images: Vec::new(),
+        attached_files: Vec::new(),
         thinking: serde_json::Value::Bool(false),
         settings: WebSearchSettings {
             enabled: true,
@@ -903,6 +905,7 @@ fn openvino_inference_reads_openai_compatible_sse() {
         context_tokens: 4_096,
         max_response_tokens: 512,
         images: Vec::new(),
+        attached_files: Vec::new(),
         thinking: serde_json::Value::Bool(true),
         settings: WebSearchSettings {
             enabled: true,
@@ -933,6 +936,389 @@ fn openvino_inference_reads_openai_compatible_sse() {
         "OpenVINO ready"
     );
     server.join().unwrap();
+}
+
+fn fallback_test_server(
+    responses: Vec<(&'static str, String)>,
+) -> (String, thread::JoinHandle<Vec<serde_json::Value>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let server = thread::spawn(move || {
+        let mut requests = Vec::new();
+        for (status, body) in responses {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "expected a fallback request");
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("mock server failed: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let payload = read_http_request_bytes(&mut stream);
+            let header_end = payload
+                .windows(4)
+                .position(|part| part == b"\r\n\r\n")
+                .unwrap();
+            requests.push(serde_json::from_slice(&payload[header_end + 4..]).unwrap());
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            ).unwrap();
+        }
+        requests
+    });
+    (format!("http://{address}/v3/chat/completions"), server)
+}
+
+fn fallback_test_request(chat_url: String) -> ToolLoopRequest {
+    ToolLoopRequest {
+        backend: InferenceBackend::OpenVino,
+        chat_url,
+        model: "qwen3-4b-npu".into(),
+        prompt: "Earlier conversation context\nUser: hello".into(),
+        user_prompt: "hello".into(),
+        system_prompt: "Be helpful and concise.".into(),
+        temperature: 0.3,
+        top_p: 0.9,
+        top_k: 40,
+        context_tokens: 32_768,
+        max_response_tokens: 1_048_576,
+        images: vec![EncodedImage {
+            mime_type: "image/png".into(),
+            data: "attached-image".into(),
+        }],
+        attached_files: Vec::new(),
+        thinking: serde_json::json!("low"),
+        settings: WebSearchSettings::default(),
+        tool_settings: crate::tools::ToolSettings::default().for_chat_web_enabled(false),
+        code_checking_enabled: false,
+        provider: None,
+        state_sender: crossbeam_channel::unbounded().0,
+        progress_sender: progress_sender(),
+        cancel: Arc::new(AtomicBool::new(false)),
+        chat_storage_dir: None,
+        conversation_profile_id: crate::app::LEGACY_PROFILE_ID.into(),
+    }
+}
+
+fn fallback_test_answer() -> String {
+    concat!(
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Brief thought\",\"content\":\"Hello!\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3}}\n\n",
+        "data: [DONE]\n\n"
+    ).into()
+}
+
+#[test]
+fn document_tools_read_a_pdf_page_and_preserve_call_ids() {
+    let _loopback_guard = LOOPBACK_TEST_LOCK.lock().unwrap();
+    let call = serde_json::json!({"choices":[{"delta":{"tool_calls":[{
+        "index":0,"id":"read-page-2","type":"function","function":{
+            "name":"read_attached_file","arguments":r#"{"file_id":"guide.pdf","page":2}"#
+        }
+    }]},"finish_reason":"tool_calls"}]})
+    .to_string();
+    let (url, server) = fallback_test_server(vec![
+        ("200 OK", format!("data: {call}\n\ndata: [DONE]\n\n")),
+        ("200 OK", fallback_test_answer()),
+    ]);
+    let mut request = fallback_test_request(url);
+    request.images.clear();
+    request.tool_settings.conversation_search = false;
+    request.attached_files = vec![crate::file_usage::fixture(
+        "guide.pdf",
+        &["First page", "Second page secret: MAPLE"],
+    )];
+    request
+        .prompt
+        .push_str(&crate::file_usage::context::prompt_context(
+            &request.attached_files,
+            "Read page 2",
+            4096,
+        ));
+    let result = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(run_tool_loop(request))
+        .unwrap();
+    assert!(!result.answer.is_empty());
+    assert!(result.sources.is_empty());
+    let requests = server.join().unwrap();
+    assert_eq!(requests[0]["tools"].as_array().unwrap().len(), 3);
+    let message = requests[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .unwrap();
+    assert_eq!(message["tool_call_id"], "read-page-2");
+    let content: serde_json::Value =
+        serde_json::from_str(message["content"].as_str().unwrap()).unwrap();
+    assert_eq!(content["page"], 2);
+    assert_eq!(content["text"], "Second page secret: MAPLE");
+}
+
+#[test]
+fn unsupported_document_tools_fall_back_to_plain_text() {
+    let _loopback_guard = LOOPBACK_TEST_LOCK.lock().unwrap();
+    let (url, server) = fallback_test_server(vec![
+        (
+            "400 Bad Request",
+            r#"{"error":{"message":"Tool parser is not configured"}}"#.into(),
+        ),
+        ("200 OK", fallback_test_answer()),
+    ]);
+    let mut request = fallback_test_request(url);
+    request.images.clear();
+    request.attached_files = vec![crate::file_usage::fixture(
+        "main.rs",
+        &["fn unique_marker() {}"],
+    )];
+    request
+        .prompt
+        .push_str(&crate::file_usage::context::prompt_context(
+            &request.attached_files,
+            "Explain this code",
+            4096,
+        ));
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(run_tool_loop(request))
+        .unwrap();
+    let requests = server.join().unwrap();
+    assert!(requests[1].get("tools").is_none());
+    assert!(
+        requests[1]["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("fn unique_marker() {}")
+    );
+}
+
+#[test]
+fn compact_web_fallback_preserves_attached_file_text() {
+    let mut request = fallback_test_request("http://unused".into());
+    request.images.clear();
+    request.attached_files = vec![crate::file_usage::fixture(
+        "notes.md",
+        &["Local document marker"],
+    )];
+    let messages = super::tool_loop::compact_web_synthesis_messages(&request, &[], 700);
+    assert!(
+        messages[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Local document marker")
+    );
+}
+
+#[test]
+fn documents_work_with_tools_disabled_and_retry_a_smaller_context_once() {
+    let _loopback_guard = LOOPBACK_TEST_LOCK.lock().unwrap();
+    let overflow =
+        r#"{"error":{"message":"Input length exceeds the maximum allowed length"}}"#.to_string();
+    let (url, server) = fallback_test_server(vec![
+        ("400 Bad Request", overflow),
+        ("200 OK", fallback_test_answer()),
+    ]);
+    let mut request = fallback_test_request(url);
+    request.images.clear();
+    request.tool_settings.enabled = false;
+    request.attached_files = vec![crate::file_usage::fixture(
+        "notes.md",
+        &[&"marker in local file\n".repeat(4_000)],
+    )];
+    request
+        .prompt
+        .push_str(&crate::file_usage::context::prompt_context(
+            &request.attached_files,
+            "Explain marker",
+            32_768,
+        ));
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(run_tool_loop(request))
+        .unwrap();
+    let requests = server.join().unwrap();
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.get("tools").is_none())
+    );
+    let first = requests[0]["messages"][1]["content"].as_str().unwrap();
+    let compact = requests[1]["messages"][1]["content"].as_str().unwrap();
+    assert!(compact.len() < first.len());
+    assert!(compact.contains("marker in local file"));
+    assert!(compact.contains("shortened document excerpts"));
+    assert_eq!(requests[1]["messages"][0], requests[0]["messages"][0]);
+}
+
+#[test]
+#[ignore = "requires LOCORYN_TEST_OPENVINO_URL and LOCORYN_TEST_OPENVINO_MODEL"]
+fn live_openvino_hello_with_default_local_tools() {
+    let url = std::env::var("LOCORYN_TEST_OPENVINO_URL").expect("set the chat endpoint URL");
+    let mut request = fallback_test_request(url);
+    request.model =
+        std::env::var("LOCORYN_TEST_OPENVINO_MODEL").expect("set a deployed model name");
+    request.prompt = "hello".into();
+    request.images.clear();
+    request.max_response_tokens = 512;
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let result = runtime
+        .block_on(async {
+            tokio::time::timeout(Duration::from_secs(45), run_tool_loop(request)).await
+        })
+        .expect("live OpenVINO request timed out")
+        .expect("live OpenVINO request failed");
+    assert!(!result.answer.trim().is_empty());
+    assert!(result.sources.is_empty());
+    println!(
+        "OpenVINO returned a visible answer; prompt tokens: {:?}, output tokens: {:?}",
+        result.generation_details.prompt_tokens, result.eval_count
+    );
+}
+
+#[test]
+fn openvino_with_web_off_recovers_from_rejected_or_empty_tool_requests() {
+    let _loopback_guard = LOOPBACK_TEST_LOCK.lock().unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    for (status, rejection) in [
+        (
+            "400 Bad Request",
+            r#"{"error":{"message":"Tool parser is not configured"}}"#,
+        ),
+        (
+            "400 Bad Request",
+            r#"{"error":{"message":"Invalid tools parameter"}}"#,
+        ),
+        (
+            "400 Bad Request",
+            r#"{"error":{"message":"Input length exceeds the maximum allowed length"}}"#,
+        ),
+        (
+            "200 OK",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        ),
+    ] {
+        let (url, server) = fallback_test_server(vec![
+            (status, rejection.into()),
+            ("200 OK", fallback_test_answer()),
+        ]);
+        let mut request = fallback_test_request(url);
+        let provider = Arc::new(CountingProvider(AtomicUsize::new(0)));
+        request.provider = Some(provider.clone());
+        let (progress_sender, progress_receiver) =
+            tokio::sync::watch::channel(ToolLoopProgress::default());
+        request.progress_sender = progress_sender;
+        let (state_sender, state_receiver) = crossbeam_channel::unbounded();
+        request.state_sender = state_sender;
+        let result = runtime.block_on(run_tool_loop(request)).unwrap();
+        let requests = server.join().unwrap();
+
+        assert!(
+            requests[0]["tools"]
+                .as_array()
+                .is_some_and(|tools| tools.len() == 1)
+        );
+        assert_eq!(
+            requests[0]["tools"][0]["function"]["name"],
+            "search_locoryn_conversations"
+        );
+        let fallback = &requests[1];
+        assert!(fallback.get("tools").is_none());
+        assert!(fallback.get("tool_choice").is_none());
+        assert_eq!(fallback["model"], "qwen3-4b-npu");
+        assert_eq!(
+            fallback["messages"][0]["content"],
+            "Be helpful and concise."
+        );
+        assert_eq!(
+            fallback["messages"][1]["content"][0]["text"],
+            "Earlier conversation context\nUser: hello"
+        );
+        assert_eq!(
+            fallback["messages"][1]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,attached-image"
+        );
+        assert_eq!(fallback["chat_template_kwargs"]["reasoning_effort"], "low");
+        assert_eq!(fallback["max_tokens"], 1_048_576);
+        assert_eq!(result.answer, "Hello!");
+        assert_eq!(result.thinking, "Brief thought");
+        assert_eq!(result.generation_details.prompt_tokens, Some(12));
+        assert_eq!(result.eval_count, Some(3));
+        assert!(result.sources.is_empty());
+        assert_eq!(provider.0.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(progress_receiver.borrow().answer, "Hello!");
+        assert_eq!(
+            state_receiver.try_iter().last(),
+            Some(WebSearchState::Completed)
+        );
+    }
+}
+
+#[test]
+fn openvino_fallback_preserves_real_server_errors_and_does_not_loop() {
+    let _loopback_guard = LOOPBACK_TEST_LOCK.lock().unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let detail = "max_tokens exceeds the server's generation limit";
+    let error = serde_json::json!({"error": {"message": detail}}).to_string();
+    let (url, server) = fallback_test_server(vec![
+        ("400 Bad Request", error.clone()),
+        ("400 Bad Request", error),
+    ]);
+    let result = runtime.block_on(run_tool_loop(fallback_test_request(url)));
+    assert!(
+        matches!(result, Err(WebSearchError::InferenceUnavailable(message)) if message.contains(detail))
+    );
+    assert_eq!(server.join().unwrap().len(), 2);
+}
+
+#[test]
+fn openvino_authentication_errors_do_not_retry_without_tools() {
+    let _loopback_guard = LOOPBACK_TEST_LOCK.lock().unwrap();
+    let (url, server) = fallback_test_server(vec![(
+        "401 Unauthorized",
+        r#"{"error":{"message":"invalid credentials"}}"#.into(),
+    )]);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let result = runtime.block_on(run_tool_loop(fallback_test_request(url)));
+    assert!(
+        matches!(result, Err(WebSearchError::InferenceUnavailable(message)) if message.contains("invalid credentials"))
+    );
+    assert_eq!(server.join().unwrap().len(), 1);
+}
+
+#[test]
+fn openvino_tool_rejection_keeps_explicit_web_search_available() {
+    let _loopback_guard = LOOPBACK_TEST_LOCK.lock().unwrap();
+    let (url, server) = fallback_test_server(vec![
+        (
+            "400 Bad Request",
+            r#"{"error":{"message":"Tool parser is not configured"}}"#.into(),
+        ),
+        ("200 OK", fallback_test_answer()),
+    ]);
+    let mut request = fallback_test_request(url);
+    request.settings.enabled = true;
+    request.tool_settings = crate::tools::ToolSettings::default();
+    request.user_prompt = "Search the web for the latest release".into();
+    let provider = Arc::new(QueryRecordingProvider {
+        queries: Mutex::new(Vec::new()),
+        pages: Mutex::new(Vec::new()),
+    });
+    request.provider = Some(provider.clone());
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let result = runtime.block_on(run_tool_loop(request)).unwrap();
+    assert_eq!(result.sources.len(), 1);
+    assert_eq!(provider.queries.lock().unwrap().len(), 1);
+    assert_eq!(server.join().unwrap().len(), 2);
 }
 
 #[test]
@@ -1040,6 +1426,7 @@ fn openvino_prompt_overflow_retries_with_compact_web_synthesis() {
         context_tokens: 131_072,
         max_response_tokens: 32_768,
         images: Vec::new(),
+        attached_files: Vec::new(),
         thinking: serde_json::Value::Bool(true),
         settings: WebSearchSettings {
             enabled: true,
@@ -1174,6 +1561,7 @@ fn tool_round_limit_forces_final_synthesis_without_losing_progress() {
         context_tokens: 4_096,
         max_response_tokens: 512,
         images: Vec::new(),
+        attached_files: Vec::new(),
         thinking: serde_json::Value::Bool(false),
         settings: WebSearchSettings {
             enabled: true,
@@ -1275,6 +1663,7 @@ fn empty_limit_synthesis_gets_a_clean_no_tools_recovery() {
         context_tokens: 4_096,
         max_response_tokens: 512,
         images: Vec::new(),
+        attached_files: Vec::new(),
         thinking: serde_json::Value::String("high".into()),
         settings: WebSearchSettings {
             enabled: true,
@@ -1457,6 +1846,7 @@ fn follow_up_research_rejects_one_broad_search_and_cross_references_sources() {
         context_tokens: 4_096,
         max_response_tokens: 512,
         images: Vec::new(),
+        attached_files: Vec::new(),
         thinking: serde_json::Value::Bool(false),
         settings: WebSearchSettings {
             enabled: true,
@@ -1781,4 +2171,278 @@ fn registrable_domain_falls_back_to_last_two_labels() {
 fn registrable_domain_handles_single_label() {
     assert_eq!(registrable_domain("localhost"), "localhost");
     assert_eq!(registrable_domain("myhost"), "myhost");
+}
+
+fn image_tool_response(backend: InferenceBackend, calls: Vec<serde_json::Value>) -> String {
+    if backend == InferenceBackend::Ollama {
+        serde_json::json!({"message":{"role":"assistant","content":"","tool_calls":calls},"done":true}).to_string()
+    } else {
+        let calls: Vec<_> = calls
+            .into_iter()
+            .enumerate()
+            .map(|(index, mut call)| {
+                call["index"] = serde_json::json!(index);
+                call["function"]["arguments"] =
+                    serde_json::Value::String(call["function"]["arguments"].to_string());
+                call
+            })
+            .collect();
+        let delta = serde_json::json!({"choices":[{"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}]});
+        format!("data: {delta}\n\ndata: [DONE]\n\n")
+    }
+}
+
+fn image_tool_call(id: &str, name: &str, arguments: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"id":id,"type":"function","function":{"name":name,"arguments":arguments}})
+}
+
+#[test]
+fn image_tool_loop_returns_pixels_after_all_tool_results_for_both_backends() {
+    use crate::tools::image_editing::{
+        conversation_images,
+        tests::{ffmpeg_available, fixture, image_message},
+    };
+    if !ffmpeg_available() {
+        eprintln!("Skipping image tool integration: FFmpeg is not installed.");
+        return;
+    }
+    let _guard = LOOPBACK_TEST_LOCK.lock().unwrap();
+    for backend in InferenceBackend::ALL {
+        let calls = vec![
+            image_tool_call(
+                "crop",
+                "edit_image",
+                serde_json::json!({"image_id":"image-1","operation":"crop","x":2,"y":1,"width":3,"height":4}),
+            ),
+            image_tool_call("list", "list_images", serde_json::json!({})),
+        ];
+        let second_calls = vec![image_tool_call(
+            "resize",
+            "edit_image",
+            serde_json::json!({"image_id":"image-2","operation":"resize","width":6,"height":8}),
+        )];
+        let answer = if backend == InferenceBackend::Ollama {
+            serde_json::json!({"message":{"role":"assistant","content":"Read the enlarged photo."},"done":true}).to_string()
+        } else {
+            fallback_test_answer()
+        };
+        let (url, server) = fallback_test_server(vec![
+            ("200 OK", image_tool_response(backend, calls)),
+            ("200 OK", image_tool_response(backend, second_calls)),
+            ("200 OK", answer),
+        ]);
+        let mut request = fallback_test_request(url);
+        request.backend = backend;
+        // A text-only follow-up must still supply the prior attachment to both
+        // the model and the image editor.
+        request.images =
+            conversation_images(&[image_message(&[fixture()]), image_message(&[])], true);
+        request.tool_settings.conversation_search = false;
+        request.tool_settings.image_editing_models =
+            vec![crate::tools::ToolSettings::image_model_key(
+                backend,
+                &request.model,
+            )];
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(run_tool_loop(request))
+            .unwrap();
+        assert!(!result.answer.is_empty());
+        let requests = server.join().unwrap();
+        let names: Vec<_> = requests[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["list_images", "edit_image"]);
+        let messages = requests[1]["messages"].as_array().unwrap();
+        let roles: Vec<_> = messages
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            roles,
+            vec!["system", "user", "assistant", "tool", "tool", "user"]
+        );
+        let crop: serde_json::Value =
+            serde_json::from_str(messages[3]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(crop["image_id"], "image-2");
+        assert_eq!(crop["width"], 3);
+        if backend == InferenceBackend::OpenVino {
+            assert_eq!(messages[3]["tool_call_id"], "crop");
+        }
+        let image = &messages[5];
+        match backend {
+            InferenceBackend::Ollama => assert!(!image["images"][0].as_str().unwrap().is_empty()),
+            InferenceBackend::OpenVino => assert!(
+                image["content"][1]["image_url"]["url"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("data:image/png;base64,")
+            ),
+        }
+        let last = requests[2]["messages"].as_array().unwrap();
+        let resized: serde_json::Value =
+            serde_json::from_str(last[last.len() - 2]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(resized["image_id"], "image-3");
+        assert_eq!(resized["source_image_id"], "image-2");
+        assert_eq!(resized["width"], 6);
+    }
+}
+
+#[test]
+fn image_tool_loop_rejects_unapproved_models_and_disabled_tools() {
+    let _guard = LOOPBACK_TEST_LOCK.lock().unwrap();
+    for master_enabled in [true, false] {
+        let call = image_tool_response(
+            InferenceBackend::OpenVino,
+            vec![image_tool_call(
+                "unauthorized",
+                "edit_image",
+                serde_json::json!({"image_id":"image-1","operation":"invert"}),
+            )],
+        );
+        let responses = if master_enabled {
+            vec![("200 OK", call), ("200 OK", fallback_test_answer())]
+        } else {
+            vec![("200 OK", fallback_test_answer())]
+        };
+        let (url, server) = fallback_test_server(responses);
+        let mut request = fallback_test_request(url);
+        if master_enabled {
+            request.tool_settings.image_editing_models = vec!["OpenVINO/different-bot".into()];
+        } else {
+            request.tool_settings.enabled = false;
+            request.tool_settings.image_editing_models =
+                vec![crate::tools::ToolSettings::image_model_key(
+                    request.backend,
+                    &request.model,
+                )];
+        }
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(run_tool_loop(request))
+            .unwrap();
+        let requests = server.join().unwrap();
+        assert!(!requests[0]["tools"].to_string().contains("edit_image"));
+        let messages = requests.last().unwrap()["messages"].as_array().unwrap();
+        if master_enabled {
+            let error = messages.iter().find(|m| m["role"] == "tool").unwrap();
+            assert!(error["content"].as_str().unwrap().contains("disabled"));
+        }
+        assert_eq!(messages.iter().filter(|m| m["role"] == "user").count(), 1);
+    }
+}
+
+#[test]
+fn image_tools_are_discoverable_without_attachments_for_both_backends() {
+    let _guard = LOOPBACK_TEST_LOCK.lock().unwrap();
+    for backend in InferenceBackend::ALL {
+        let calls = vec![
+            image_tool_call("list", "list_images", serde_json::json!({})),
+            image_tool_call(
+                "edit",
+                "edit_image",
+                serde_json::json!({"image_id":"image-1","operation":"invert"}),
+            ),
+        ];
+        let answer = if backend == InferenceBackend::Ollama {
+            serde_json::json!({"message":{"role":"assistant","content":"Please attach an image to edit."},"done":true}).to_string()
+        } else {
+            fallback_test_answer()
+        };
+        let (url, server) = fallback_test_server(vec![
+            ("200 OK", image_tool_response(backend, calls)),
+            ("200 OK", answer),
+        ]);
+        let mut request = fallback_test_request(url);
+        request.backend = backend;
+        request.images.clear();
+        request.tool_settings.conversation_search = false;
+        request.tool_settings.image_editing_models =
+            vec![crate::tools::ToolSettings::image_model_key(
+                backend,
+                &request.model,
+            )];
+        assert!(request.tool_settings.any_tool_enabled());
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(run_tool_loop(request))
+            .unwrap();
+        let requests = server.join().unwrap();
+        let names: Vec<_> = requests[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["list_images", "edit_image"]);
+        assert!(
+            requests[0]["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Image editing is enabled")
+        );
+        let messages = requests[1]["messages"].as_array().unwrap();
+        let listed: serde_json::Value =
+            serde_json::from_str(messages[3]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(listed, serde_json::json!({"images":[]}));
+        let edit: serde_json::Value =
+            serde_json::from_str(messages[4]["content"].as_str().unwrap()).unwrap();
+        assert!(edit["error"].as_str().unwrap().contains("attach an image"));
+        assert_eq!(messages.iter().filter(|m| m["role"] == "user").count(), 1);
+    }
+}
+
+#[test]
+fn image_tool_fallback_keeps_latest_edited_pixels() {
+    use crate::tools::image_editing::tests::{ffmpeg_available, fixture};
+    if !ffmpeg_available() {
+        return;
+    }
+    let _guard = LOOPBACK_TEST_LOCK.lock().unwrap();
+    let call = image_tool_response(
+        InferenceBackend::OpenVino,
+        vec![image_tool_call(
+            "edit",
+            "edit_image",
+            serde_json::json!({"image_id":"image-1","operation":"invert"}),
+        )],
+    );
+    let (url, server) = fallback_test_server(vec![
+        ("200 OK", call),
+        (
+            "400 Bad Request",
+            r#"{"error":{"message":"Tool parser is not configured"}}"#.into(),
+        ),
+        ("200 OK", fallback_test_answer()),
+    ]);
+    let mut request = fallback_test_request(url);
+    request.images = vec![fixture()];
+    request.tool_settings.conversation_search = false;
+    request.tool_settings.image_editing_models = vec![crate::tools::ToolSettings::image_model_key(
+        request.backend,
+        &request.model,
+    )];
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(run_tool_loop(request))
+        .unwrap();
+    let requests = server.join().unwrap();
+    assert!(requests[2].get("tools").is_none());
+    let messages = requests[2]["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 3);
+    assert!(
+        messages[2]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("image-2")
+    );
+    assert!(
+        messages[2]["content"][1]["image_url"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,")
+    );
 }

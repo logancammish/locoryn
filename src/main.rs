@@ -18,6 +18,10 @@ use iced_widget::markdown;
 use ollama_rs::Ollama;
 use rustrict::{Censor, Type};
 mod app;
+mod chat_transcript;
+mod clipboard_images;
+mod conversation_title;
+mod file_usage;
 mod gui;
 mod inference;
 mod password;
@@ -29,8 +33,9 @@ use crate::app::{
     Language, Profile, ProfileRegistry, Prompt, SavedChat, SystemPrompt, ThinkingLevel,
     UserInformation,
 };
+use crate::conversation_title::{TitleRequest, next_clone_title};
 use crate::inference::{
-    BackendConnections, EncodedImage, GenerationDetails, InferenceBackend, OpenAiStreamLine,
+    BackendConnections, GenerationDetails, InferenceBackend, OpenAiStreamLine,
     api_url as backend_api_url, base_url as backend_base_url, decode_openai_stream_line,
     direct_request_body, model_names,
 };
@@ -290,6 +295,7 @@ enum Message {
     ToggleFetchWebpageTool,
     ToggleConversationSearchTool,
     ToggleCodeCheckingTool,
+    ToggleImageEditingModel,
     ToggleDeepResearchControls,
     ToggleChatWebSearch,
     WebSearchProviderChange(WebSearchProviderKind),
@@ -308,6 +314,7 @@ enum Message {
     OpenAppUpdate(String),
     UrlOpened(Result<(), String>),
     NewChat,
+    CloneChat,
     OpenChat(String),
     ToggleChatPin(String),
     DeleteChat(String),
@@ -318,13 +325,36 @@ enum Message {
     AsyncResult(()),
     ModelsLoaded(InferenceBackend, Result<Vec<String>, String>),
     PromptFinished(String),
+    ConversationTitleGenerated {
+        chat_id: String,
+        storage_dir: PathBuf,
+        temporary: bool,
+        result: Result<String, String>,
+    },
     ListPrompt,
     ThinkingLevelChange(ThinkingLevel),
     ToggleImages,
     PickImage,
-    DropImage(PathBuf),
+    PickFiles,
+    DropFile(PathBuf),
+    FilesLoaded {
+        batch_id: String,
+        results: Vec<Result<LoadedAttachment, String>>,
+    },
+    CancelFileLoad,
+    RemoveFile(usize),
+    PreviewFile(Arc<file_usage::AttachedFile>),
+    FilePreviewPage(usize),
+    FilePreviewOffset(usize),
+    CloseFilePreview,
     PasteImage,
-    ImageLoaded(Result<ChatImage, String>),
+    PastePrompt,
+    ClipboardPasted {
+        chat_id: String,
+        text: Option<String>,
+        images: Result<Vec<ChatImage>, String>,
+        explicit_image: bool,
+    },
     ImagesLoaded(Result<Vec<ChatImage>, String>),
     MarkdownImageLoaded {
         url: String,
@@ -339,8 +369,6 @@ enum Message {
     EditPrompt(iced::widget::text_editor::Action),
     UseSuggestion(String),
     None,
-    KeyPressed(keyboard::Key, keyboard::Modifiers),
-    KeyReleased(keyboard::Key),
     StartUiResize(UiResizeTarget),
     UiResizeMoved(Point),
     StopUiResize,
@@ -348,6 +376,9 @@ enum Message {
     FrameTick,
     Tick,
     CopyResponse(usize),
+    SelectConversation,
+    ClearConversationSelection,
+    CopyChatTranscript,
     CopyCode(CodeCopyScope, usize),
     ToggleThinking(usize),
     ToggleSources(usize),
@@ -387,6 +418,7 @@ enum Message {
     LanguageChange(Language),
     ToggleInfoPopup,
     ToggleChatHistory,
+    ToggleAutomaticConversationTitles,
     ToggleFiltering,
     InterfaceThemeChange(InterfaceTheme),
     ToggleShowTokensPerSecond,
@@ -421,6 +453,7 @@ impl Message {
             | Self::ToggleFetchWebpageTool
             | Self::ToggleConversationSearchTool
             | Self::ToggleCodeCheckingTool
+            | Self::ToggleImageEditingModel
             | Self::WebSearchProviderChange(_)
             | Self::WebSearchApiKeyChange(_)
             | Self::WebSearchResultLimitChange(_)
@@ -452,6 +485,7 @@ impl Message {
             | Self::ThinkingLevelChange(_)
             | Self::InterfaceThemeChange(_)
             | Self::ToggleChatHistory
+            | Self::ToggleAutomaticConversationTitles
             | Self::WipeChatHistory => Some(ProtectedSettingsArea::Standard),
             Self::ChangeBatchTokens(_)
             | Self::ToggleFastStreaming
@@ -471,6 +505,8 @@ impl Message {
 }
 
 struct ActivePrompt {
+    title_request: Option<TitleRequest>,
+    conversation_title: Option<String>,
     chat_history: Arc<Mutex<CurrentChat>>,
     response_text: String,
     thinking_text: String,
@@ -516,6 +552,7 @@ struct GenerationChunk {
 }
 
 struct TemporaryChatSession {
+    title: Option<String>,
     chat_history: Arc<Mutex<CurrentChat>>,
     web_search_enabled: bool,
     profile_id: String,
@@ -544,6 +581,18 @@ enum AppUpdateState {
 
 struct VisionResponse {
     markdown: Vec<markdown::Item>,
+}
+
+#[derive(Clone, Debug)]
+enum LoadedAttachment {
+    Image(ChatImage),
+    File(Arc<file_usage::AttachedFile>),
+}
+
+struct FilePreview {
+    file: Arc<file_usage::AttachedFile>,
+    page: usize,
+    offset: usize,
 }
 
 #[derive(Clone)]
@@ -587,8 +636,13 @@ struct Program {
     /// Used for brief copy feedback animations/buttons.
     last_copied_text: Option<String>,
     last_copied_at: Option<Instant>,
+    conversation_selected: bool,
 
     pending_images: Vec<ChatImage>,
+    pending_files: Vec<Arc<file_usage::AttachedFile>>,
+    loading_files: Option<(String, Arc<AtomicBool>)>,
+    queued_file_paths: Vec<PathBuf>,
+    file_preview: Option<FilePreview>,
     vision_responses: HashMap<String, VisionResponse>,
     markdown_images: HashMap<String, MarkdownImageState>,
 
@@ -608,6 +662,7 @@ struct Program {
     prompt: Prompt,
     batch_tokens: i32,
     fast_streaming: bool,
+    automatic_conversation_titles: bool,
     /// Persisted setting that shows the generation speed under each reply.
     show_tokens_per_second: bool,
     chat_menu_open: bool,
@@ -1720,34 +1775,6 @@ fn load_chat_image(path: &Path) -> Result<ChatImage, String> {
     })
 }
 
-fn paste_chat_image() -> Result<ChatImage, String> {
-    let mut clipboard =
-        arboard::Clipboard::new().map_err(|error| format!("Could not open clipboard: {error}"))?;
-    let image_data = clipboard
-        .get_image()
-        .map_err(|_| "The clipboard does not contain an image.".to_string())?;
-    let rgba = image::RgbaImage::from_raw(
-        image_data.width as u32,
-        image_data.height as u32,
-        image_data.bytes.into_owned(),
-    )
-    .ok_or_else(|| "Clipboard image data was invalid.".to_string())?;
-    let mut bytes = Vec::new();
-    image::DynamicImage::ImageRgba8(rgba)
-        .write_to(
-            &mut std::io::Cursor::new(&mut bytes),
-            image::ImageFormat::Png,
-        )
-        .map_err(|error| format!("Could not prepare clipboard image: {error}"))?;
-    let preview_handle = decoded_image_handle(&bytes)?;
-    Ok(ChatImage {
-        name: "Pasted image.png".to_string(),
-        mime_type: "image/png".to_string(),
-        bytes,
-        preview_handle,
-    })
-}
-
 fn version_components(version: &str) -> Option<Vec<u64>> {
     let version = version.trim().trim_start_matches(['v', 'V']);
     let stable = version.split(['-', '+']).next()?;
@@ -2013,6 +2040,8 @@ impl Program {
     }
 
     fn clear_open_chat(&mut self) {
+        self.clear_file_draft();
+        self.conversation_selected = false;
         self.user_information.chat_history = Arc::new(Mutex::new(CurrentChat {
             chats: vec![],
             messages: vec![],
@@ -2072,6 +2101,7 @@ impl Program {
             .unwrap_or_else(|| "New chat".into());
         let mut saved = SavedChat::from_current(id, title, chat, web_search_enabled, profile);
         if let Some(existing) = self.saved_chats.iter_mut().find(|item| item.id == saved.id) {
+            saved.title.clone_from(&existing.title);
             saved.pinned = existing.pinned;
             // A chat never changes profile when it is updated.
             if existing.profile.is_some() {
@@ -2364,22 +2394,187 @@ impl Program {
                 .map(|(_, web_search_enabled)| web_search_enabled)
                 .or(saved_web_search_enabled)
                 .unwrap_or(self.new_chat_web_search);
-            self.user_information.chat_history = chat_history;
-            self.open_chat_dirty = false;
-            // Rendering caches are positional and belong only to the
-            // previously open chat.
-            self.chat_messages_cache.clear();
-            self.chat_thinking_cache.clear();
-            self.chat_visible_text_cache.clear();
-            self.chat_markdown_cache.clear();
-            self.chat_model_name_cache.clear();
-            self.expanded_thinking.clear();
-            self.expanded_sources.clear();
-            self.last_copied_text = None;
-            self.last_copied_at = None;
-            self.refresh_chat_markdown_cache();
-            self.begin_page_transition();
+            self.load_open_chat_history(chat_history);
         }
+        self.queue_missing_markdown_images()
+    }
+
+    fn load_open_chat_history(&mut self, chat_history: Arc<Mutex<CurrentChat>>) {
+        self.clear_file_draft();
+        self.conversation_selected = false;
+        self.user_information.chat_history = chat_history;
+        self.open_chat_dirty = false;
+        // Rendering caches are positional and belong only to the previously open chat.
+        self.chat_messages_cache.clear();
+        self.chat_thinking_cache.clear();
+        self.chat_visible_text_cache.clear();
+        self.chat_markdown_cache.clear();
+        self.chat_model_name_cache.clear();
+        self.expanded_thinking.clear();
+        self.expanded_sources.clear();
+        self.last_copied_text = None;
+        self.last_copied_at = None;
+        self.refresh_chat_markdown_cache();
+        self.begin_page_transition();
+    }
+
+    fn cancel_file_load(&mut self) {
+        self.queued_file_paths.clear();
+        if let Some((_, cancel)) = self.loading_files.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn clear_file_draft(&mut self) {
+        self.cancel_file_load();
+        self.pending_files.clear();
+        self.pending_images.clear();
+        self.file_preview = None;
+    }
+
+    fn load_attachments(&mut self, paths: Option<Vec<PathBuf>>) -> Task<Message> {
+        if self.loading_files.is_some() {
+            if let Some(paths) = paths {
+                self.queued_file_paths
+                    .extend(paths.into_iter().take(file_usage::MAX_ATTACHMENTS));
+            }
+            return Task::none();
+        }
+        let capacity = file_usage::MAX_ATTACHMENTS
+            .saturating_sub(self.pending_files.len() + self.pending_images.len());
+        if capacity == 0 {
+            self.set_debug_message(DebugMessage {
+                message: "Attach at most 8 files per message.".into(),
+                is_error: true,
+            });
+            return Task::none();
+        }
+        let batch_id = file_usage::new_id();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.loading_files = Some((batch_id.clone(), Arc::clone(&cancel)));
+        Task::perform(
+            async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    let paths = paths.or_else(|| {
+                        rfd::FileDialog::new()
+                            .set_title("Attach documents, code, PDFs or images")
+                            .pick_files()
+                    }).unwrap_or_default();
+                    let mut results = Vec::new();
+                    if paths.len() > capacity {
+                        results.push(Err(format!(
+                            "Only the first {capacity} files were selected (8 attachments per message)."
+                        )));
+                    }
+                    for path in paths.into_iter().take(capacity) {
+                        if cancel.load(Ordering::Relaxed) { break; }
+                        let is_image = path.extension().and_then(|extension| extension.to_str())
+                            .is_some_and(|extension| matches!(extension.to_ascii_lowercase().as_str(),
+                                "png" | "jpg" | "jpeg" | "webp" | "gif"));
+                        let result = if is_image {
+                            load_chat_image(&path).map(LoadedAttachment::Image)
+                        } else {
+                            file_usage::load(&path, &cancel).map(LoadedAttachment::File)
+                        };
+                        results.push(result.map_err(|error| format!("{}: {error}",
+                            path.file_name().unwrap_or_default().to_string_lossy())));
+                    }
+                    results
+                }).await.unwrap_or_else(|error| {
+                    vec![Err(format!("File reader could not finish: {error}"))]
+                });
+                (batch_id, result)
+            },
+            |(batch_id, results)| Message::FilesLoaded { batch_id, results },
+        )
+    }
+
+    fn clone_open_chat(&mut self) -> Task<Message> {
+        if self.current_chat_is_processing() {
+            return Task::none();
+        }
+        let chat = self.user_information.chat_history.lock().unwrap().clone();
+        if chat.messages.is_empty() || chat.bot_responding {
+            return Task::none();
+        }
+        self.save_open_chat();
+
+        let saved = self
+            .saved_chats
+            .iter()
+            .find(|chat| chat.id == self.current_chat_id);
+        let temporary = self.temporary_chats.get(&self.current_chat_id);
+        let title = if self.temporary_chat {
+            temporary.and_then(|chat| chat.title.clone())
+        } else {
+            saved.map(|chat| chat.title.clone())
+        }
+        .or_else(|| {
+            chat.messages.iter().find_map(|message| match message {
+                Correspondence::User { text, .. } => Some(text.trim().chars().take(42).collect()),
+                _ => None,
+            })
+        })
+        .filter(|title: &String| !title.is_empty())
+        .unwrap_or_else(|| "New chat".into());
+        let profile = if self.temporary_chat {
+            temporary.map(|chat| chat.profile_id.as_str())
+        } else {
+            saved.map(chat_profile_id)
+        }
+        .unwrap_or(&self.active_profile_id)
+        .to_string();
+        let titles = self
+            .saved_chats
+            .iter()
+            .filter(|chat| chat_profile_id(chat) == profile)
+            .map(|chat| chat.title.as_str())
+            .chain(
+                self.temporary_chats
+                    .values()
+                    .filter(|chat| chat.profile_id == profile)
+                    .filter_map(|chat| chat.title.as_deref()),
+            )
+            .chain(
+                self.active_prompts
+                    .values()
+                    .filter(|job| job.profile_id == profile)
+                    .filter_map(|job| job.conversation_title.as_deref()),
+            );
+        let title = next_clone_title(&title, titles);
+        let id = Self::new_chat_id();
+        let chat_history = Arc::new(Mutex::new(chat));
+        if self.temporary_chat {
+            self.temporary_chats.insert(
+                id.clone(),
+                TemporaryChatSession {
+                    title: Some(title),
+                    chat_history: Arc::clone(&chat_history),
+                    web_search_enabled: self.web_search_for_chat,
+                    profile_id: profile,
+                },
+            );
+        } else {
+            let saved = SavedChat::from_current(
+                id.clone(),
+                title,
+                &chat_history.lock().unwrap(),
+                self.web_search_for_chat,
+                profile,
+            );
+            let insert_at = self
+                .saved_chats
+                .iter()
+                .position(|chat| !chat.pinned)
+                .unwrap_or(self.saved_chats.len());
+            self.saved_chats.insert(insert_at, saved);
+            self.persist_saved_chats();
+        }
+        self.current_chat_id = id;
+        self.chat_row_menu = None;
+        self.hovered_chat_row = None;
+        // Open the independent snapshot directly so in-memory image attachments survive.
+        self.load_open_chat_history(chat_history);
         self.queue_missing_markdown_images()
     }
 
@@ -2517,6 +2712,21 @@ impl Program {
             .nth(code_block_index)
     }
 
+    fn current_chat_transcript(&self) -> String {
+        let chat = self.user_information.chat_history.lock().unwrap();
+        let live_reply = self.current_active_prompt().and_then(|job| {
+            // The worker may already have committed its final reply before the
+            // UI receives PromptFinished. Do not append that reply twice.
+            let reply_stored = chat
+                .messages
+                .iter()
+                .skip(job.response_start_index)
+                .any(|message| matches!(message, Correspondence::Bot { .. }));
+            (!reply_stored).then_some((job.response_text.as_str(), job.model_name.as_str()))
+        });
+        chat_transcript::format_transcript(&chat.messages, live_reply)
+    }
+
     fn copy_text(&mut self, input: Option<String>) -> Task<Message> {
         let Some(input) = input.filter(|input| !input.trim().is_empty()) else {
             self.set_debug_message(DebugMessage {
@@ -2618,9 +2828,9 @@ impl Program {
         }
     }
 
-    fn finish_prompt(&mut self, chat_id: &str) {
+    fn finish_prompt(&mut self, chat_id: &str) -> Task<Message> {
         let Some(job) = self.active_prompts.remove(chat_id) else {
-            return;
+            return Task::none();
         };
         Self::finalize_response_metadata(&job);
 
@@ -2629,6 +2839,7 @@ impl Program {
             self.temporary_chats.insert(
                 chat_id.to_string(),
                 TemporaryChatSession {
+                    title: job.conversation_title.clone(),
                     chat_history: Arc::clone(&job.chat_history),
                     web_search_enabled: job.web_search_enabled,
                     profile_id: job.profile_id.clone(),
@@ -2669,6 +2880,74 @@ impl Program {
             self.refresh_chat_markdown_cache();
             self.open_chat_dirty = false;
         }
+
+        if self.automatic_conversation_titles
+            && !job.cancel.load(Ordering::Relaxed)
+            && let Some(request) = job.title_request
+        {
+            let chat_id = chat_id.to_string();
+            let storage_dir = self.chat_storage_dir.clone();
+            return Task::perform(request.generate(), move |result| {
+                Message::ConversationTitleGenerated {
+                    chat_id: chat_id.clone(),
+                    storage_dir: storage_dir.clone(),
+                    temporary: job.temporary,
+                    result,
+                }
+            });
+        }
+        Task::none()
+    }
+
+    fn apply_token_limits_before_prompt(&mut self) -> bool {
+        if self.password_protection.protects_standard_settings()
+            && !self.password_protection.unlocked
+        {
+            // Locking settings must not let an unapplied draft change the
+            // protected configuration when an ordinary chat is sent.
+            self.max_response_tokens_input = self.user_information.max_response_tokens.to_string();
+            self.context_tokens_input = self.user_information.context_tokens.to_string();
+            return true;
+        }
+        let limits = [
+            (
+                "Maximum response",
+                self.max_response_tokens_input.trim().parse::<u32>().ok(),
+                MIN_RESPONSE_TOKENS,
+                MAX_RESPONSE_TOKENS,
+            ),
+            (
+                "Context window",
+                self.context_tokens_input.trim().parse::<u32>().ok(),
+                MIN_CONTEXT_TOKENS,
+                MAX_CONTEXT_TOKENS,
+            ),
+        ];
+        let mut parsed = [0; 2];
+        for (index, (name, input, minimum, maximum)) in limits.into_iter().enumerate() {
+            match input {
+                Some(tokens) if (minimum..=maximum).contains(&tokens) => parsed[index] = tokens,
+                _ => {
+                    self.set_debug_message(DebugMessage {
+                        message: format!("{name} must be between {minimum} and {maximum} tokens."),
+                        is_error: true,
+                    });
+                    return false;
+                }
+            }
+        }
+        let [max_response_tokens, context_tokens] = parsed;
+        if self.user_information.max_response_tokens != max_response_tokens {
+            self.user_information.max_response_tokens = max_response_tokens;
+            self.persist_setting_value("max_response_tokens", max_response_tokens.into());
+        }
+        if self.user_information.context_tokens != context_tokens {
+            self.user_information.context_tokens = context_tokens;
+            self.persist_setting_value("context_tokens", context_tokens.into());
+        }
+        self.max_response_tokens_input = max_response_tokens.to_string();
+        self.context_tokens_input = context_tokens.to_string();
+        true
     }
 
     fn prompt(&mut self, mut prompt: String) -> Task<Message> {
@@ -2829,14 +3108,7 @@ impl Program {
         // copy until the submission has been accepted, avoiding a transient blank
         // preview while the async request is being prepared.
         let attached_images = self.pending_images.clone();
-        let encoded_images = attached_images
-            .iter()
-            .map(|image| EncodedImage {
-                mime_type: image.mime_type.clone(),
-                data: BASE64.encode(&image.bytes),
-            })
-            .collect::<Vec<_>>();
-        let had_image = !attached_images.is_empty();
+        let attached_files = self.pending_files.clone();
         let filtering = self.app_state.filtering;
         let code_checking_enabled = self.code_checking_enabled;
         let user_info = self.user_information.clone();
@@ -2871,18 +3143,42 @@ impl Program {
         let chat_storage_dir = self.chat_storage_dir.clone();
         self.chat_notices.remove(&chat_id);
 
-        let response_start_index = {
+        let (response_start_index, encoded_images) = {
             let mut chat = user_info.chat_history.lock().unwrap();
             chat.push_message(Correspondence::User {
                 text: prompt.clone(),
                 images: attached_images.clone(),
+                files: attached_files,
             });
-            chat.messages.len()
+            let images = crate::tools::image_editing::conversation_images(
+                &chat.messages,
+                user_info.current_chat_history_enabled && user_info.vision_supported != Some(false),
+            );
+            (chat.messages.len(), images)
         };
+        let had_image = !encoded_images.is_empty();
+        let title_request = (self.automatic_conversation_titles
+            && response_start_index == 1
+            && !prompt.trim().is_empty()
+            && !self.saved_chats.iter().any(|chat| chat.id == chat_id))
+        .then(|| {
+            TitleRequest::new(
+                backend,
+                backend_chat_url.clone(),
+                &model_name,
+                &prompt,
+                &user_info.thinking_levels,
+            )
+        });
+        let conversation_title = self
+            .temporary_chats
+            .get(&chat_id)
+            .and_then(|chat| chat.title.clone());
         self.open_chat_dirty = true;
 
         self.refresh_chat_markdown_cache();
         self.pending_images.clear();
+        self.pending_files.clear();
         user_info.chat_history.lock().unwrap().bot_responding = true;
         if self.temporary_chat {
             self.temporary_chats.remove(&chat_id);
@@ -2890,6 +3186,8 @@ impl Program {
         self.active_prompts.insert(
             chat_id,
             ActivePrompt {
+                title_request,
+                conversation_title,
                 chat_history: Arc::clone(&user_info.chat_history),
                 response_text: String::new(),
                 thinking_text: String::new(),
@@ -2915,8 +3213,15 @@ impl Program {
             async move {
                 println!("Received prompt: {}", prompt.clone());
 
-                let system_prompt: String = system_prompt.unwrap();
-                let to_send_prompt: String = if user_info.current_chat_history_enabled {
+                let mut system_prompt: String = system_prompt.unwrap();
+                let files = file_usage::context::conversation_files(
+                    &user_info.chat_history.lock().unwrap().messages,
+                    user_info.current_chat_history_enabled,
+                );
+                if !files.is_empty() {
+                    system_prompt.push_str(file_usage::context::GUIDANCE);
+                }
+                let mut to_send_prompt: String = if user_info.current_chat_history_enabled {
                     conversation_context_prompt(
                         &user_info.chat_history.lock().unwrap().unravel(),
                         &prompt_user_name,
@@ -2926,7 +3231,13 @@ impl Program {
                     prompt.clone()
                 };
 
-                if tool_settings.any_tool_enabled() {
+                to_send_prompt.push_str(&file_usage::context::prompt_context(
+                    &files,
+                    &prompt,
+                    user_info.context_tokens,
+                ));
+
+                if tool_settings.any_tool_enabled() || !files.is_empty() {
                     let provider = if tool_settings.web_tools_enabled() {
                         match create_search_provider(&web_search_settings) {
                             Ok(provider) => Some(provider),
@@ -2968,6 +3279,7 @@ impl Program {
                         context_tokens: user_info.context_tokens,
                         max_response_tokens: user_info.max_response_tokens,
                         images: encoded_images.clone(),
+                        attached_files: files,
                         thinking: user_info.thinking_level.api_value(),
                         settings: web_search_settings.clone(),
                         tool_settings: tool_settings.clone(),
@@ -3041,7 +3353,7 @@ impl Program {
                             let api_key = web_search_settings.resolved_api_key();
                             let message = error.detailed_user_message(api_key.as_deref());
                             eprintln!(
-                                "Web-search failure: {}",
+                                "Tool-enabled response failure: {}",
                                 error.diagnostic(api_key.as_deref())
                             );
                             let _ = web_search_state_sender.send(WebSearchState::Failed {
@@ -3057,7 +3369,7 @@ impl Program {
                             );
                             user_info.chat_history.lock().unwrap().push_message(
                                 Correspondence::Bot {
-                                    text: format!("Web search failed: {message}"),
+                                    text: format!("Response failed: {message}"),
                                     model: user_info.model.clone(),
                                     thinking_seconds: None,
                                     tokens_per_second: None,
@@ -3454,6 +3766,9 @@ impl Program {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        if self.app_state.gui_state != GUIState::Main {
+            self.conversation_selected = false;
+        }
         if let Some(area) = message.protected_settings_area() {
             let locked = match area {
                 ProtectedSettingsArea::Standard => {
@@ -3525,9 +3840,65 @@ impl Program {
             }
 
             Message::PromptFinished(chat_id) => {
-                self.finish_prompt(&chat_id);
+                let title_task = self.finish_prompt(&chat_id);
                 self.begin_page_transition();
-                self.queue_missing_markdown_images()
+                Task::batch([title_task, self.queue_missing_markdown_images()])
+            }
+
+            Message::ConversationTitleGenerated {
+                chat_id,
+                storage_dir,
+                temporary,
+                result,
+            } => {
+                if !self.automatic_conversation_titles {
+                    return Task::none();
+                }
+                // Ignore stale results from deleted chats or a different storage folder.
+                let chat_exists = if temporary {
+                    self.temporary_chats.contains_key(&chat_id)
+                        || self
+                            .active_prompts
+                            .get(&chat_id)
+                            .is_some_and(|job| job.temporary)
+                } else {
+                    storage_dir == self.chat_storage_dir
+                        && self.saved_chats.iter().any(|chat| chat.id == chat_id)
+                };
+                if !chat_exists {
+                    return Task::none();
+                }
+                if let Ok(title) = result {
+                    let title = if self.app_state.filtering {
+                        censor_text(&title)
+                    } else {
+                        title
+                    };
+                    if temporary {
+                        if let Some(job) = self
+                            .active_prompts
+                            .get_mut(&chat_id)
+                            .filter(|job| job.temporary)
+                        {
+                            job.conversation_title = Some(title.clone());
+                        }
+                        if let Some(chat) = self.temporary_chats.get_mut(&chat_id) {
+                            chat.title = Some(title);
+                        }
+                    } else if storage_dir == self.chat_storage_dir
+                        && let Some(chat) =
+                            self.saved_chats.iter_mut().find(|chat| chat.id == chat_id)
+                    {
+                        chat.title = title;
+                        self.persist_saved_chats();
+                    }
+                } else if let Err(error) = result {
+                    self.chat_notices.insert(chat_id, (DebugMessage {
+                        message: format!("Automatic title unavailable: {error} The current title was kept."),
+                        is_error: true,
+                    }, Instant::now()));
+                }
+                Task::none()
             }
 
             Message::None => Task::none(),
@@ -3556,43 +3927,177 @@ impl Program {
                 Message::ImagesLoaded,
             ),
 
-            Message::DropImage(path) => {
-                Task::perform(async move { load_chat_image(&path) }, Message::ImageLoaded)
+            Message::PickFiles => self.load_attachments(None),
+            Message::DropFile(path) => self.load_attachments(Some(vec![path])),
+            Message::CancelFileLoad => {
+                self.cancel_file_load();
+                Task::none()
             }
-
-            Message::PasteImage => {
-                Task::perform(async { paste_chat_image() }, Message::ImageLoaded)
-            }
-
-            Message::ImageLoaded(result) => {
-                match result {
-                    Ok(image) => {
-                        let name = image.name.clone();
-                        self.pending_images.push(image);
-                        self.set_debug_message(DebugMessage {
-                            message: format!("Attached {name}."),
-                            is_error: false,
-                        });
+            Message::FilesLoaded { batch_id, results } => {
+                if self
+                    .loading_files
+                    .as_ref()
+                    .is_none_or(|(current, _)| *current != batch_id)
+                {
+                    return Task::none();
+                }
+                self.loading_files = None;
+                let mut errors = Vec::new();
+                let mut count = 0;
+                let mut notices = false;
+                for result in results {
+                    match result {
+                        Ok(attachment) => {
+                            if self.pending_files.len() + self.pending_images.len()
+                                >= file_usage::MAX_ATTACHMENTS
+                            {
+                                errors.push("Attach at most 8 files per message.".to_string());
+                                break;
+                            }
+                            match attachment {
+                                LoadedAttachment::Image(image) => self.pending_images.push(image),
+                                LoadedAttachment::File(file) => {
+                                    notices |= file.has_notices();
+                                    self.pending_files.push(file);
+                                }
+                            }
+                            count += 1;
+                        }
+                        Err(error) => errors.push(error),
                     }
-                    Err(error) if error != "No image selected." => {
+                }
+                if count > 0 || !errors.is_empty() {
+                    self.set_debug_message(DebugMessage {
+                        message: format!("Attached {count} files. {}{}", errors.join("\n"),
+                            if notices { " Some PDF pages could not be fully read. Open the attachment for details." } else { "" }),
+                        is_error: !errors.is_empty() || notices,
+                    });
+                }
+                if !self.queued_file_paths.is_empty() {
+                    let paths = std::mem::take(&mut self.queued_file_paths);
+                    return self.load_attachments(Some(paths));
+                }
+                Task::none()
+            }
+            Message::RemoveFile(index) => {
+                if index < self.pending_files.len() {
+                    self.pending_files.remove(index);
+                }
+                Task::none()
+            }
+            Message::PreviewFile(file) => {
+                self.file_preview = Some(FilePreview {
+                    file,
+                    page: 0,
+                    offset: 0,
+                });
+                Task::none()
+            }
+            Message::FilePreviewPage(page) => {
+                if let Some(preview) = self.file_preview.as_mut()
+                    && page < preview.file.pages.len()
+                {
+                    preview.page = page;
+                    preview.offset = 0;
+                }
+                Task::none()
+            }
+            Message::FilePreviewOffset(offset) => {
+                if let Some(preview) = self.file_preview.as_mut() {
+                    preview.offset = offset;
+                }
+                Task::none()
+            }
+            Message::CloseFilePreview => {
+                self.file_preview = None;
+                Task::none()
+            }
+
+            Message::PasteImage | Message::PastePrompt => {
+                if !matches!(self.app_state.gui_state, GUIState::Main | GUIState::Images)
+                    || self.file_preview.is_some()
+                {
+                    return Task::none();
+                }
+                let explicit_image = matches!(message, Message::PasteImage);
+                let chat_id = self.current_chat_id.clone();
+                Task::perform(clipboard_images::read(), std::convert::identity).then(
+                    move |images| {
+                        let chat_id = chat_id.clone();
+                        if explicit_image || images.is_ok() {
+                            Task::done(Message::ClipboardPasted {
+                                chat_id,
+                                text: None,
+                                images,
+                                explicit_image,
+                            })
+                        } else {
+                            // Iced reads text synchronously on the window thread. Only
+                            // request it as a fallback; image paste must never wait on
+                            // a second, unrelated clipboard transfer before starting.
+                            clipboard::read().map(move |text| Message::ClipboardPasted {
+                                chat_id: chat_id.clone(),
+                                text,
+                                images: images.clone(),
+                                explicit_image,
+                            })
+                        }
+                    },
+                )
+            }
+
+            Message::ClipboardPasted {
+                chat_id,
+                text,
+                images,
+                explicit_image,
+            } => {
+                if chat_id != self.current_chat_id
+                    || !matches!(self.app_state.gui_state, GUIState::Main | GUIState::Images)
+                {
+                    return Task::none();
+                }
+                match images {
+                    Ok(images) => self.update(Message::ImagesLoaded(Ok(images))),
+                    Err(_)
+                        if !explicit_image
+                            && text.as_ref().is_some_and(|text| !text.is_empty()) =>
+                    {
+                        self.update(Message::EditPrompt(
+                            iced::widget::text_editor::Action::Edit(
+                                iced::widget::text_editor::Edit::Paste(Arc::new(text.unwrap())),
+                            ),
+                        ))
+                    }
+                    Err(error) => {
                         self.set_debug_message(DebugMessage {
                             message: error,
                             is_error: true,
-                        })
+                        });
+                        Task::none()
                     }
-                    Err(_) => {}
                 }
-                Task::none()
             }
 
             Message::ImagesLoaded(result) => {
                 match result {
                     Ok(images) => {
-                        let count = images.len();
-                        self.pending_images.extend(images);
+                        let capacity = file_usage::MAX_ATTACHMENTS
+                            .saturating_sub(self.pending_images.len() + self.pending_files.len());
+                        let count = images.len().min(capacity);
+                        let truncated = count < images.len();
+                        self.pending_images
+                            .extend(images.into_iter().take(capacity));
                         self.set_debug_message(DebugMessage {
-                            message: format!("Attached {count} images."),
-                            is_error: false,
+                            message: format!(
+                                "Attached {count} images.{}",
+                                if truncated {
+                                    " Attach at most 8 files per message."
+                                } else {
+                                    ""
+                                }
+                            ),
+                            is_error: truncated,
                         });
                     }
                     Err(error) if error != "No image selected." => {
@@ -3763,6 +4268,24 @@ impl Program {
             Message::ToggleConversationSearchTool => {
                 self.tool_settings.conversation_search = !self.tool_settings.conversation_search;
                 self.persist_tool_settings();
+                Task::none()
+            }
+
+            Message::ToggleImageEditingModel => {
+                if let Some(model) = &self.user_information.model {
+                    let key = crate::tools::ToolSettings::image_model_key(
+                        self.user_information.backend,
+                        model,
+                    );
+                    if self.tool_settings.image_editing_models.contains(&key) {
+                        self.tool_settings
+                            .image_editing_models
+                            .retain(|entry| entry != &key);
+                    } else {
+                        self.tool_settings.image_editing_models.push(key);
+                    }
+                    self.persist_tool_settings();
+                }
                 Task::none()
             }
 
@@ -3953,6 +4476,8 @@ impl Program {
                 self.begin_page_transition();
                 Task::none()
             }
+
+            Message::CloneChat => self.clone_open_chat(),
 
             Message::OpenChat(id) => {
                 self.chat_row_menu = None;
@@ -4293,6 +4818,15 @@ impl Program {
                 self.persist_boolean_setting(
                     "current_chat_history_enabled",
                     self.user_information.current_chat_history_enabled,
+                );
+                Task::none()
+            }
+
+            Message::ToggleAutomaticConversationTitles => {
+                self.automatic_conversation_titles = !self.automatic_conversation_titles;
+                self.persist_boolean_setting(
+                    "automatic_conversation_titles",
+                    self.automatic_conversation_titles,
                 );
                 Task::none()
             }
@@ -5082,6 +5616,40 @@ impl Program {
                     .to_string(),
             ),
 
+            Message::SelectConversation => {
+                if self.app_state.gui_state == GUIState::Main
+                    && !self
+                        .user_information
+                        .chat_history
+                        .lock()
+                        .unwrap()
+                        .messages
+                        .is_empty()
+                {
+                    self.conversation_selected = true;
+                    self.set_debug_message(DebugMessage {
+                        message: if cfg!(target_os = "macos") {
+                            "Entire conversation selected. Press Cmd+C to copy or Esc to cancel."
+                        } else {
+                            "Entire conversation selected. Press Ctrl+C to copy or Esc to cancel."
+                        }
+                        .into(),
+                        is_error: false,
+                    });
+                }
+                Task::none()
+            }
+
+            Message::ClearConversationSelection => {
+                self.conversation_selected = false;
+                Task::none()
+            }
+
+            Message::CopyChatTranscript => {
+                self.drain_live_updates();
+                self.copy_text(Some(self.current_chat_transcript()))
+            }
+
             Message::CopyResponse(message_index) => {
                 let input = self
                     .chat_messages_cache
@@ -5100,22 +5668,24 @@ impl Program {
                 self.copy_code_block(scope, code_block_index)
             }
 
-            Message::KeyPressed(keyboard::Key::Character(key), modifiers)
-                if modifiers.control() && key.eq_ignore_ascii_case("v") =>
-            {
-                Task::perform(async { paste_chat_image() }, Message::ImageLoaded)
-            }
-
-            Message::KeyPressed(_, _) => Task::none(),
-
-            Message::KeyReleased(_key) => Task::none(),
-
             Message::Prompt(prompt) => {
                 if !self.current_chat_is_processing() {
                     let mut prompt = prompt.trim().to_string();
-                    if prompt.is_empty() && self.pending_images.is_empty() {
+                    if self.loading_files.is_some() {
                         self.set_debug_message(DebugMessage {
-                            message: "Enter a message or attach an image first.".to_string(),
+                            message:
+                                "Wait for file reading to finish, or cancel it before sending."
+                                    .into(),
+                            is_error: true,
+                        });
+                        return Task::none();
+                    }
+                    if prompt.is_empty()
+                        && self.pending_images.is_empty()
+                        && self.pending_files.is_empty()
+                    {
+                        self.set_debug_message(DebugMessage {
+                            message: "Enter a message or attach a file first.".to_string(),
                             is_error: true,
                         });
                         return Task::none();
@@ -5138,8 +5708,18 @@ impl Program {
                         });
                         return Task::none();
                     }
+                    // The compact Config fields have no Apply button. Commit
+                    // valid edits before snapshotting settings for the request.
+                    if !self.apply_token_limits_before_prompt() {
+                        return Task::none();
+                    }
                     if prompt.is_empty() {
-                        prompt = "Describe this image in detail.".to_string();
+                        prompt = if self.pending_files.is_empty() {
+                            "Describe this image in detail."
+                        } else {
+                            "Read the attached files and summarize their contents."
+                        }
+                        .to_string();
                     }
                     self.prompt.prompt.clear();
                     self.prompt.editor = iced::widget::text_editor::Content::new();
@@ -5168,6 +5748,7 @@ impl Program {
             }
 
             Message::EditPrompt(action) => {
+                self.conversation_selected = false;
                 self.prompt.editor.perform(action);
                 self.prompt.prompt = self.prompt.editor.text();
                 Task::none()
@@ -5194,7 +5775,7 @@ impl Program {
         let mut subscriptions = vec![
             iced::event::listen().filter_map(|event| match event {
                 iced::event::Event::Window(iced::window::Event::FileDropped(path)) => {
-                    Some(Message::DropImage(path))
+                    Some(Message::DropFile(path))
                 }
                 iced::event::Event::Window(iced::window::Event::Opened { size, .. })
                 | iced::event::Event::Window(iced::window::Event::Resized(size)) => {
@@ -5206,18 +5787,11 @@ impl Program {
                     modifiers,
                     ..
                 }) if modifiers.command()
+                    && !modifiers.alt()
                     && (key == keyboard::Key::Character("v".into())
                         || physical_key == keyboard::key::Code::KeyV) =>
                 {
                     Some(Message::PasteImage)
-                }
-                iced::event::Event::Keyboard(keyboard::Event::KeyPressed {
-                    key,
-                    modifiers,
-                    ..
-                }) => Some(Message::KeyPressed(key, modifiers)),
-                iced::event::Event::Keyboard(keyboard::Event::KeyReleased { key, .. }) => {
-                    Some(Message::KeyReleased(key))
                 }
                 _ => None,
             }),
@@ -5332,6 +5906,7 @@ impl Default for Program {
         let interface_theme = interface_theme_from_settings(&settings_hmap);
         let info_popup = setting_bool("info_popup", false);
         let fast_streaming = setting_bool("fast_streaming", true);
+        let automatic_conversation_titles = setting_bool("automatic_conversation_titles", false);
         let show_tokens_per_second = setting_bool("show_tokens_per_second", false);
         let current_chat_history_enabled = setting_bool("current_chat_history_enabled", true);
         let code_checking_enabled = setting_bool("code_checking_enabled", false);
@@ -5468,6 +6043,7 @@ impl Default for Program {
         Self {
             batch_tokens: 3,
             fast_streaming,
+            automatic_conversation_titles,
             show_tokens_per_second,
             chat_menu_open: true,
             config_drawer_open: false,
@@ -5529,7 +6105,12 @@ impl Default for Program {
             chat_model_name_cache: Vec::new(),
             last_copied_text: None,
             last_copied_at: None,
+            conversation_selected: false,
             pending_images: Vec::new(),
+            pending_files: Vec::new(),
+            loading_files: None,
+            queued_file_paths: Vec::new(),
+            file_preview: None,
             vision_responses: HashMap::new(),
             markdown_images: HashMap::new(),
             expanded_thinking: HashSet::new(),
@@ -5681,6 +6262,8 @@ mod tests {
         let (_progress_sender, web_progress_receiver) =
             tokio::sync::watch::channel(ToolLoopProgress::default());
         ActivePrompt {
+            title_request: None,
+            conversation_title: None,
             chat_history,
             response_text: "Background answer".to_string(),
             thinking_text: String::new(),
@@ -5777,6 +6360,381 @@ mod tests {
         chat
     }
 
+    fn program_with_cloneable_chat(temporary: bool) -> Program {
+        let mut program = Program {
+            chat_storage_dir: std::env::temp_dir().join(Program::new_chat_id()),
+            saved_chats: Vec::new(),
+            temporary_chats: Default::default(),
+            current_chat_id: "source".into(),
+            active_profile_id: "profile-1".into(),
+            temporary_chat: temporary,
+            web_search_for_chat: true,
+            ..Program::default()
+        };
+        let chat = CurrentChat {
+            chats: vec!["User: Question\nAI Language Model: Answer".into()],
+            messages: vec![
+                Correspondence::User {
+                    text: "Question".into(),
+                    images: vec![crate::app::ChatImage {
+                        name: "image.png".into(),
+                        mime_type: "image/png".into(),
+                        bytes: vec![1, 2, 3],
+                        preview_handle: iced::widget::image::Handle::from_rgba(1, 1, vec![0; 4]),
+                    }],
+                    files: vec![crate::file_usage::fixture(
+                        "notes.md",
+                        &["Snapshot survives cloning."],
+                    )],
+                },
+                Correspondence::Bot {
+                    text: "<think>Reasoning</think>Answer".into(),
+                    model: Some("test-model".into()),
+                    thinking_seconds: Some(3),
+                    tokens_per_second: Some(18.5),
+                    generation_details: Some(GenerationDetails {
+                        output_tokens: Some(42),
+                        ..GenerationDetails::default()
+                    }),
+                    sources: vec![crate::tools::web_search::WebSource {
+                        title: "Example".into(),
+                        url: "https://example.com".into(),
+                    }],
+                    web_search_used: true,
+                },
+            ],
+            bot_responding: false,
+        };
+        program.user_information.chat_history = Arc::new(Mutex::new(chat.clone()));
+        if temporary {
+            program.temporary_chats.insert(
+                "source".into(),
+                super::TemporaryChatSession {
+                    title: Some("Learning Rust 🦀".into()),
+                    chat_history: Arc::clone(&program.user_information.chat_history),
+                    web_search_enabled: true,
+                    profile_id: "profile-1".into(),
+                },
+            );
+        } else {
+            let mut saved = SavedChat::from_current(
+                "source".into(),
+                "Learning Rust 🦀".into(),
+                &chat,
+                true,
+                "profile-1".into(),
+            );
+            saved.pinned = true;
+            saved.updated_at = "2026-01-01T00:00:00Z".into();
+            program.saved_chats.push(saved);
+        }
+        program.refresh_chat_markdown_cache();
+        program
+    }
+
+    #[test]
+    fn cloning_opens_and_persists_an_independent_chat_with_all_response_metadata() {
+        let mut program = program_with_cloneable_chat(false);
+        let source_history = Arc::clone(&program.user_information.chat_history);
+        let original = serde_json::to_value(&program.saved_chats[0]).unwrap();
+        program.expanded_thinking.insert(1);
+        program.chat_row_menu = Some("source".into());
+
+        drop(program.update(Message::CloneChat));
+
+        assert_ne!(program.current_chat_id, "source");
+        assert!(!Arc::ptr_eq(
+            &source_history,
+            &program.user_information.chat_history
+        ));
+        assert!(!program.temporary_chat);
+        assert!(program.web_search_for_chat);
+        assert!(program.chat_row_menu.is_none());
+        assert!(program.expanded_thinking.is_empty());
+        assert_eq!(program.chat_messages_cache.len(), 2);
+        assert!(
+            matches!(&program.chat_messages_cache[0], Correspondence::User { images, .. }
+            if images.len() == 1 && images[0].bytes == [1, 2, 3])
+        );
+        let stored: Vec<SavedChat> =
+            read_json_with_backup(&program.chat_storage_dir.join("chats.json")).unwrap();
+        assert_eq!(stored.len(), 2);
+        assert_eq!(serde_json::to_value(&stored[0]).unwrap(), original);
+        assert_eq!(stored[1].id, program.current_chat_id);
+        assert_eq!(stored[1].title, "Learning Rust 🦀 (1)");
+        assert_eq!(
+            stored[1].files[0][0].pages[0].text,
+            "Snapshot survives cloning."
+        );
+        assert!(!stored[1].pinned);
+        assert_ne!(stored[1].updated_at, stored[0].updated_at);
+        let mut cloned = serde_json::to_value(&stored[1]).unwrap();
+        for field in ["id", "title", "updated_at", "pinned"] {
+            cloned[field] = original[field].clone();
+        }
+        assert_eq!(cloned, original);
+
+        program
+            .user_information
+            .chat_history
+            .lock()
+            .unwrap()
+            .push_message(Correspondence::User {
+                text: "Follow-up".into(),
+                images: Vec::new(),
+                files: Vec::new(),
+            });
+        program.open_chat_dirty = true;
+        drop(program.update(Message::OpenChat("source".into())));
+        assert_eq!(source_history.lock().unwrap().messages.len(), 2);
+        assert_eq!(program.chat_messages_cache.len(), 2);
+        let clone_id = stored[1].id.clone();
+        drop(program.update(Message::OpenChat(clone_id)));
+        assert_eq!(program.chat_messages_cache.len(), 3);
+        assert_eq!(program.saved_chats[1].title, "Learning Rust 🦀 (1)");
+        fs::remove_dir_all(&program.chat_storage_dir).unwrap();
+    }
+
+    #[test]
+    fn file_load_results_keep_valid_files_and_ignore_cancelled_batches() {
+        let mut program = program_with_cloneable_chat(false);
+        let cancel = Arc::new(AtomicBool::new(false));
+        program.loading_files = Some(("batch".into(), Arc::clone(&cancel)));
+        drop(program.update(Message::FilesLoaded {
+            batch_id: "batch".into(),
+            results: vec![
+                Ok(super::LoadedAttachment::File(crate::file_usage::fixture(
+                    "valid.rs",
+                    &["fn main() {}"],
+                ))),
+                Err("bad.bin is binary".into()),
+            ],
+        }));
+        assert_eq!(program.pending_files.len(), 1);
+        assert!(program.debug_message.is_error);
+        assert!(program.loading_files.is_none());
+
+        program.loading_files = Some(("stale".into(), Arc::clone(&cancel)));
+        program.clear_open_chat();
+        assert!(cancel.load(Ordering::Relaxed));
+        drop(program.update(Message::FilesLoaded {
+            batch_id: "stale".into(),
+            results: vec![Ok(super::LoadedAttachment::File(
+                crate::file_usage::fixture("stale.md", &["private"]),
+            ))],
+        }));
+        assert!(program.pending_files.is_empty());
+        assert!(program.file_preview.is_none());
+    }
+
+    #[test]
+    fn file_only_prompts_are_accepted_and_consume_the_draft() {
+        let mut program = program_with_cloneable_chat(false);
+        program.app_state.gui_state = GUIState::Main;
+        program.user_information.model = Some("test-model".into());
+        program.user_information.vision_supported = Some(false);
+        program.pending_files = vec![crate::file_usage::fixture(
+            "file.md",
+            &["Text file contents"],
+        )];
+        drop(program.update(Message::Prompt(String::new())));
+        assert!(program.pending_files.is_empty());
+        let history = program.user_information.chat_history.lock().unwrap();
+        assert!(
+            matches!(history.messages.last(), Some(Correspondence::User { text, files, .. })
+            if text == "Read the attached files and summarize their contents." && files[0].name == "file.md")
+        );
+    }
+
+    #[test]
+    fn document_preview_navigation_is_bounded_and_resets_the_excerpt() {
+        let mut program = program_with_cloneable_chat(false);
+        drop(
+            program.update(Message::PreviewFile(crate::file_usage::fixture(
+                "guide.pdf",
+                &["one", "two"],
+            ))),
+        );
+        drop(program.update(Message::FilePreviewOffset(1)));
+        drop(program.update(Message::FilePreviewPage(1)));
+        assert_eq!(program.file_preview.as_ref().unwrap().page, 1);
+        assert_eq!(program.file_preview.as_ref().unwrap().offset, 0);
+        drop(program.update(Message::FilePreviewPage(100)));
+        assert_eq!(program.file_preview.as_ref().unwrap().page, 1);
+        drop(program.update(Message::CloseFilePreview));
+        assert!(program.file_preview.is_none());
+    }
+
+    #[test]
+    fn cloning_uses_latest_unsaved_messages_and_numbers_copies_within_the_profile() {
+        let mut program = program_with_cloneable_chat(false);
+        let mut other = test_saved_chat("other", "other-profile", "2026-01-01T00:00:00Z");
+        other.title = "Learning Rust 🦀 (1)".into();
+        program.saved_chats.push(other);
+        program
+            .user_information
+            .chat_history
+            .lock()
+            .unwrap()
+            .push_message(Correspondence::User {
+                text: "Latest message".into(),
+                images: Vec::new(),
+                files: Vec::new(),
+            });
+        program.open_chat_dirty = true;
+
+        drop(program.update(Message::CloneChat));
+        assert_eq!(program.saved_chats[1].title, "Learning Rust 🦀 (1)");
+        assert_eq!(program.saved_chats[0].messages.len(), 3);
+        assert_eq!(program.saved_chats[1].messages.len(), 3);
+        assert_eq!(program.saved_chats[1].profile.as_deref(), Some("profile-1"));
+        let first_clone_id = program.current_chat_id.clone();
+        drop(program.update(Message::CloneChat));
+        assert_ne!(program.current_chat_id, first_clone_id);
+        assert_eq!(program.saved_chats[1].title, "Learning Rust 🦀 (2)");
+        drop(program.update(Message::OpenChat("source".into())));
+        drop(program.update(Message::CloneChat));
+        assert_eq!(program.saved_chats[1].title, "Learning Rust 🦀 (3)");
+        fs::remove_dir_all(&program.chat_storage_dir).unwrap();
+    }
+
+    #[test]
+    fn cloning_temporary_chats_keeps_independent_copies_in_memory() {
+        let mut program = program_with_cloneable_chat(true);
+        let source_history = Arc::clone(&program.user_information.chat_history);
+
+        drop(program.update(Message::CloneChat));
+        let clone_id = program.current_chat_id.clone();
+        assert!(program.temporary_chat);
+        assert!(program.saved_chats.is_empty());
+        assert!(!program.chat_storage_dir.exists());
+        assert_eq!(program.temporary_chats.len(), 2);
+        let cloned = &program.temporary_chats[&clone_id];
+        assert_eq!(cloned.title.as_deref(), Some("Learning Rust 🦀 (1)"));
+        assert_eq!(cloned.profile_id, "profile-1");
+        assert!(cloned.web_search_enabled);
+        assert!(!Arc::ptr_eq(&source_history, &cloned.chat_history));
+        cloned
+            .chat_history
+            .lock()
+            .unwrap()
+            .chats
+            .push("New context".into());
+        assert_eq!(source_history.lock().unwrap().chats.len(), 1);
+        drop(program.update(Message::CloneChat));
+        assert_eq!(
+            program.temporary_chats[&program.current_chat_id]
+                .title
+                .as_deref(),
+            Some("Learning Rust 🦀 (2)")
+        );
+        drop(program.update(Message::OpenChat(clone_id)));
+        assert_eq!(
+            program
+                .user_information
+                .chat_history
+                .lock()
+                .unwrap()
+                .chats
+                .len(),
+            2
+        );
+        assert!(!program.chat_storage_dir.exists());
+    }
+
+    #[test]
+    fn cloning_ignores_empty_chats_and_chats_with_a_response_in_progress() {
+        let mut program = program_with_cloneable_chat(false);
+        let history = Arc::clone(&program.user_information.chat_history);
+        program.active_prompts.insert(
+            "source".into(),
+            test_active_prompt(Arc::clone(&history), Arc::new(AtomicBool::new(false))),
+        );
+        drop(program.update(Message::CloneChat));
+        assert_eq!(program.current_chat_id, "source");
+        assert_eq!(program.saved_chats.len(), 1);
+        program.active_prompts.clear();
+        history.lock().unwrap().bot_responding = true;
+        drop(program.update(Message::CloneChat));
+        assert_eq!(program.saved_chats.len(), 1);
+        *history.lock().unwrap() = empty_current_chat();
+        drop(program.update(Message::CloneChat));
+        assert_eq!(program.current_chat_id, "source");
+        assert_eq!(program.saved_chats.len(), 1);
+        assert!(!program.chat_storage_dir.exists());
+    }
+
+    #[test]
+    fn copy_chat_transcript_button_and_selection_copy_the_same_open_chat() {
+        let mut program = program_with_cloneable_chat(true);
+        program.app_state.gui_state = GUIState::Main;
+        let expected = program.current_chat_transcript();
+        assert!(expected.contains("[Image: image.png]"));
+        assert!(expected.contains("Assistant (test-model):"));
+        assert!(expected.contains("https://example.com"));
+
+        let button_task = program.update(Message::CopyChatTranscript);
+        assert!(button_task.units() > 0);
+        assert_eq!(program.last_copied_text.as_deref(), Some(expected.as_str()));
+        drop(program.update(Message::SelectConversation));
+        assert!(program.conversation_selected);
+        let keyboard_task = program.update(Message::CopyChatTranscript);
+        assert!(keyboard_task.units() > 0);
+        assert_eq!(program.last_copied_text.as_deref(), Some(expected.as_str()));
+        drop(program.update(Message::ClearConversationSelection));
+        assert!(!program.conversation_selected);
+        assert!(!program.chat_storage_dir.exists());
+
+        drop(program.update(Message::SelectConversation));
+        drop(program.update(Message::NewChat));
+        assert!(!program.conversation_selected);
+        assert!(program.current_chat_transcript().is_empty());
+        drop(program.update(Message::SelectConversation));
+        assert!(!program.conversation_selected);
+        let empty_copy = program.update(Message::CopyChatTranscript);
+        assert_eq!(empty_copy.units(), 0);
+        assert!(program.last_copied_text.is_none());
+    }
+
+    #[test]
+    fn transcript_includes_only_the_open_chats_live_reply_without_duplicate_final_text() {
+        let mut program = program_with_cloneable_chat(true);
+        let history = Arc::clone(&program.user_information.chat_history);
+        history.lock().unwrap().push_message(Correspondence::User {
+            text: "Follow-up".into(),
+            images: vec![],
+            files: Vec::new(),
+        });
+        let mut job = test_active_prompt(Arc::clone(&history), Arc::new(AtomicBool::new(false)));
+        job.response_start_index = 3;
+        job.response_text = "Part of the answer".into();
+        program.active_prompts.insert("source".into(), job);
+        let other_job = test_active_prompt(
+            Arc::new(Mutex::new(empty_current_chat())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        program
+            .active_prompts
+            .insert("other-chat".into(), other_job);
+        let transcript = program.current_chat_transcript();
+        assert!(transcript.ends_with("Assistant (test-model):\nPart of the answer"));
+        assert!(!transcript.contains("Background answer"));
+
+        history.lock().unwrap().push_message(Correspondence::Bot {
+            text: "Complete answer".into(),
+            model: Some("test-model".into()),
+            thinking_seconds: None,
+            tokens_per_second: None,
+            generation_details: None,
+            sources: vec![],
+            web_search_used: false,
+        });
+        let transcript = program.current_chat_transcript();
+        assert!(transcript.ends_with("Complete answer"));
+        assert!(!transcript.contains("Part of the answer"));
+        assert_eq!(transcript.matches("Assistant (").count(), 2);
+    }
+
     #[test]
     fn content_filter_replaces_entire_inappropriate_words_with_hashes() {
         assert_eq!(censor_text("hello crap"), "hello ####");
@@ -5853,8 +6811,10 @@ mod tests {
 
     #[test]
     fn backend_address_changes_persist_only_the_selected_connection() {
-        let mut program = Program::default();
-        program.password_protection = PasswordProtection::default();
+        let mut program = Program {
+            password_protection: PasswordProtection::default(),
+            ..Program::default()
+        };
         program.user_information.backend = InferenceBackend::Ollama;
         program.user_information.backend_connections = Default::default();
         let original_openvino = program
@@ -5989,6 +6949,78 @@ mod tests {
     }
 
     #[test]
+    fn composer_pastes_text_when_native_image_clipboard_is_unavailable() {
+        let mut program = Program::default();
+        program.app_state.gui_state = GUIState::Main;
+        program.debug_message.message.clear();
+        let _ = program.update(Message::ClipboardPasted {
+            chat_id: program.current_chat_id.clone(),
+            text: Some("first line\nsecond line".into()),
+            images: Err("Clipboard backend unavailable".into()),
+            explicit_image: false,
+        });
+        assert_eq!(program.prompt.prompt, "first line\nsecond line");
+        assert!(program.pending_images.is_empty());
+        assert!(program.debug_message.message.is_empty());
+    }
+
+    #[test]
+    fn composer_pastes_image_once_without_its_alternative_text() {
+        let mut program = Program::default();
+        program.app_state.gui_state = GUIState::Main;
+        let image = super::load_chat_image(std::path::Path::new("assets/icon.png")).unwrap();
+        let _ = program.update(Message::ClipboardPasted {
+            chat_id: program.current_chat_id.clone(),
+            text: Some("file:///tmp/image.png".into()),
+            images: Ok(vec![image]),
+            explicit_image: false,
+        });
+        assert_eq!(program.pending_images.len(), 1);
+        assert!(program.prompt.prompt.is_empty());
+    }
+
+    #[test]
+    fn clipboard_result_does_not_modify_another_chat_or_settings() {
+        let mut program = Program::default();
+        program.app_state.gui_state = GUIState::Main;
+        let _ = program.update(Message::ClipboardPasted {
+            chat_id: "previous-chat".into(),
+            text: Some("old paste".into()),
+            images: Err("No image".into()),
+            explicit_image: false,
+        });
+        program.app_state.gui_state = GUIState::Settings;
+        let _ = program.update(Message::ClipboardPasted {
+            chat_id: program.current_chat_id.clone(),
+            text: Some("old paste".into()),
+            images: Err("No image".into()),
+            explicit_image: false,
+        });
+        assert!(program.prompt.prompt.is_empty());
+        assert!(program.pending_images.is_empty());
+    }
+
+    #[test]
+    fn explicit_image_paste_reports_failures_without_inserting_text() {
+        let mut program = Program::default();
+        program.app_state.gui_state = GUIState::Images;
+        let _ = program.update(Message::ClipboardPasted {
+            chat_id: program.current_chat_id.clone(),
+            text: Some("plain text".into()),
+            images: Err("The clipboard does not contain an image.".into()),
+            explicit_image: true,
+        });
+        assert!(program.prompt.prompt.is_empty());
+        assert!(program.debug_message.is_error);
+        assert!(
+            program
+                .debug_message
+                .message
+                .contains("does not contain an image")
+        );
+    }
+
+    #[test]
     fn starter_suggestion_fills_the_composer_without_sending() {
         let mut program = Program::default();
         let suggestion = "Help me plan a small project.".to_string();
@@ -6116,6 +7148,76 @@ mod tests {
             program.settings_feedback,
             Some((SettingsFeedbackTarget::ApplyContextWindow, _))
         ));
+    }
+
+    #[test]
+    fn sending_applies_displayed_token_limits_without_a_separate_enter() {
+        let mut program = Program::default();
+        program.clear_open_chat();
+        program.user_information.model = Some("qwen3-4b-npu".into());
+        program.user_information.backend = InferenceBackend::OpenVino;
+        program.user_information.max_response_tokens = 1_048_576;
+        program.max_response_tokens_input = "1048576".into();
+        drop(program.update(Message::EditMaxResponseTokens("512".into())));
+        drop(program.update(Message::EditContextTokens("32768".into())));
+        drop(program.update(Message::Prompt("hello".into())));
+        assert!(program.current_chat_is_processing());
+        assert_eq!(program.user_information.max_response_tokens, 512);
+        assert_eq!(program.user_information.context_tokens, 32_768);
+        assert_eq!(program.pending_settings["max_response_tokens"], 512);
+        let body = crate::inference::direct_request_body(
+            program.user_information.backend,
+            "qwen3-4b-npu",
+            "hello".into(),
+            "Be helpful.".into(),
+            &[],
+            &serde_json::json!(false),
+            0.3,
+            0.9,
+            40,
+            program.user_information.context_tokens,
+            program.user_information.max_response_tokens,
+        );
+        assert_eq!(body["max_tokens"], 512);
+    }
+
+    #[test]
+    fn invalid_token_edits_do_not_send_using_the_previous_limit_or_clear_the_prompt() {
+        let mut program = Program::default();
+        program.clear_open_chat();
+        program.user_information.model = Some("test-model".into());
+        program.prompt.prompt = "hello".into();
+        for (response, context) in [("", "32768"), ("0", "32768"), ("512", "invalid")] {
+            drop(program.update(Message::EditMaxResponseTokens(response.into())));
+            drop(program.update(Message::EditContextTokens(context.into())));
+            drop(program.update(Message::Prompt("hello".into())));
+            assert!(!program.current_chat_is_processing());
+            assert!(
+                program
+                    .user_information
+                    .chat_history
+                    .lock()
+                    .unwrap()
+                    .messages
+                    .is_empty()
+            );
+            assert_eq!(program.prompt.prompt, "hello");
+            assert!(program.debug_message.is_error);
+        }
+    }
+
+    #[test]
+    fn sending_does_not_apply_token_drafts_after_settings_are_locked() {
+        let mut program = Program::default();
+        let original = program.user_information.max_response_tokens;
+        drop(program.update(Message::EditMaxResponseTokens("512".into())));
+        program.password_protection.enabled = true;
+        program.password_protection.password_hash = password::hash_password("teacher").unwrap();
+        program.password_protection.scope = PasswordProtectionScope::AllSettings;
+        program.password_protection.unlocked = false;
+        assert!(program.apply_token_limits_before_prompt());
+        assert_eq!(program.user_information.max_response_tokens, original);
+        assert_eq!(program.max_response_tokens_input, original.to_string());
     }
 
     #[test]
@@ -6803,6 +7905,7 @@ mod tests {
                 Correspondence::User {
                     text: "New question".into(),
                     images: Vec::new(),
+                    files: Vec::new(),
                 },
                 Correspondence::Bot {
                     text: "New answer".into(),
@@ -6863,6 +7966,7 @@ mod tests {
             messages: vec![Correspondence::User {
                 text: "Background question".to_string(),
                 images: Vec::new(),
+                files: Vec::new(),
             }],
             bot_responding: true,
         }));
@@ -7233,6 +8337,7 @@ mod tests {
                 messages: vec![Correspondence::User {
                     text: "Hello there".to_string(),
                     images: Vec::new(),
+                    files: Vec::new(),
                 }],
                 bot_responding: false,
             })),
@@ -7490,5 +8595,150 @@ mod tests {
 
         drop(program.update(Message::ToggleShowTokensPerSecond));
         assert!(!program.show_tokens_per_second);
+    }
+
+    #[test]
+    fn automatic_titles_default_off_and_are_a_persisted_basic_setting() {
+        let mut program = Program::default();
+        assert!(!program.automatic_conversation_titles);
+        program.password_protection.enabled = true;
+        program.password_protection.password_hash = password::hash_password("teacher").unwrap();
+        program.password_protection.unlocked = false;
+        program.password_protection.scope = PasswordProtectionScope::AllSettings;
+        drop(program.update(Message::ToggleAutomaticConversationTitles));
+        assert!(!program.automatic_conversation_titles);
+
+        program.password_protection.scope = PasswordProtectionScope::AdvancedSettingsOnly;
+        drop(program.update(Message::ToggleAutomaticConversationTitles));
+        assert!(program.automatic_conversation_titles);
+        assert_eq!(
+            program.pending_settings["automatic_conversation_titles"],
+            true
+        );
+        drop(program.update(Message::ToggleAutomaticConversationTitles));
+        assert!(!program.automatic_conversation_titles);
+        assert_eq!(
+            program.pending_settings["automatic_conversation_titles"],
+            false
+        );
+    }
+
+    #[test]
+    fn automatic_titles_are_requested_only_for_an_enabled_first_prompt() {
+        let mut program = Program::default();
+        program.saved_chats.clear();
+        program.clear_open_chat();
+        program.user_information.model = Some("first-model".into());
+        program.automatic_conversation_titles = false;
+        drop(program.prompt("Opening prompt".into()));
+        assert!(
+            program
+                .current_active_prompt()
+                .unwrap()
+                .title_request
+                .is_none()
+        );
+
+        program.active_prompts.clear();
+        program.clear_open_chat();
+        program.automatic_conversation_titles = true;
+        drop(program.prompt("Opening prompt".into()));
+        assert!(
+            program
+                .current_active_prompt()
+                .unwrap()
+                .title_request
+                .is_some()
+        );
+        program.active_prompts.clear();
+        program.user_information.model = Some("later-model".into());
+        drop(program.prompt("Follow-up prompt".into()));
+        assert!(
+            program
+                .current_active_prompt()
+                .unwrap()
+                .title_request
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn generated_titles_stay_with_the_original_chat_and_survive_saving() {
+        let mut program = Program::default();
+        program.saved_chats.clear();
+        program.automatic_conversation_titles = true;
+        program.app_state.filtering = false;
+        program.chat_storage_dir = std::env::temp_dir().join(Program::new_chat_id());
+        let mut chat = empty_current_chat();
+        chat.push_message(Correspondence::User {
+            text: "Please help me learn Rust programming".into(),
+            images: Vec::new(),
+            files: Vec::new(),
+        });
+        program.save_chat_snapshot("original".into(), &chat, false, LEGACY_PROFILE_ID.into());
+        program.saved_chats[0].pinned = true;
+        let apply_title = |result| Message::ConversationTitleGenerated {
+            chat_id: "original".into(),
+            storage_dir: program.chat_storage_dir.clone(),
+            temporary: false,
+            result,
+        };
+        let generated = apply_title(Ok("Learning Rust Programming".into()));
+        let failed = apply_title(Err("Model unavailable".into()));
+        program.current_chat_id = "another-chat".into();
+        drop(program.update(generated.clone()));
+        assert_eq!(program.current_chat_id, "another-chat");
+        drop(program.update(failed));
+        assert!(
+            program.chat_notices["original"]
+                .0
+                .message
+                .contains("Model unavailable")
+        );
+        program.save_chat_snapshot("original".into(), &chat, false, "another-profile".into());
+        let stored: Vec<SavedChat> =
+            read_json_with_backup(&program.chat_storage_dir.join("chats.json")).unwrap();
+        assert_eq!(stored[0].title, "Learning Rust Programming");
+        assert_eq!(stored[0].profile.as_deref(), Some(LEGACY_PROFILE_ID));
+        assert!(stored[0].pinned);
+        assert_eq!(stored[0].messages.len(), 1);
+
+        program.saved_chats[0].title = "Other folder title".into();
+        let original_folder = program.chat_storage_dir.clone();
+        program.chat_storage_dir = original_folder.join("other");
+        drop(program.update(generated.clone()));
+        assert_eq!(program.saved_chats[0].title, "Other folder title");
+        program.chat_storage_dir = original_folder;
+        drop(program.update(Message::DeleteChat("original".into())));
+        drop(program.update(generated));
+        assert!(program.saved_chats.is_empty());
+        fs::remove_dir_all(&program.chat_storage_dir).unwrap();
+    }
+
+    #[test]
+    fn temporary_titles_follow_running_chats_without_saving_them() {
+        let mut program = Program::default();
+        program.saved_chats.clear();
+        program.automatic_conversation_titles = true;
+        let history = Arc::new(Mutex::new(empty_current_chat()));
+        let mut job = test_active_prompt(history, Arc::new(AtomicBool::new(false)));
+        job.temporary = true;
+        program.active_prompts.insert("temporary".into(), job);
+        let generated = Message::ConversationTitleGenerated {
+            chat_id: "temporary".into(),
+            storage_dir: program.chat_storage_dir.clone(),
+            temporary: true,
+            result: Ok("Learning Rust".into()),
+        };
+        drop(program.update(generated.clone()));
+        drop(program.update(Message::PromptFinished("temporary".into())));
+        assert_eq!(
+            program.temporary_chats["temporary"].title.as_deref(),
+            Some("Learning Rust")
+        );
+        assert!(program.saved_chats.is_empty());
+        drop(program.update(Message::DeleteTemporaryChat("temporary".into())));
+        drop(program.update(generated));
+        assert!(program.temporary_chats.is_empty());
     }
 }

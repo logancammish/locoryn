@@ -362,6 +362,9 @@ pub enum WebSearchError {
     EmptyResults,
     InvalidToolCall,
     ModelToolsUnsupported,
+    /// An OpenVINO request containing tools was rejected, but the server did
+    /// not explicitly identify tool support as the cause. Keep its diagnostic.
+    ToolRequestRejected(String),
     /// Native function calling was accepted by the server, but the model
     /// returned neither a tool call nor a usable answer. Locoryn can recover
     /// by performing one compact search itself before a no-tools synthesis.
@@ -393,12 +396,15 @@ impl WebSearchError {
             Self::ModelToolsUnsupported => {
                 "The selected model or inference server does not support tool calling."
             }
+            Self::ToolRequestRejected(_) => {
+                "The inference server rejected the request containing tools."
+            }
             Self::WebSearchNotPerformed => "The model did not perform the requested web search.",
             Self::ContextLengthExceeded(_) => {
                 "The inference request exceeded the model server's prompt-length limit. For OpenVINO on NPU, increase --max_prompt_len or shorten the active chat context."
             }
             Self::InferenceUnavailable(_) => {
-                "The inference backend could not complete the tool-enabled response."
+                "The inference backend could not complete the response."
             }
             Self::ProviderUnavailable(_) => "The web-search provider is unavailable.",
             Self::Cancelled => "Web search was cancelled.",
@@ -407,7 +413,9 @@ impl WebSearchError {
 
     pub fn diagnostic(&self, api_key: Option<&str>) -> String {
         let detail = match self {
-            Self::InferenceUnavailable(detail) | Self::ContextLengthExceeded(detail) => {
+            Self::InferenceUnavailable(detail)
+            | Self::ContextLengthExceeded(detail)
+            | Self::ToolRequestRejected(detail) => {
                 format!("inference backend unavailable: {detail}")
             }
             Self::ProviderUnavailable(detail) => {
@@ -422,7 +430,8 @@ impl WebSearchError {
         let detail = match self {
             Self::InferenceUnavailable(detail)
             | Self::ProviderUnavailable(detail)
-            | Self::ContextLengthExceeded(detail) => redact_secret(detail, api_key)
+            | Self::ContextLengthExceeded(detail)
+            | Self::ToolRequestRejected(detail) => redact_secret(detail, api_key)
                 .trim()
                 .chars()
                 .take(320)

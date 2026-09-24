@@ -849,7 +849,11 @@ pub(super) fn message_bubble<'a>(
     motion: f32,
 ) -> Element<'a, Message> {
     match message {
-        Correspondence::User { text, images } => widget::row![
+        Correspondence::User {
+            text,
+            images,
+            files,
+        } => widget::row![
             Space::new().width(Length::Fill),
             container(widget::column![
                 widget::text(tr(language, "You"))
@@ -862,6 +866,7 @@ pub(super) fn message_bubble<'a>(
                     .align_x(Horizontal::Right),
                 Space::new().height(Length::Fixed(6.0)),
                 image_previews(images, false, language),
+                super::file_attachments::file_chips(files, false, language),
                 widget::text(text)
                     .size(text_size)
                     .font(chat_font(font_family))

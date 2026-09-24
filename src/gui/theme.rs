@@ -987,7 +987,7 @@ pub(super) fn icon_button<'a>(
 pub(super) fn compact_icon_button<'a>(
     icon: &'a str,
     tooltip_label: &'a str,
-    message: Message,
+    message: impl Into<Option<Message>>,
 ) -> Element<'a, Message> {
     let button = widget::button(
         container(widget::text(icon).size(15).align_x(Horizontal::Center))
@@ -998,7 +998,7 @@ pub(super) fn compact_icon_button<'a>(
     .height(Length::Fixed(36.0))
     .padding(0)
     .style(|_theme, status| button_visual(panel_soft(), border_soft(), text_main(), status))
-    .on_press(message);
+    .on_press_maybe(message.into());
 
     widget::tooltip(
         button,
